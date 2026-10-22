@@ -5,8 +5,18 @@
 //! covered (lab finding). A trace id that appears in the note but in NO raw checkpoint is an
 //! "unbacked" claim and must not count as AI evidence.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashSet;
+
+/// Git AI writes explicit `null` for empty optional objects (e.g. `"agent_metadata":null` on
+/// human checkpoints). `#[serde(default)]` only covers MISSING keys, so treat null as default too.
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RawAgentId {
@@ -30,7 +40,7 @@ pub struct RawLineAttribution {
 pub struct RawEntry {
     #[serde(default)]
     pub file: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub line_attributions: Vec<RawLineAttribution>,
 }
 
@@ -53,13 +63,13 @@ pub struct RawCheckpoint {
     pub agent_id: Option<RawAgentId>,
     #[serde(default)]
     pub timestamp: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub entries: Vec<RawEntry>,
     /// Lines the AI actually added at this checkpoint (Git AI's own count).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub line_stats: RawLineStats,
     /// e.g. `edit_kind` ("bash"), `tool_use_id`, `transcript_path` (local path; privacy-sensitive).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub agent_metadata: std::collections::HashMap<String, String>,
 }
 
@@ -115,5 +125,32 @@ impl Backing {
     }
     pub fn is_empty(&self) -> bool {
         self.traces.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `prov analyze` crashed on a real repo with
+    /// "invalid type: null, expected a map" because a human checkpoint carries
+    /// `"agent_metadata":null` (and `"agent_id":null`).
+    #[test]
+    fn explicit_nulls_are_accepted() {
+        let ai = r#"{"kind":"AiAgent","diff":"d","author":"a","entries":[{"file":"app.txt","blob_sha":"b","attributions":[],"line_attributions":[{"start_line":4,"end_line":7,"author_id":"s_1::t_1","overrode":null}]}],"timestamp":1,"agent_id":{"tool":"mock_ai","id":"x","model":"unknown"},"agent_metadata":null,"line_stats":{"additions":4,"deletions":0,"additions_sloc":4,"deletions_sloc":0},"api_version":"checkpoint/1.0.0","trace_id":"t_1"}"#;
+        let human = r#"{"kind":"KnownHuman","diff":"d","author":"a","entries":null,"timestamp":2,"agent_id":null,"agent_metadata":null,"line_stats":null,"api_version":"checkpoint/1.0.0","known_human_metadata":{"editor":"vscode","editor_version":"1","extension_version":"2"},"trace_id":"t_2"}"#;
+        let cps = parse_checkpoints_jsonl(&format!("{ai}\n{human}\n")).unwrap();
+        assert_eq!(cps.len(), 2);
+        assert!(cps[0].is_ai());
+        assert!(!cps[1].is_ai());
+        assert!(cps[1].agent_metadata.is_empty());
+        let b = Backing::from_checkpoints(&cps);
+        assert!(b.contains_trace("t_1"));
+        assert!(!b.contains_trace("t_2"));
+    }
+
+    #[test]
+    fn blank_lines_and_bom_are_tolerated() {
+        assert_eq!(parse_checkpoints_jsonl("\u{feff}\n\n").unwrap().len(), 0);
     }
 }

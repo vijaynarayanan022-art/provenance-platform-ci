@@ -113,7 +113,7 @@ mod tests {
     fn deleted_file_and_no_newline_marker() {
         let d = "diff --git a/d.txt b/d.txt\ndeleted file mode 100644\n--- a/d.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\ndiff --git a/e.txt b/e.txt\n--- a/e.txt\n+++ b/e.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n";
         let m = parse_unified_diff_added_lines(d);
-        assert!(m.get("d.txt").is_none());
+        assert!(!m.contains_key("d.txt"));
         assert_eq!(lines(&m, "e.txt"), vec![1]);
     }
 }

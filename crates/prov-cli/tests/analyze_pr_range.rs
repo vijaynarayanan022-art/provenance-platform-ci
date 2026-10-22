@@ -1,0 +1,530 @@
+//! Integration tests for `prov analyze --base REV --head REV` (PR range mode).
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn git(dir: &Path, empty_cfg: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", empty_cfg)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn prov(repo: &Path, cfg: &Path, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_prov"))
+        .arg("analyze")
+        .arg("--repo")
+        .arg(repo)
+        .args(extra)
+        .env("GIT_CONFIG_GLOBAL", cfg)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+
+fn setup_repo() -> (PathBuf, PathBuf) {
+    let id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(format!("prov-pr-test-{id}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("empty.gitconfig");
+    std::fs::write(&cfg, "").unwrap();
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &cfg, &["init", "-q", "-b", "main"]);
+    git(&repo, &cfg, &["config", "core.autocrlf", "false"]);
+    (repo, cfg)
+}
+
+fn write_note(repo: &Path, cfg: &Path, commit: &str, note_content: &str) {
+    let note_path = repo.join(".git").join("temp_note.txt");
+    std::fs::write(&note_path, note_content).unwrap();
+    git(
+        repo,
+        cfg,
+        &[
+            "notes",
+            "--ref=ai",
+            "add",
+            "-f",
+            "-F",
+            note_path.to_str().unwrap(),
+            commit,
+        ],
+    );
+    let _ = std::fs::remove_file(note_path);
+}
+
+fn write_checkpoints(repo: &Path, parent_sha: &str, content: &str) {
+    let wl = repo
+        .join(".git/ai/working_logs")
+        .join(format!("old-{parent_sha}"));
+    std::fs::create_dir_all(&wl).unwrap();
+    std::fs::write(wl.join("checkpoints.jsonl"), content).unwrap();
+}
+
+#[test]
+fn test_multicommit_pr_analysis_and_aggregation() {
+    let (repo, cfg) = setup_repo();
+
+    // Base commit
+    std::fs::write(repo.join("file.txt"), "base 1\nbase 2\n").unwrap();
+    git(&repo, &cfg, &["add", "file.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // Commit 1: 4 lines added by AI
+    std::fs::write(
+        repo.join("file.txt"),
+        "base 1\nbase 2\nc1_line1\nc1_line2\nc1_line3\nc1_line4\n",
+    )
+    .unwrap();
+    git(&repo, &cfg, &["add", "file.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "feat commit 1"]);
+    let c1 = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    let c1_note = "\
+file.txt
+  s_1::t_c1 3-6
+---
+{\"schema_version\":\"authorship/3.0.0\"}
+";
+    write_note(&repo, &cfg, &c1, c1_note);
+    write_checkpoints(
+        &repo,
+        &base,
+        "{\"kind\":\"AiAgent\",\"trace_id\":\"t_c1\"}\n",
+    );
+
+    // Commit 2: 2 lines human (7-8), 2 lines AI (9-10)
+    std::fs::write(
+        repo.join("file.txt"),
+        "base 1\nbase 2\nc1_line1\nc1_line2\nc1_line3\nc1_line4\nhuman_7\nhuman_8\nc2_line9\nc2_line10\n",
+    )
+    .unwrap();
+    git(&repo, &cfg, &["add", "file.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "feat commit 2"]);
+    let c2 = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    let c2_note = "\
+file.txt
+  s_2::t_c2 9-10
+---
+{\"schema_version\":\"authorship/3.0.0\"}
+";
+    write_note(&repo, &cfg, &c2, c2_note);
+    write_checkpoints(
+        &repo,
+        &c1,
+        "{\"kind\":\"AiAgent\",\"trace_id\":\"t_c2\"}\n",
+    );
+
+    // Analyze PR base..c2
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &c2, "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert_eq!(v["mode"], "pr_range");
+    assert_eq!(v["commits_in_range"], 2);
+    assert_eq!(v["eligible_added_lines"], 8);
+    assert_eq!(v["counts"]["strong"], 6); // 4 from c1 + 2 from c2
+    assert_eq!(v["counts"]["unknown"], 2); // 2 human lines from c2
+    let det = v["ai_deterministic_pct"].as_f64().unwrap();
+    assert!((det - 75.0).abs() < 1e-3, "expected 75.0, got {det}");
+    let linked = v["ai_linked_pct"].as_f64().unwrap();
+    assert!((linked - 75.0).abs() < 1e-3, "expected 75.0, got {linked}");
+
+    let per_commit = v["per_commit"].as_array().unwrap();
+    assert_eq!(per_commit.len(), 2);
+    assert_eq!(per_commit[0]["sha"], c1);
+    assert_eq!(per_commit[0]["lines_in_final"], 4);
+    assert_eq!(per_commit[0]["note_found"], true);
+    assert_eq!(per_commit[0]["checkpoints_found"], true);
+
+    assert_eq!(per_commit[1]["sha"], c2);
+    assert_eq!(per_commit[1]["lines_in_final"], 4);
+    assert_eq!(per_commit[1]["note_found"], true);
+    assert_eq!(per_commit[1]["checkpoints_found"], true);
+}
+
+#[test]
+fn test_survival_rule_rewritten_and_deleted_lines() {
+    let (repo, cfg) = setup_repo();
+
+    // Base commit
+    std::fs::write(repo.join("lib.rs"), "fn root() {}\n").unwrap();
+    git(&repo, &cfg, &["add", "lib.rs"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // Commit 1: adds lines 2-3 to lib.rs (AI), and creates temp.txt with 2 lines (AI)
+    std::fs::write(
+        repo.join("lib.rs"),
+        "fn root() {}\nfn c1_keep() {}\nfn c1_rewrite_me() {}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("temp.txt"), "t1\nt2\n").unwrap();
+    git(&repo, &cfg, &["add", "lib.rs", "temp.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "commit 1"]);
+    let c1 = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    let c1_note = "\
+lib.rs
+  s_1::t_c1 2-3
+temp.txt
+  s_1::t_c1 1-2
+---
+{\"schema_version\":\"authorship/3.0.0\"}
+";
+    write_note(&repo, &cfg, &c1, c1_note);
+    write_checkpoints(
+        &repo,
+        &base,
+        "{\"kind\":\"AiAgent\",\"trace_id\":\"t_c1\"}\n",
+    );
+
+    // Commit 2: rewrites line 3 of lib.rs (human, no AI note claim), and deletes temp.txt
+    std::fs::write(
+        repo.join("lib.rs"),
+        "fn root() {}\nfn c1_keep() {}\nfn c2_rewritten() {}\n",
+    )
+    .unwrap();
+    git(&repo, &cfg, &["rm", "temp.txt"]);
+    git(&repo, &cfg, &["add", "lib.rs"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "commit 2 rewrites line 3 and deletes temp"]);
+    let c2 = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // Commit 2 note has empty/no AI attestation for lib.rs
+    let c2_note = "\
+lib.rs
+---
+{\"schema_version\":\"authorship/3.0.0\"}
+";
+    write_note(&repo, &cfg, &c2, c2_note);
+
+    // Analyze PR
+    let out = prov(
+        &repo,
+        &cfg,
+        &["--base", &base, "--head", &c2, "--json", "--explain"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    // Surviving added lines in HEAD are:
+    // lib.rs line 2 (from c1: ai_strong)
+    // lib.rs line 3 (from c2: unknown)
+    // temp.txt is deleted, 0 lines.
+    assert_eq!(v["eligible_added_lines"], 2);
+    assert_eq!(v["counts"]["strong"], 1);
+    assert_eq!(v["counts"]["unknown"], 1);
+
+    let per_commit = v["per_commit"].as_array().unwrap();
+    assert_eq!(per_commit[0]["lines_in_final"], 1); // c1 only kept 1 line!
+    assert_eq!(per_commit[1]["lines_in_final"], 1); // c2 authored the rewritten line!
+
+    let explanations = v["explanations"].as_array().unwrap();
+    assert_eq!(explanations.len(), 2);
+
+    assert_eq!(explanations[0]["file"], "lib.rs");
+    assert_eq!(explanations[0]["line"], 2);
+    assert_eq!(explanations[0]["commit"], c1);
+    assert_eq!(explanations[0]["category"], "ai_strong");
+
+    assert_eq!(explanations[1]["file"], "lib.rs");
+    assert_eq!(explanations[1]["line"], 3);
+    assert_eq!(explanations[1]["commit"], c2);
+    assert_eq!(explanations[1]["category"], "unknown");
+}
+
+#[test]
+fn test_unbacked_claims_in_pr_downgraded() {
+    let (repo, cfg) = setup_repo();
+
+    std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    std::fs::write(repo.join("f.txt"), "base\nline1\nline2\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "unbacked AI claims"]);
+    let c1 = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // Note claims trace t_ghost
+    let c1_note = "\
+f.txt
+  s_1::t_ghost 2-3
+---
+{\"schema_version\":\"authorship/3.0.0\"}
+";
+    write_note(&repo, &cfg, &c1, c1_note);
+    // Checkpoints file only has trace t_real, so t_ghost is unbacked
+    write_checkpoints(
+        &repo,
+        &base,
+        "{\"kind\":\"AiAgent\",\"trace_id\":\"t_real\"}\n",
+    );
+
+    let out = prov(
+        &repo,
+        &cfg,
+        &["--base", &base, "--head", &c1, "--json", "--explain"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert_eq!(v["eligible_added_lines"], 2);
+    assert_eq!(v["counts"]["strong"], 0);
+    assert_eq!(v["counts"]["unknown"], 2);
+    assert_eq!(v["unbacked_ai_lines"], 2);
+
+    let warnings = v["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("unbacked AI claim(s) counted as unknown")),
+        "warnings: {warnings:?}"
+    );
+
+    let expl = v["explanations"].as_array().unwrap();
+    assert!(expl[0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("not in raw checkpoints -> unknown"));
+}
+
+#[test]
+fn test_missing_notes_on_commit_in_range() {
+    let (repo, cfg) = setup_repo();
+
+    std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    std::fs::write(repo.join("f.txt"), "base\nline1\nline2\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "no note commit"]);
+    let c1 = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // Do NOT create any note for c1
+
+    let out = prov(
+        &repo,
+        &cfg,
+        &["--base", &base, "--head", &c1, "--json", "--explain"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert_eq!(v["eligible_added_lines"], 2);
+    assert_eq!(v["counts"]["unknown"], 2);
+
+    let per_commit = v["per_commit"].as_array().unwrap();
+    assert_eq!(per_commit[0]["note_found"], false);
+
+    let warnings = v["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("no Git AI note")),
+        "warnings: {warnings:?}"
+    );
+
+    let expl = v["explanations"].as_array().unwrap();
+    assert_eq!(expl[0]["category"], "unknown");
+    assert_eq!(expl[0]["reason"], "no note -> unknown");
+}
+
+#[test]
+fn test_excluded_files_ignored_in_metric() {
+    let (repo, cfg) = setup_repo();
+
+    std::fs::write(repo.join("f.rs"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "f.rs"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // Add 2 lines to f.rs (AI) and 5 lines to Cargo.lock (excluded)
+    std::fs::write(repo.join("f.rs"), "base\nline1\nline2\n").unwrap();
+    std::fs::write(repo.join("Cargo.lock"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+    git(&repo, &cfg, &["add", "f.rs", "Cargo.lock"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "feat with lockfile"]);
+    let c1 = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    let c1_note = "\
+f.rs
+  s_1::t_c1 2-3
+---
+{\"schema_version\":\"authorship/3.0.0\"}
+";
+    write_note(&repo, &cfg, &c1, c1_note);
+    write_checkpoints(
+        &repo,
+        &base,
+        "{\"kind\":\"AiAgent\",\"trace_id\":\"t_c1\"}\n",
+    );
+
+    let out = prov(
+        &repo,
+        &cfg,
+        &["--base", &base, "--head", &c1, "--json", "--explain"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert_eq!(v["eligible_added_lines"], 2);
+    assert_eq!(v["counts"]["excluded"], 5);
+    assert_eq!(v["counts"]["strong"], 2);
+    let det = v["ai_deterministic_pct"].as_f64().unwrap();
+    assert!((det - 100.0).abs() < 1e-3);
+
+    let expl = v["explanations"].as_array().unwrap();
+    let lock_expls: Vec<_> = expl
+        .iter()
+        .filter(|e| e["file"] == "Cargo.lock")
+        .collect();
+    assert_eq!(lock_expls.len(), 5);
+    assert_eq!(lock_expls[0]["category"], "excluded");
+}
+
+#[test]
+fn test_empty_prs_and_edge_cases() {
+    let (repo, cfg) = setup_repo();
+
+    std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // Empty PR: 0 commits (base..base)
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &base, "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["commits_in_range"], 0);
+    assert_eq!(v["eligible_added_lines"], 0);
+    assert!(v["ai_deterministic_pct"].is_null());
+    assert!(v["ai_linked_pct"].is_null());
+
+    // Single commit mode default (HEAD) still works
+    let out_single = prov(&repo, &cfg, &["--json"]);
+    assert!(out_single.status.success());
+
+    // --explain without --base/--head errors out with clean usage error
+    let out_bad_explain = prov(&repo, &cfg, &["--explain"]);
+    assert_eq!(out_bad_explain.status.code(), Some(2));
+    let err_str = String::from_utf8_lossy(&out_bad_explain.stderr);
+    assert!(err_str.contains("--explain requires --base and --head"));
+
+    // --commit combined with --base/--head errors out
+    let out_bad_comb = prov(
+        &repo,
+        &cfg,
+        &["--commit", "HEAD", "--base", &base, "--head", &base],
+    );
+    assert_eq!(out_bad_comb.status.code(), Some(2));
+    let err_str = String::from_utf8_lossy(&out_bad_comb.stderr);
+    assert!(err_str.contains("--commit cannot be combined with --base and --head"));
+
+    // Invalid base/head revisions error out with exit code 1
+    let out_bad_rev = prov(
+        &repo,
+        &cfg,
+        &["--base", "nonexistent_rev", "--head", &base],
+    );
+    assert_eq!(out_bad_rev.status.code(), Some(1));
+}
+
+#[test]
+fn test_merge_commits_rejected() {
+    let (repo, cfg) = setup_repo();
+
+    std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // Create branch 1
+    git(&repo, &cfg, &["checkout", "-b", "branch1"]);
+    std::fs::write(repo.join("b1.txt"), "b1\n").unwrap();
+    git(&repo, &cfg, &["add", "b1.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "b1 commit"]);
+
+    // Create branch 2
+    git(&repo, &cfg, &["checkout", "main"]);
+    git(&repo, &cfg, &["checkout", "-b", "branch2"]);
+    std::fs::write(repo.join("b2.txt"), "b2\n").unwrap();
+    git(&repo, &cfg, &["add", "b2.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "b2 commit"]);
+
+    // Merge branch1 into branch2
+    git(&repo, &cfg, &["merge", "--no-ff", "-m", "merge branch1", "branch1"]);
+    let merge_head = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // Analyze PR containing merge commit
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &merge_head]);
+    assert_eq!(out.status.code(), Some(1));
+    let err_str = String::from_utf8_lossy(&out.stderr);
+    assert!(err_str.contains("merge commits are not supported yet"));
+}
+
+#[test]
+fn test_text_report_pr_range() {
+    let (repo, cfg) = setup_repo();
+
+    std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    std::fs::write(repo.join("f.txt"), "base\nline1\nline2\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "feat commit"]);
+    let c1 = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    let c1_note = "\
+f.txt
+  s_1::t_c1 2-3
+---
+{\"schema_version\":\"authorship/3.0.0\"}
+";
+    write_note(&repo, &cfg, &c1, c1_note);
+    write_checkpoints(
+        &repo,
+        &base,
+        "{\"kind\":\"AiAgent\",\"trace_id\":\"t_c1\"}\n",
+    );
+
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &c1, "--explain"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("PR range:"));
+    assert!(s.contains("Eligible added lines: 2"));
+    assert!(s.contains("AI deterministic: 100.0%"));
+    assert!(s.contains("--- Per-line explanations ---"));
+    assert!(s.contains("f.txt:"));
+    assert!(s.contains("L2: ai_strong"));
+    assert!(s.contains("L3: ai_strong"));
+}

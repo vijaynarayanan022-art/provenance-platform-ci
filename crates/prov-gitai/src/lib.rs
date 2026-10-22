@@ -6,12 +6,14 @@
 //! unmarked human edits to an AI session. Human-marked lines map to `Unknown` + a human signal,
 //! because the docs have no "human" category ("unknown is never human").
 
+pub mod blame;
 pub mod checkpoints;
 pub mod classify;
 pub mod diff;
 pub mod note;
 
+pub use blame::{parse_blame_porcelain, BlameLine};
 pub use checkpoints::{parse_checkpoints_jsonl, Backing, RawCheckpoint};
-pub use classify::{classify_added_lines, classify_added_lines_backed, ExclusionPolicy, MappingPolicy, PrAnalysis};
+pub use classify::{classify_added_lines, classify_added_lines_backed, classify_added_lines_explained, ExclusionPolicy, LineExplanation, MappingPolicy, PrAnalysis};
 pub use diff::parse_unified_diff_added_lines;
 pub use note::{parse_note, ActorKind, Entry, FileAttestation, LineRange, NoteMeta, ParseError, ParsedNote};

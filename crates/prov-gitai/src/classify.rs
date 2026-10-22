@@ -52,6 +52,17 @@ pub struct PrAnalysis {
     pub unbacked_ai_lines: u64,
 }
 
+/// Per-line explanation for the `--explain` output.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LineExplanation {
+    pub file: String,
+    pub line: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    pub category: String,
+    pub reason: String,
+}
+
 fn norm(p: &str) -> String {
     p.replace('\\', "/")
 }
@@ -143,3 +154,130 @@ pub fn classify_added_lines_backed(
         unbacked_ai_lines: unbacked,
     }
 }
+
+/// Classify added lines AND produce per-line explanations.
+/// Returns (analysis, explanations).
+pub fn classify_added_lines_explained(
+    note: &ParsedNote,
+    added: &BTreeMap<String, BTreeSet<u32>>,
+    mapping: &MappingPolicy,
+    exclusion: &ExclusionPolicy,
+    backing: Option<&Backing>,
+) -> (PrAnalysis, Vec<LineExplanation>) {
+    let mut unbacked = 0u64;
+    let mut counts = LineCounts::default();
+    let mut known_human = 0u64;
+    let mut conflicts = 0u64;
+    let mut explanations = Vec::new();
+
+    for (path, lines) in added {
+        let normed = norm(path);
+        if exclusion.excludes(&normed) {
+            counts.add(Category::Excluded, lines.len() as u64);
+            for &line in lines {
+                explanations.push(LineExplanation {
+                    file: normed.clone(),
+                    line,
+                    commit: None,
+                    category: "excluded".into(),
+                    reason: "path matches exclusion policy".into(),
+                });
+            }
+            continue;
+        }
+        let file = note.files.iter().find(|f| norm(&f.path) == normed);
+        for &line in lines {
+            let mut ai = false;
+            let mut human = false;
+            let mut unbacked_here = false;
+            let mut reason_parts: Vec<String> = Vec::new();
+            if let Some(f) = file {
+                for e in &f.entries {
+                    if e.ranges.iter().any(|r| r.contains(line)) {
+                        match e.kind {
+                            ActorKind::AiSession | ActorKind::Prompt => {
+                                let trace_desc = e.trace.as_deref().unwrap_or("none");
+                                let backed = match (backing, e.trace.as_deref()) {
+                                    (Some(b), Some(t)) => b.contains_trace(t),
+                                    _ => true,
+                                };
+                                if backed {
+                                    ai = true;
+                                    if backing.is_some() {
+                                        reason_parts.push(format!(
+                                            "AI session claim, trace {} backed by checkpoint",
+                                            trace_desc
+                                        ));
+                                    } else {
+                                        reason_parts.push(format!(
+                                            "AI session claim, trace {} (no checkpoints to verify)",
+                                            trace_desc
+                                        ));
+                                    }
+                                } else {
+                                    unbacked_here = true;
+                                    reason_parts.push(format!(
+                                        "trace {} not in raw checkpoints -> unknown",
+                                        trace_desc
+                                    ));
+                                }
+                            }
+                            ActorKind::KnownHuman => {
+                                human = true;
+                                reason_parts.push("known-human marker -> unknown (no human category)".into());
+                            }
+                        }
+                    }
+                }
+            }
+            if reason_parts.is_empty() {
+                reason_parts.push("no note entry -> unknown".into());
+            }
+            if unbacked_here && !ai && !human {
+                unbacked += 1;
+            }
+            let cat = match (ai, human) {
+                (true, false) => mapping.ai_session,
+                (false, true) => {
+                    known_human += 1;
+                    Category::Unknown
+                }
+                (true, true) => {
+                    conflicts += 1;
+                    reason_parts.push("conflicting AI + human claims -> unknown".into());
+                    Category::Unknown
+                }
+                (false, false) => Category::Unknown,
+            };
+            counts.add(cat, 1);
+
+            // Normalize category name for serialization
+            let cat_name = match cat {
+                Category::AiDirect => "ai_direct",
+                Category::AiStrong => "ai_strong",
+                Category::AiProbable => "ai_probable",
+                Category::Mixed => "mixed",
+                Category::Unknown => "unknown",
+                Category::Excluded => "excluded",
+            };
+
+            explanations.push(LineExplanation {
+                file: normed.clone(),
+                line,
+                commit: None,
+                category: cat_name.to_string(),
+                reason: reason_parts.join("; "),
+            });
+        }
+    }
+
+    let analysis = PrAnalysis {
+        metric: PrMetric::from_counts(counts),
+        known_human_lines: known_human,
+        conflicting_lines: conflicts,
+        unbacked_ai_lines: unbacked,
+    };
+
+    (analysis, explanations)
+}
+
