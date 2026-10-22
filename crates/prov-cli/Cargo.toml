@@ -1,0 +1,14 @@
+[package]
+name = "prov-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "prov"
+path = "src/main.rs"
+
+[dependencies]
+prov-core = { path = "../prov-core" }
+prov-gitai = { path = "../prov-gitai" }
+serde_json = { workspace = true }
