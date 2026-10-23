@@ -692,27 +692,30 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             "--commit" => {
                 i += 1;
-                commit = args
+                let value = args
                     .get(i)
-                    .ok_or("usage\n--commit needs a value")?
-                    .clone();
+                    .ok_or("usage\n--commit needs a value")?;
+                if value.starts_with('-') {
+                    return Err("usage\n--commit value cannot start with '-'".to_string());
+                }
+                commit = value.clone();
                 commit_specified = true;
             }
             "--base" => {
                 i += 1;
-                base = Some(
-                    args.get(i)
-                        .ok_or("usage\n--base needs a value")?
-                        .clone(),
-                );
+                let value = args.get(i).ok_or("usage\n--base needs a value")?;
+                if value.starts_with('-') {
+                    return Err("usage\n--base value cannot start with '-'".to_string());
+                }
+                base = Some(value.clone());
             }
             "--head" => {
                 i += 1;
-                head = Some(
-                    args.get(i)
-                        .ok_or("usage\n--head needs a value")?
-                        .clone(),
-                );
+                let value = args.get(i).ok_or("usage\n--head needs a value")?;
+                if value.starts_with('-') {
+                    return Err("usage\n--head value cannot start with '-'".to_string());
+                }
+                head = Some(value.clone());
             }
             "--json" => json = true,
             "--explain" => explain = true,

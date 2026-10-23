@@ -222,6 +222,20 @@ fn test_malformed_checkpoints_in_pr_are_unverifiable() {
 }
 
 #[test]
+fn test_revision_values_starting_with_dash_are_usage_errors() {
+    let (repo, cfg) = setup_repo();
+    for args in [
+        vec!["--commit", "-HEAD"],
+        vec!["--base", "-main", "--head", "main"],
+        vec!["--base", "main", "--head", "-feature"],
+    ] {
+        let out = prov(&repo, &cfg, &args);
+        assert_eq!(out.status.code(), Some(2), "args {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("value cannot start with"));
+    }
+}
+
+#[test]
 fn test_unsupported_note_schema_is_unknown_without_aborting() {
     let (repo, cfg) = setup_repo();
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
