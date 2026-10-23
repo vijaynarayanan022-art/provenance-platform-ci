@@ -61,12 +61,68 @@ fn find_checkpoints(git_dir: &Path, parent: Option<&str>) -> Option<PathBuf> {
     None
 }
 
+/// Evidence loaded for one commit. Parse failures never abort the analysis.
+#[derive(Debug)]
+struct Evidence {
+    note: ParsedNote,
+    note_found: bool,
+    note_error: Option<String>,
+    backing: Option<Backing>,
+    cp_path: Option<PathBuf>,
+    cp_count: usize,
+    cp_error: Option<String>,
+}
+
+fn empty_note() -> ParsedNote {
+    ParsedNote {
+        files: vec![],
+        meta: NoteMeta::default(),
+    }
+}
+
+fn load_evidence(repo: &Path, git_dir: &Path, sha: &str, parent: Option<&str>) -> Evidence {
+    let note_text = git(repo, &["notes", "--ref=ai", "show", sha]).ok();
+    let (note, note_found, note_error) = match note_text {
+        Some(t) => match parse_note(&t) {
+            Ok(n) => (n, true, None),
+            Err(e) => (empty_note(), false, Some(e.to_string())),
+        },
+        None => (empty_note(), false, None),
+    };
+
+    let cp_path = find_checkpoints(git_dir, parent);
+    let (backing, cp_count, cp_error) = match &cp_path {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(text) => match parse_checkpoints_jsonl(&text) {
+                Ok(cps) => {
+                    let n = cps.len();
+                    (Some(Backing::from_checkpoints(&cps)), n, None)
+                }
+                Err(e) => (None, 0, Some(e.to_string())),
+            },
+            Err(e) => (None, 0, Some(e.to_string())),
+        },
+        None => (None, 0, None),
+    };
+
+    Evidence {
+        note,
+        note_found,
+        note_error,
+        backing,
+        cp_path,
+        cp_count,
+        cp_error,
+    }
+}
+
 /// Information gathered about a single commit in the PR range.
 #[derive(Debug)]
 struct CommitInfo {
     sha: String,
     subject: String,
     note_found: bool,
+    note_error: Option<String>,
     checkpoints_found: bool,
     lines_attributed: u64,
 }
