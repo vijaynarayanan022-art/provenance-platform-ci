@@ -219,7 +219,11 @@ fn run_single_commit(
     let cp_count = evidence.cp_count;
     let backing = evidence.backing;
     if let Some(err) = evidence.note_error {
-        warnings.push(format!("Git AI note could not be read ({err}); added lines counted as unknown"));
+        let line_count: usize = added.values().map(BTreeSet::len).sum();
+        warnings.push(format!(
+            "commit {}: Git AI note could not be read ({err}); {line_count} line(s) counted as unknown",
+            &sha[..sha.len().min(10)]
+        ));
     }
     if let Some(err) = evidence.cp_error {
         warnings.push(format!("raw checkpoints could not be read ({err}): AI claims could NOT be verified"));
