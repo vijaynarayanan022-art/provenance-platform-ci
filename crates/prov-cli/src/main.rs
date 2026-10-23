@@ -208,38 +208,25 @@ fn run_single_commit(
     let added = parse_unified_diff_added_lines(&diff);
 
     let mut warnings: Vec<String> = Vec::new();
-    let note_text = git(repo, &["notes", "--ref=ai", "show", &sha]).ok();
-    let note_found = note_text.is_some();
-    let note = match note_text {
-        Some(t) => parse_note(&t).map_err(|e| format!("cannot read Git AI note: {e}"))?,
-        None => {
-            warnings.push("no Git AI note on this commit: every added line is unknown".into());
-            ParsedNote {
-                files: vec![],
-                meta: NoteMeta::default(),
-            }
-        }
-    };
-
     let git_dir = PathBuf::from(
         git(repo, &["rev-parse", "--absolute-git-dir"])?
             .trim(),
     );
-    let cp_path = find_checkpoints(&git_dir, parent);
-    let (backing, cp_count) = match &cp_path {
-        Some(p) => {
-            let text = std::fs::read_to_string(p)
-                .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-            let cps = parse_checkpoints_jsonl(&text)?;
-            (Some(Backing::from_checkpoints(&cps)), cps.len())
-        }
-        None => {
-            if note_found {
-                warnings.push("raw Git AI checkpoints not found on this machine: AI claims in the note could NOT be verified".into());
-            }
-            (None, 0)
-        }
-    };
+    let evidence = load_evidence(repo, &git_dir, &sha, parent);
+    let note = evidence.note;
+    let note_found = evidence.note_found;
+    let cp_path = evidence.cp_path;
+    let cp_count = evidence.cp_count;
+    let backing = evidence.backing;
+    if let Some(err) = evidence.note_error {
+        warnings.push(format!("Git AI note could not be read ({err}); added lines counted as unknown"));
+    }
+    if let Some(err) = evidence.cp_error {
+        warnings.push(format!("raw checkpoints could not be read ({err}): AI claims could NOT be verified"));
+    } else if note_found && cp_path.is_none() {
+        warnings.push("raw Git AI checkpoints not found on this machine: AI claims in the note could NOT be verified".into());
+    }
+    if !note_found && warnings.is_empty() { warnings.push("no Git AI note on this commit: every added line is unknown".into()); }
 
     let r = classify_added_lines_backed(
         &note,
@@ -486,37 +473,19 @@ fn run_pr_range(
         let commit_line_count: u64 = added_for_commit.values().map(|s| s.len() as u64).sum();
 
         // Load note
-        let note_text = git(repo, &["notes", "--ref=ai", "show", commit_sha]).ok();
-        let note_found = note_text.is_some();
-        let note = match note_text {
-            Some(t) => parse_note(&t).map_err(|e| format!("cannot read Git AI note on {}: {e}", &commit_sha[..10.min(commit_sha.len())]))?,
-            None => ParsedNote {
-                files: vec![],
-                meta: NoteMeta::default(),
-            },
-        };
-
-        // Load checkpoints
-        let cp_path = find_checkpoints(&git_dir, parent.as_deref());
-        let (backing, _cp_count) = match &cp_path {
-            Some(p) => {
-                let text = std::fs::read_to_string(p)
-                    .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-                let cps = parse_checkpoints_jsonl(&text)?;
-                (Some(Backing::from_checkpoints(&cps)), cps.len())
-            }
-            None => {
-                if note_found && commit_line_count > 0 {
-                    warnings.push(format!(
-                        "commit {}: raw checkpoints not found; AI claims could NOT be verified",
-                        &commit_sha[..commit_sha.len().min(10)]
-                    ));
-                }
-                (None, 0)
-            }
-        };
-
-        let checkpoints_found = cp_path.is_some();
+        let evidence = load_evidence(repo, &git_dir, commit_sha, parent.as_deref());
+        let note_found = evidence.note_found;
+        let note = evidence.note;
+        let checkpoints_found = evidence.cp_path.is_some();
+        let backing = evidence.backing;
+        if let Some(err) = &evidence.note_error {
+            warnings.push(format!("commit {}: Git AI note could not be read ({err}); {} line(s) counted as unknown", &commit_sha[..10.min(commit_sha.len())], commit_line_count));
+        }
+        if let Some(err) = &evidence.cp_error {
+            warnings.push(format!("commit {}: raw checkpoints could not be read ({err}): AI claims could NOT be verified", &commit_sha[..10.min(commit_sha.len())]));
+        } else if note_found && !checkpoints_found && commit_line_count > 0 {
+            warnings.push(format!("commit {}: raw checkpoints not found; AI claims could NOT be verified", &commit_sha[..10.min(commit_sha.len())]));
+        }
 
         // Classify
         let (r, mut expl) = if explain {
@@ -570,6 +539,7 @@ fn run_pr_range(
             sha: commit_sha.to_string(),
             subject,
             note_found,
+            note_error: evidence.note_error,
             checkpoints_found,
             lines_attributed: commit_line_count,
         });
@@ -598,6 +568,7 @@ fn run_pr_range(
                     "sha": ci.sha,
                     "subject": ci.subject,
                     "note_found": ci.note_found,
+                    "note_error": ci.note_error,
                     "checkpoints_found": ci.checkpoints_found,
                     "lines_in_final": ci.lines_attributed,
                 })
