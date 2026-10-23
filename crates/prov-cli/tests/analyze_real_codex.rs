@@ -62,6 +62,7 @@ fn analyze_downgrades_unbacked_human_lines() {
     let out = prov(&repo, &cfg, &["--json"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema_version"], "prov.analysis/0.1");
     assert_eq!(v["eligible_added_lines"], 6);
     assert_eq!(v["counts"]["strong"], 4);
     assert_eq!(v["counts"]["unknown"], 2);

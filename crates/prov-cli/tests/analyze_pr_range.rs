@@ -152,6 +152,7 @@ file.txt
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
 
     assert_eq!(v["mode"], "pr_range");
+    assert_eq!(v["schema_version"], "prov.analysis/0.1");
     assert_eq!(v["commits_in_range"], 2);
     assert_eq!(v["eligible_added_lines"], 8);
     assert_eq!(v["counts"]["strong"], 6); // 4 from c1 + 2 from c2

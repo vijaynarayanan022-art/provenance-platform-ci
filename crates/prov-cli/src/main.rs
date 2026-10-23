@@ -245,6 +245,7 @@ fn run_single_commit(
 
     if json {
         let v = serde_json::json!({
+            "schema_version": "prov.analysis/0.1",
             "commit": sha, "subject": subject, "note_found": note_found,
             "raw_checkpoints": { "found": cp_path.is_some(), "path": cp_path.as_ref().map(|p| p.display().to_string()), "count": cp_count },
             "eligible_added_lines": m.eligible,
@@ -576,6 +577,7 @@ fn run_pr_range(
             .collect();
 
         let mut v = serde_json::json!({
+            "schema_version": "prov.analysis/0.1",
             "mode": "pr_range",
             "base": base_sha,
             "head": head_sha,
