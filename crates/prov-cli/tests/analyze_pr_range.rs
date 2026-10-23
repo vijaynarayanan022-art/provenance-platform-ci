@@ -587,3 +587,53 @@ fn test_unattributed_lines_reported_and_counted_as_unknown() {
     assert_eq!(expl[0]["category"], "unknown");
     assert_eq!(expl[0]["reason_code"], "unattributed");
 }
+
+#[test]
+fn test_merge_base_three_dot_ignores_main_side_edits() {
+    let (repo, cfg) = setup_repo();
+
+    // Base: f.txt with three lines
+    std::fs::write(repo.join("f.txt"), "line1\nline2\nline3\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let _fork = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // Feature branch: new file g.txt with 2 AI lines
+    git(&repo, &cfg, &["checkout", "-b", "feature"]);
+    std::fs::write(repo.join("g.txt"), "g1\ng2\n").unwrap();
+    git(&repo, &cfg, &["add", "g.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "feature adds g"]);
+    let feat = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    let feat_note = "\
+g.txt
+  s_1::t_feat 1-2
+---
+{\"schema_version\":\"authorship/3.0.0\"}
+";
+    write_note(&repo, &cfg, &feat, feat_note);
+    write_checkpoints(
+        &repo,
+        &_fork,
+        "{\"kind\":\"AiAgent\",\"trace_id\":\"t_feat\"}\n",
+    );
+
+    // On main (after the fork): change line 2 of f.txt
+    git(&repo, &cfg, &["checkout", "main"]);
+    std::fs::write(repo.join("f.txt"), "line1\nmain edit\nline3\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "main edit line2"]);
+
+    // With three-dot (merge-base) semantics, only g.txt's 2 lines are in the PR.
+    // A two-dot diff would wrongly treat the untouched old line2 as an added line.
+    let out = prov(
+        &repo,
+        &cfg,
+        &["--base", "main", "--head", "feature", "--json"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert_eq!(v["eligible_added_lines"], 2);
+    assert_eq!(v["unattributed_lines"], 0);
+    assert_eq!(v["counts"]["strong"], 2);
+}

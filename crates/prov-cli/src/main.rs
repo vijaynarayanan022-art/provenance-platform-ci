@@ -274,28 +274,35 @@ fn run_pr_range(
     .trim()
     .to_string();
 
-    // List commits in base..head (oldest first)
+    // List commits in base..head (oldest first). Same --parents output also detects merges.
     let rev_list = git(
         repo,
-        &["rev-list", "--reverse", &format!("{base_sha}..{head_sha}")],
+        &[
+            "rev-list",
+            "--reverse",
+            "--parents",
+            &format!("{base_sha}..{head_sha}"),
+        ],
     )?;
-    let commits: Vec<&str> = rev_list.lines().filter(|l| !l.is_empty()).collect();
-
-    // Check for merge commits in the range
-    for &c in &commits {
-        let parents_line = git(repo, &["rev-list", "--parents", "-n", "1", c])?;
-        let parents: Vec<&str> = parents_line.split_whitespace().skip(1).collect();
-        if parents.len() > 1 {
+    let mut commits: Vec<String> = Vec::new();
+    for line in rev_list.lines().filter(|l| !l.is_empty()) {
+        let mut parts = line.split_whitespace();
+        let sha = parts
+            .next()
+            .ok_or_else(|| "empty rev-list line".to_string())?;
+        let parent_count = parts.count();
+        if parent_count > 1 {
             return Err(format!(
                 "merge commit {} found in range: merge commits are not supported yet",
-                &c[..c.len().min(10)]
+                &sha[..sha.len().min(10)]
             ));
         }
+        commits.push(sha.to_string());
     }
 
-    let commit_set: HashSet<String> = commits.iter().map(|s| s.to_string()).collect();
+    let commit_set: HashSet<String> = commits.iter().cloned().collect();
 
-    // Step 1: Get the overall diff base..head -> added lines in head version
+    // Step 1: Merge-base diff (three dots) -> added lines in head relative to merge base
     let diff = git(
         repo,
         &[
@@ -303,7 +310,7 @@ fn run_pr_range(
             "--unified=0",
             "--no-color",
             "--no-ext-diff",
-            &format!("{base_sha}..{head_sha}"),
+            &format!("{base_sha}...{head_sha}"),
         ],
     )?;
     let added_in_head = parse_unified_diff_added_lines(&diff);
@@ -406,7 +413,7 @@ fn run_pr_range(
             .trim(),
     );
 
-    for &commit_sha in &commits {
+    for commit_sha in &commits {
         let subject = git(repo, &["log", "-1", "--format=%s", commit_sha])?
             .trim()
             .to_string();
