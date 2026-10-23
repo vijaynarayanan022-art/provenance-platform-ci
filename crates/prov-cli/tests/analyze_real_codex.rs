@@ -84,6 +84,26 @@ fn analyze_warns_when_raw_checkpoints_are_missing() {
 }
 
 #[test]
+fn analyze_malformed_raw_checkpoints_are_unverifiable() {
+    let (repo, cfg) = setup();
+    let parent = git(&repo, &cfg, &["rev-parse", "HEAD^"]);
+    let checkpoint_file = repo
+        .join(".git/ai/working_logs")
+        .join(format!("old-{parent}"))
+        .join("checkpoints.jsonl");
+    std::fs::write(checkpoint_file, "not JSON\n").unwrap();
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["counts"]["strong"], 6);
+    assert_eq!(v["raw_checkpoints"]["found"], false);
+    assert!(v["raw_checkpoints"]["error"].as_str().unwrap().len() > 0);
+    assert!(v["warnings"].to_string().contains("raw checkpoints could not be read"));
+    assert!(v["warnings"].to_string().contains("could NOT be verified"));
+}
+
+#[test]
 fn analyze_text_report_and_usage_error() {
     let (repo, cfg) = setup();
     let out = prov(&repo, &cfg, &[]);

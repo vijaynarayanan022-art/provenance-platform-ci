@@ -198,6 +198,30 @@ fn test_missing_checkpoints_leave_ai_claims_strong_and_warn() {
 }
 
 #[test]
+fn test_malformed_checkpoints_in_pr_are_unverifiable() {
+    let (repo, cfg) = setup_repo();
+    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "base.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("g.txt"), "ai line\n").unwrap();
+    git(&repo, &cfg, &["add", "g.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "feature"]);
+    let head = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    write_note(&repo, &cfg, &head, "g.txt\n  s_1::t_ai 1\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n");
+    write_checkpoints(&repo, &base, "not JSON\n");
+
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["counts"]["strong"], 1);
+    assert_eq!(v["per_commit"][0]["checkpoints_found"], false);
+    assert!(v["per_commit"][0]["checkpoints_error"].as_str().unwrap().len() > 0);
+    assert!(v["warnings"].to_string().contains("raw checkpoints could not be read"));
+    assert!(v["warnings"].to_string().contains("could NOT be verified"));
+}
+
+#[test]
 fn test_unsupported_note_schema_is_unknown_without_aborting() {
     let (repo, cfg) = setup_repo();
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
