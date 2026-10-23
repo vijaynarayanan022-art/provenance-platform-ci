@@ -2,6 +2,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Unique per call. The clock alone is not enough: on Windows its resolution is coarse, so two
+/// parallel tests can get the same timestamp and `git init` the same folder at once.
+static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn git(dir: &Path, empty_cfg: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -39,12 +44,13 @@ fn prov(repo: &Path, cfg: &Path, extra: &[&str]) -> std::process::Output {
 
 fn setup_repo() -> (PathBuf, PathBuf) {
     let id = format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
     );
     let dir = std::env::temp_dir().join(format!("prov-pr-test-{id}"));
     std::fs::create_dir_all(&dir).unwrap();
