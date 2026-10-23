@@ -198,6 +198,28 @@ fn test_missing_checkpoints_leave_ai_claims_strong_and_warn() {
 }
 
 #[test]
+fn test_unsupported_note_schema_is_unknown_without_aborting() {
+    let (repo, cfg) = setup_repo();
+    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "base.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let parent = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("f.txt"), "new line\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "unsupported note"]);
+    let head = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    write_note(&repo, &cfg, &head, "f.txt\n  s_1::t_ai 1\n---\n{\"schema_version\":\"authorship/9.0.0\"}\n");
+
+    let out = prov(&repo, &cfg, &["--base", &parent, "--head", &head, "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["counts"]["unknown"], 1);
+    assert_eq!(v["eligible_added_lines"], 1);
+    assert!(v["warnings"].to_string().contains("Git AI note could not be read"));
+    assert!(v["per_commit"][0]["note_error"].as_str().unwrap().contains("unsupported schema_version"));
+}
+
+#[test]
 fn test_survival_rule_rewritten_and_deleted_lines() {
     let (repo, cfg) = setup_repo();
 
