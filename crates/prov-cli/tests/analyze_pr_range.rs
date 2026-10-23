@@ -210,13 +210,16 @@ fn test_unsupported_note_schema_is_unknown_without_aborting() {
     let head = git(&repo, &cfg, &["rev-parse", "HEAD"]);
     write_note(&repo, &cfg, &head, "f.txt\n  s_1::t_ai 1\n---\n{\"schema_version\":\"authorship/9.0.0\"}\n");
 
-    let out = prov(&repo, &cfg, &["--base", &parent, "--head", &head, "--json"]);
+    let out = prov(&repo, &cfg, &["--base", &parent, "--head", &head, "--json", "--explain"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["counts"]["unknown"], 1);
     assert_eq!(v["eligible_added_lines"], 1);
+    assert_eq!(v["per_commit"][0]["note_found"], true);
     assert!(v["warnings"].to_string().contains("Git AI note could not be read"));
+    assert!(!v["warnings"].to_string().contains("no Git AI note"));
     assert!(v["per_commit"][0]["note_error"].as_str().unwrap().contains("unsupported schema_version"));
+    assert_eq!(v["explanations"][0]["reason_code"], "no_note_entry");
 }
 
 #[test]

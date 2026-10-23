@@ -65,6 +65,7 @@ fn find_checkpoints(git_dir: &Path, parent: Option<&str>) -> Option<PathBuf> {
 #[derive(Debug)]
 struct Evidence {
     note: ParsedNote,
+    note_present: bool,
     note_found: bool,
     note_error: Option<String>,
     backing: Option<Backing>,
@@ -82,10 +83,11 @@ fn empty_note() -> ParsedNote {
 
 fn load_evidence(repo: &Path, git_dir: &Path, sha: &str, parent: Option<&str>) -> Evidence {
     let note_text = git(repo, &["notes", "--ref=ai", "show", sha]).ok();
+    let note_present = note_text.is_some();
     let (note, note_found, note_error) = match note_text {
         Some(t) => match parse_note(&t) {
             Ok(n) => (n, true, None),
-            Err(e) => (empty_note(), false, Some(e.to_string())),
+            Err(e) => (empty_note(), true, Some(e.to_string())),
         },
         None => (empty_note(), false, None),
     };
@@ -107,6 +109,7 @@ fn load_evidence(repo: &Path, git_dir: &Path, sha: &str, parent: Option<&str>) -
 
     Evidence {
         note,
+        note_present,
         note_found,
         note_error,
         backing,
@@ -124,6 +127,7 @@ struct CommitInfo {
     note_found: bool,
     note_error: Option<String>,
     checkpoints_found: bool,
+    checkpoints_error: Option<String>,
     lines_attributed: u64,
 }
 
@@ -217,6 +221,8 @@ fn run_single_commit(
     let note_found = evidence.note_found;
     let cp_path = evidence.cp_path;
     let cp_count = evidence.cp_count;
+    let cp_found = cp_path.is_some() && evidence.cp_error.is_none();
+    let cp_error = evidence.cp_error;
     let backing = evidence.backing;
     if let Some(err) = evidence.note_error {
         let line_count: usize = added.values().map(BTreeSet::len).sum();
@@ -225,7 +231,7 @@ fn run_single_commit(
             &sha[..sha.len().min(10)]
         ));
     }
-    if let Some(err) = evidence.cp_error {
+    if let Some(err) = &cp_error {
         warnings.push(format!("raw checkpoints could not be read ({err}): AI claims could NOT be verified"));
     } else if note_found && cp_path.is_none() {
         warnings.push("raw Git AI checkpoints not found on this machine: AI claims in the note could NOT be verified".into());
@@ -251,7 +257,7 @@ fn run_single_commit(
         let v = serde_json::json!({
             "schema_version": "prov.analysis/0.1",
             "commit": sha, "subject": subject, "note_found": note_found,
-            "raw_checkpoints": { "found": cp_path.is_some(), "path": cp_path.as_ref().map(|p| p.display().to_string()), "count": cp_count },
+            "raw_checkpoints": { "found": cp_found, "path": cp_path.as_ref().map(|p| p.display().to_string()), "count": cp_count, "error": cp_error },
             "eligible_added_lines": m.eligible,
             "counts": m.counts,
             "ai_deterministic_pct": m.ai_deterministic_pct,
@@ -479,9 +485,9 @@ fn run_pr_range(
 
         // Load note
         let evidence = load_evidence(repo, &git_dir, commit_sha, parent.as_deref());
-        let note_found = evidence.note_found;
-        let note = evidence.note;
-        let checkpoints_found = evidence.cp_path.is_some();
+    let note_found = evidence.note_found;
+    let note = evidence.note;
+        let checkpoints_found = evidence.cp_path.is_some() && evidence.cp_error.is_none();
         let backing = evidence.backing;
         if let Some(err) = &evidence.note_error {
             warnings.push(format!("commit {}: Git AI note could not be read ({err}); {} line(s) counted as unknown", &commit_sha[..10.min(commit_sha.len())], commit_line_count));
@@ -532,7 +538,7 @@ fn run_pr_range(
                 if let Some(&final_l) = orig_to_final.get(&key) {
                     e.line = final_l;
                 }
-                if !note_found && e.reason_code == ReasonCode::NoNoteEntry {
+                if !evidence.note_present && e.reason_code == ReasonCode::NoNoteEntry {
                     e.reason_code = ReasonCode::NoNote;
                     e.reason = "no note -> unknown".to_string();
                 }
@@ -546,11 +552,12 @@ fn run_pr_range(
             note_found,
             note_error: evidence.note_error,
             checkpoints_found,
+            checkpoints_error: evidence.cp_error,
             lines_attributed: commit_line_count,
         });
 
         // Warn about missing notes
-        if !note_found && commit_line_count > 0 {
+        if !evidence.note_present && commit_line_count > 0 {
             warnings.push(format!(
                 "commit {}: no Git AI note; {} line(s) from this commit are classified as unknown",
                 &commit_sha[..commit_sha.len().min(10)],
@@ -575,6 +582,7 @@ fn run_pr_range(
                     "note_found": ci.note_found,
                     "note_error": ci.note_error,
                     "checkpoints_found": ci.checkpoints_found,
+                    "checkpoints_error": ci.checkpoints_error,
                     "lines_in_final": ci.lines_attributed,
                 })
             })
