@@ -534,3 +534,56 @@ f.txt
     assert!(s.contains("L2: ai_strong"));
     assert!(s.contains("L3: ai_strong"));
 }
+
+#[test]
+fn test_unattributed_lines_reported_and_counted_as_unknown() {
+    let (repo, cfg) = setup_repo();
+
+    std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    // A gitlink (submodule mode) appears as an added line in the diff, but `git blame`
+    // cannot attribute it — counted as unattributed/unknown.
+    git(
+        &repo,
+        &cfg,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            "1234567890123456789012345678901234567890",
+            "mysub",
+        ],
+    );
+    git(&repo, &cfg, &["commit", "-q", "-m", "c1 with gitlink"]);
+    let c1 = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    let out = prov(
+        &repo,
+        &cfg,
+        &["--base", &base, "--head", &c1, "--json", "--explain"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    assert_eq!(v["unattributed_lines"], 1);
+    assert_eq!(v["counts"]["unknown"], 1);
+    assert_eq!(v["eligible_added_lines"], 1);
+
+    let warnings = v["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("1 added line(s) could not be attributed to a commit in the range: counted as unknown")),
+        "warnings: {warnings:?}"
+    );
+
+    let expl = v["explanations"].as_array().unwrap();
+    assert_eq!(expl.len(), 1);
+    assert_eq!(expl[0]["category"], "unknown");
+    assert_eq!(expl[0]["reason_code"], "unattributed");
+}

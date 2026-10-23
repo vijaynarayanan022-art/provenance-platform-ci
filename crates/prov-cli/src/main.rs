@@ -3,11 +3,11 @@
 //! Reads: `git diff-tree` (added lines), the Git AI note on the commit, and Git AI's raw
 //! checkpoints archived on this machine. Writes nothing; every git call is read-only.
 
-use prov_core::LineCounts;
+use prov_core::{Category, LineCounts};
 use prov_gitai::{
     classify_added_lines_backed, classify_added_lines_explained, parse_blame_porcelain,
-    parse_checkpoints_jsonl, parse_note, parse_unified_diff_added_lines, Backing, ExclusionPolicy,
-    LineExplanation, MappingPolicy, NoteMeta, ParsedNote, ReasonCode,
+    parse_checkpoints_jsonl, parse_note, parse_unified_diff_added_lines, Backing, BlameLine,
+    ExclusionPolicy, LineExplanation, MappingPolicy, NoteMeta, ParsedNote, ReasonCode,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -69,6 +69,53 @@ struct CommitInfo {
     note_found: bool,
     checkpoints_found: bool,
     lines_attributed: u64,
+}
+
+/// Result of placing head-diff added lines onto introducing commits in the range.
+#[derive(Debug, Default)]
+struct Placement {
+    /// commit_sha -> (file_path -> set of original line numbers in that commit)
+    per_commit_lines: HashMap<String, BTreeMap<String, BTreeSet<u32>>>,
+    /// (commit, path, orig_line) -> final line number in head
+    orig_to_final: HashMap<(String, String, u32), u32>,
+    /// Final-line numbers that could not be attributed to any commit in the range.
+    unattributed: Vec<u32>,
+}
+
+/// Place added lines of one file onto commits in `commit_set` using blame.
+///
+/// `blame = None` means the blame command itself failed: every line is unattributed.
+/// A missing blame entry, or a blame commit outside the range, is also unattributed.
+fn place_lines(
+    path: &str,
+    lines: &BTreeSet<u32>,
+    blame: Option<&HashMap<u32, BlameLine>>,
+    commit_set: &HashSet<String>,
+    placement: &mut Placement,
+) {
+    let normed = path.replace('\\', "/");
+    for &line in lines {
+        let Some(blame_map) = blame else {
+            placement.unattributed.push(line);
+            continue;
+        };
+        match blame_map.get(&line) {
+            Some(bl) if commit_set.contains(&bl.commit) => {
+                placement
+                    .per_commit_lines
+                    .entry(bl.commit.clone())
+                    .or_default()
+                    .entry(normed.clone())
+                    .or_default()
+                    .insert(bl.orig_line);
+                placement.orig_to_final.insert(
+                    (bl.commit.clone(), normed.clone(), bl.orig_line),
+                    line,
+                );
+            }
+            _ => placement.unattributed.push(line),
+        }
+    }
 }
 
 fn run_single_commit(
@@ -261,14 +308,41 @@ fn run_pr_range(
     )?;
     let added_in_head = parse_unified_diff_added_lines(&diff);
 
-    // Step 2: For each file with added lines, run git blame on head to find introducing commit
-    // and original line numbers.
-    // per_commit_lines: commit_sha -> (file_path -> set of original line numbers in that commit)
-    let mut per_commit_lines: HashMap<String, BTreeMap<String, BTreeSet<u32>>> = HashMap::new();
-    let mut orig_to_final: HashMap<(String, String, u32), u32> = HashMap::new();
-    let mut _total_skipped = 0u64;
+    let mapping = MappingPolicy::default();
+    let exclusion = ExclusionPolicy::with_lockfiles();
+    let mut total_counts = LineCounts::default();
+    let mut total_known_human = 0u64;
+    let mut total_conflicts = 0u64;
+    let mut total_unbacked = 0u64;
+    let mut unattributed_lines = 0u64;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut commit_infos: Vec<CommitInfo> = Vec::new();
+    let mut all_explanations: Vec<LineExplanation> = Vec::new();
+    let mut unattributed_explanations: Vec<LineExplanation> = Vec::new();
+
+    // Step 2: Place each added line onto its introducing commit (or count as unattributed /
+    // excluded). Excluded paths are never blamed.
+    let mut placement = Placement::default();
 
     for (file_path, line_numbers) in &added_in_head {
+        let normed = file_path.replace('\\', "/");
+        if exclusion.excludes(&normed) {
+            total_counts.excluded += line_numbers.len() as u64;
+            if explain {
+                for &line in line_numbers {
+                    unattributed_explanations.push(LineExplanation {
+                        file: normed.clone(),
+                        line,
+                        commit: None,
+                        category: Category::Excluded,
+                        reason: "path matches exclusion policy".into(),
+                        reason_code: ReasonCode::ExcludedByPolicy,
+                    });
+                }
+            }
+            continue;
+        }
+
         let blame_output = git(
             repo,
             &[
@@ -278,47 +352,59 @@ fn run_pr_range(
                 "--",
                 file_path,
             ],
-        )?;
-        let blame_map = parse_blame_porcelain(&blame_output);
-
-        for &line in line_numbers {
-            if let Some(bl) = blame_map.get(&line) {
-                if commit_set.contains(&bl.commit) {
-                    let normed = file_path.replace('\\', "/");
-                    per_commit_lines
-                        .entry(bl.commit.clone())
-                        .or_default()
-                        .entry(normed.clone())
-                        .or_default()
-                        .insert(bl.orig_line);
-                    orig_to_final.insert(
-                        (bl.commit.clone(), normed, bl.orig_line),
-                        line,
-                    );
-                } else {
-                    // Line was introduced by a commit outside the range (e.g. a base line
-                    // that shows up in the diff due to context). Skip it.
-                    _total_skipped += 1;
-                }
+        );
+        let blame_map = match blame_output {
+            Ok(out) => Some(parse_blame_porcelain(&out)),
+            Err(e) => {
+                warnings.push(format!(
+                    "git blame failed for {normed}: {e}; {} line(s) counted as unknown",
+                    line_numbers.len()
+                ));
+                None
             }
-            // If blame doesn't have this line, something unexpected happened; skip silently.
+        };
+
+        let before = placement.unattributed.len();
+        place_lines(
+            &normed,
+            line_numbers,
+            blame_map.as_ref(),
+            &commit_set,
+            &mut placement,
+        );
+        for &line in &placement.unattributed[before..] {
+            unattributed_lines += 1;
+            total_counts.unknown += 1;
+            if explain {
+                unattributed_explanations.push(LineExplanation {
+                    file: normed.clone(),
+                    line,
+                    commit: None,
+                    category: Category::Unknown,
+                    reason: "could not attribute to a commit in the range -> unknown".into(),
+                    reason_code: ReasonCode::Unattributed,
+                });
+            }
         }
     }
+
+    if unattributed_lines > 0 {
+        warnings.push(format!(
+            "{unattributed_lines} added line(s) could not be attributed to a commit in the range: counted as unknown"
+        ));
+    }
+
+    let Placement {
+        mut per_commit_lines,
+        orig_to_final,
+        ..
+    } = placement;
 
     // Step 3: For each commit, load its note + checkpoints and classify using ORIGINAL line numbers.
     let git_dir = PathBuf::from(
         git(repo, &["rev-parse", "--absolute-git-dir"])?
             .trim(),
     );
-    let mapping = MappingPolicy::default();
-    let exclusion = ExclusionPolicy::with_lockfiles();
-    let mut total_counts = LineCounts::default();
-    let mut total_known_human = 0u64;
-    let mut total_conflicts = 0u64;
-    let mut total_unbacked = 0u64;
-    let mut warnings: Vec<String> = Vec::new();
-    let mut commit_infos: Vec<CommitInfo> = Vec::new();
-    let mut all_explanations: Vec<LineExplanation> = Vec::new();
 
     for &commit_sha in &commits {
         let subject = git(repo, &["log", "-1", "--format=%s", commit_sha])?
@@ -435,6 +521,7 @@ fn run_pr_range(
         }
     }
 
+    all_explanations.append(&mut unattributed_explanations);
     all_explanations.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
 
     // Compute merged metric
@@ -466,6 +553,7 @@ fn run_pr_range(
             "known_human_lines": total_known_human,
             "conflicting_lines": total_conflicts,
             "unbacked_ai_lines": total_unbacked,
+            "unattributed_lines": unattributed_lines,
             "per_commit": commits_json,
             "warnings": warnings,
         });
@@ -630,5 +718,72 @@ fn main() {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod place_lines_tests {
+    use super::*;
+
+    fn bl(commit: &str, orig: u32, final_line: u32) -> BlameLine {
+        BlameLine {
+            commit: commit.to_string(),
+            orig_line: orig,
+            final_line,
+        }
+    }
+
+    #[test]
+    fn places_lines_blamed_to_commits_in_range() {
+        let commit_set = HashSet::from(["aaa".to_string()]);
+        let blame = HashMap::from([(2u32, bl("aaa", 1, 2)), (3u32, bl("aaa", 2, 3))]);
+        let lines = BTreeSet::from([2u32, 3]);
+        let mut placement = Placement::default();
+        place_lines("f.txt", &lines, Some(&blame), &commit_set, &mut placement);
+        assert!(placement.unattributed.is_empty());
+        let placed = placement.per_commit_lines.get("aaa").unwrap();
+        assert_eq!(placed.get("f.txt").unwrap(), &BTreeSet::from([1u32, 2]));
+        assert_eq!(placement.orig_to_final.get(&("aaa".into(), "f.txt".into(), 1)), Some(&2));
+        assert_eq!(placement.orig_to_final.get(&("aaa".into(), "f.txt".into(), 2)), Some(&3));
+    }
+
+    #[test]
+    fn blamed_outside_range_is_unattributed() {
+        let commit_set = HashSet::from(["aaa".to_string()]);
+        let blame = HashMap::from([(1u32, bl("outside", 1, 1))]);
+        let lines = BTreeSet::from([1u32]);
+        let mut placement = Placement::default();
+        place_lines("f.txt", &lines, Some(&blame), &commit_set, &mut placement);
+        assert_eq!(placement.unattributed, vec![1]);
+        assert!(placement.per_commit_lines.is_empty());
+    }
+
+    #[test]
+    fn missing_from_blame_is_unattributed() {
+        let commit_set = HashSet::from(["aaa".to_string()]);
+        let blame = HashMap::from([(1u32, bl("aaa", 1, 1))]);
+        let lines = BTreeSet::from([1u32, 99]);
+        let mut placement = Placement::default();
+        place_lines("f.txt", &lines, Some(&blame), &commit_set, &mut placement);
+        assert_eq!(placement.unattributed, vec![99]);
+        assert_eq!(
+            placement
+                .per_commit_lines
+                .get("aaa")
+                .unwrap()
+                .get("f.txt")
+                .unwrap(),
+            &BTreeSet::from([1u32])
+        );
+    }
+
+    #[test]
+    fn blame_failed_none_marks_all_unattributed() {
+        let commit_set = HashSet::from(["aaa".to_string()]);
+        let lines = BTreeSet::from([1u32, 2, 3]);
+        let mut placement = Placement::default();
+        place_lines("f.txt", &lines, None, &commit_set, &mut placement);
+        assert_eq!(placement.unattributed, vec![1, 2, 3]);
+        assert!(placement.per_commit_lines.is_empty());
     }
 }
