@@ -13,6 +13,17 @@ pub enum Category {
 }
 
 impl Category {
+    /// Snake_case spelling matching the serde serialized form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Category::AiDirect => "ai_direct",
+            Category::AiStrong => "ai_strong",
+            Category::AiProbable => "ai_probable",
+            Category::Mixed => "mixed",
+            Category::Unknown => "unknown",
+            Category::Excluded => "excluded",
+        }
+    }
     /// Counts toward the eligible denominator E.
     pub fn is_eligible(self) -> bool {
         !matches!(self, Category::Excluded)
@@ -37,6 +48,12 @@ impl Category {
             Category::AiProbable => Some((0.50, 0.79)),
             Category::Mixed | Category::Unknown | Category::Excluded => None,
         }
+    }
+}
+
+impl std::fmt::Display for Category {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -81,5 +98,21 @@ mod tests {
         assert_eq!(s, "\"DIRECT_ACCEPTED_EDIT\"");
         let c = serde_json::to_string(&Category::AiStrong).unwrap();
         assert_eq!(c, "\"ai_strong\"");
+    }
+
+    #[test]
+    fn as_str_matches_serialized_snake_case() {
+        for cat in [
+            Category::AiDirect,
+            Category::AiStrong,
+            Category::AiProbable,
+            Category::Mixed,
+            Category::Unknown,
+            Category::Excluded,
+        ] {
+            let json = serde_json::to_string(&cat).unwrap();
+            assert_eq!(json, format!("\"{}\"", cat.as_str()));
+            assert_eq!(cat.to_string(), cat.as_str());
+        }
     }
 }

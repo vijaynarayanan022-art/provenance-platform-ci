@@ -23,6 +23,15 @@ impl LineCounts {
             Category::Excluded => self.excluded += n,
         }
     }
+    /// Add another set of counts into this one.
+    pub fn merge(&mut self, other: &LineCounts) {
+        self.direct += other.direct;
+        self.strong += other.strong;
+        self.probable += other.probable;
+        self.mixed += other.mixed;
+        self.unknown += other.unknown;
+        self.excluded += other.excluded;
+    }
     /// E = D + S + P + M + U. Excluded lines are never part of E.
     pub fn eligible(&self) -> u64 {
         self.direct + self.strong + self.probable + self.mixed + self.unknown
@@ -121,5 +130,37 @@ mod tests {
         c.add(Category::Excluded, 7);
         assert_eq!(c.eligible(), 5);
         assert_eq!(c.total_seen(), 12);
+    }
+
+    #[test]
+    fn merge_sums_each_bucket() {
+        let mut a = LineCounts {
+            direct: 1,
+            strong: 2,
+            probable: 3,
+            mixed: 4,
+            unknown: 5,
+            excluded: 6,
+        };
+        let b = LineCounts {
+            direct: 10,
+            strong: 20,
+            probable: 30,
+            mixed: 40,
+            unknown: 50,
+            excluded: 60,
+        };
+        a.merge(&b);
+        assert_eq!(
+            a,
+            LineCounts {
+                direct: 11,
+                strong: 22,
+                probable: 33,
+                mixed: 44,
+                unknown: 55,
+                excluded: 66,
+            }
+        );
     }
 }

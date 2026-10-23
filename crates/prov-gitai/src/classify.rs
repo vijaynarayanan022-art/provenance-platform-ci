@@ -34,7 +34,7 @@ impl ExclusionPolicy {
                 .collect(),
         }
     }
-    fn excludes(&self, path: &str) -> bool {
+    pub fn excludes(&self, path: &str) -> bool {
         self.path_suffixes.iter().any(|s| path.ends_with(s.as_str()))
     }
 }
@@ -52,6 +52,21 @@ pub struct PrAnalysis {
     pub unbacked_ai_lines: u64,
 }
 
+/// Machine-readable reason for a per-line classification (serialized snake_case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasonCode {
+    ExcludedByPolicy,
+    AiBackedByCheckpoint,
+    AiUnverified,
+    UnbackedTrace,
+    KnownHuman,
+    Conflict,
+    NoNoteEntry,
+    NoNote,
+    Unattributed,
+}
+
 /// Per-line explanation for the `--explain` output.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LineExplanation {
@@ -59,8 +74,9 @@ pub struct LineExplanation {
     pub line: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
-    pub category: String,
+    pub category: Category,
     pub reason: String,
+    pub reason_code: ReasonCode,
 }
 
 fn norm(p: &str) -> String {
@@ -94,65 +110,7 @@ pub fn classify_added_lines_backed(
     exclusion: &ExclusionPolicy,
     backing: Option<&Backing>,
 ) -> PrAnalysis {
-    let mut unbacked = 0u64;
-    let mut counts = LineCounts::default();
-    let mut known_human = 0u64;
-    let mut conflicts = 0u64;
-
-    for (path, lines) in added {
-        let path = norm(path);
-        if exclusion.excludes(&path) {
-            counts.add(Category::Excluded, lines.len() as u64);
-            continue;
-        }
-        let file = note.files.iter().find(|f| norm(&f.path) == path);
-        for &line in lines {
-            let mut ai = false;
-            let mut human = false;
-            let mut unbacked_here = false;
-            if let Some(f) = file {
-                for e in &f.entries {
-                    if e.ranges.iter().any(|r| r.contains(line)) {
-                        match e.kind {
-                            ActorKind::AiSession | ActorKind::Prompt => {
-                                let backed = match (backing, e.trace.as_deref()) {
-                                    (Some(b), Some(t)) => b.contains_trace(t),
-                                    _ => true,
-                                };
-                                if backed {
-                                    ai = true;
-                                } else {
-                                    unbacked_here = true;
-                                }
-                            }
-                            ActorKind::KnownHuman => human = true,
-                        }
-                    }
-                }
-            }
-            if unbacked_here && !ai && !human {
-                unbacked += 1;
-            }
-            match (ai, human) {
-                (true, false) => counts.add(mapping.ai_session, 1),
-                (false, true) => {
-                    known_human += 1;
-                    counts.add(Category::Unknown, 1);
-                }
-                (true, true) => {
-                    conflicts += 1;
-                    counts.add(Category::Unknown, 1);
-                }
-                (false, false) => counts.add(Category::Unknown, 1),
-            }
-        }
-    }
-    PrAnalysis {
-        metric: PrMetric::from_counts(counts),
-        known_human_lines: known_human,
-        conflicting_lines: conflicts,
-        unbacked_ai_lines: unbacked,
-    }
+    classify_added_lines_explained(note, added, mapping, exclusion, backing).0
 }
 
 /// Classify added lines AND produce per-line explanations.
@@ -179,8 +137,9 @@ pub fn classify_added_lines_explained(
                     file: normed.clone(),
                     line,
                     commit: None,
-                    category: "excluded".into(),
+                    category: Category::Excluded,
                     reason: "path matches exclusion policy".into(),
+                    reason_code: ReasonCode::ExcludedByPolicy,
                 });
             }
             continue;
@@ -236,37 +195,43 @@ pub fn classify_added_lines_explained(
             if unbacked_here && !ai && !human {
                 unbacked += 1;
             }
-            let cat = match (ai, human) {
-                (true, false) => mapping.ai_session,
+
+            let (cat, reason_code) = match (ai, human) {
+                (true, false) => {
+                    let rc = if backing.is_some() {
+                        ReasonCode::AiBackedByCheckpoint
+                    } else {
+                        ReasonCode::AiUnverified
+                    };
+                    (mapping.ai_session, rc)
+                }
                 (false, true) => {
                     known_human += 1;
-                    Category::Unknown
+                    (Category::Unknown, ReasonCode::KnownHuman)
                 }
                 (true, true) => {
                     conflicts += 1;
                     reason_parts.push("conflicting AI + human claims -> unknown".into());
-                    Category::Unknown
+                    (Category::Unknown, ReasonCode::Conflict)
                 }
-                (false, false) => Category::Unknown,
+                (false, false) => {
+                    let rc = if unbacked_here {
+                        ReasonCode::UnbackedTrace
+                    } else {
+                        ReasonCode::NoNoteEntry
+                    };
+                    (Category::Unknown, rc)
+                }
             };
             counts.add(cat, 1);
-
-            // Normalize category name for serialization
-            let cat_name = match cat {
-                Category::AiDirect => "ai_direct",
-                Category::AiStrong => "ai_strong",
-                Category::AiProbable => "ai_probable",
-                Category::Mixed => "mixed",
-                Category::Unknown => "unknown",
-                Category::Excluded => "excluded",
-            };
 
             explanations.push(LineExplanation {
                 file: normed.clone(),
                 line,
                 commit: None,
-                category: cat_name.to_string(),
+                category: cat,
                 reason: reason_parts.join("; "),
+                reason_code,
             });
         }
     }
@@ -281,3 +246,33 @@ pub fn classify_added_lines_explained(
     (analysis, explanations)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NoteMeta;
+
+    #[test]
+    fn backed_matches_explained() {
+        let note = ParsedNote {
+            files: vec![],
+            meta: NoteMeta::default(),
+        };
+        let mut added = BTreeMap::new();
+        added.insert("a.txt".to_string(), BTreeSet::from([1, 2]));
+        let mapping = MappingPolicy::default();
+        let exclusion = ExclusionPolicy::with_lockfiles();
+
+        let backed_res = classify_added_lines_backed(&note, &added, &mapping, &exclusion, None);
+        let (explained_res, expls) =
+            classify_added_lines_explained(&note, &added, &mapping, &exclusion, None);
+
+        assert_eq!(backed_res, explained_res);
+        assert_eq!(expls.len(), 2);
+        assert_eq!(expls[0].category, Category::Unknown);
+        assert_eq!(expls[0].reason_code, ReasonCode::NoNoteEntry);
+
+        let json = serde_json::to_value(&expls[0]).unwrap();
+        assert_eq!(json["category"], "unknown");
+        assert_eq!(json["reason_code"], "no_note_entry");
+    }
+}

@@ -7,7 +7,7 @@ use prov_core::LineCounts;
 use prov_gitai::{
     classify_added_lines_backed, classify_added_lines_explained, parse_blame_porcelain,
     parse_checkpoints_jsonl, parse_note, parse_unified_diff_added_lines, Backing, ExclusionPolicy,
-    LineExplanation, MappingPolicy, NoteMeta, ParsedNote,
+    LineExplanation, MappingPolicy, NoteMeta, ParsedNote, ReasonCode,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -390,12 +390,7 @@ fn run_pr_range(
         };
 
         // Merge counts
-        total_counts.direct += r.metric.counts.direct;
-        total_counts.strong += r.metric.counts.strong;
-        total_counts.probable += r.metric.counts.probable;
-        total_counts.mixed += r.metric.counts.mixed;
-        total_counts.unknown += r.metric.counts.unknown;
-        total_counts.excluded += r.metric.counts.excluded;
+        total_counts.merge(&r.metric.counts);
         total_known_human += r.known_human_lines;
         total_conflicts += r.conflicting_lines;
         total_unbacked += r.unbacked_ai_lines;
@@ -414,7 +409,8 @@ fn run_pr_range(
                 if let Some(&final_l) = orig_to_final.get(&key) {
                     e.line = final_l;
                 }
-                if !note_found && e.reason == "no note entry -> unknown" {
+                if !note_found && e.reason_code == ReasonCode::NoNoteEntry {
+                    e.reason_code = ReasonCode::NoNote;
                     e.reason = "no note -> unknown".to_string();
                 }
             }
@@ -534,7 +530,10 @@ fn run_pr_range(
                     };
                     println!(
                         "    L{}: {}{} - {}",
-                        e.line, e.category, commit_str, e.reason
+                        e.line,
+                        e.category.as_str(),
+                        commit_str,
+                        e.reason
                     );
                 }
             }
