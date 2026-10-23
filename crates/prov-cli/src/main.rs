@@ -379,7 +379,7 @@ fn run_pr_range(
     let mut warnings: Vec<String> = Vec::new();
     let mut commit_infos: Vec<CommitInfo> = Vec::new();
     let mut all_explanations: Vec<LineExplanation> = Vec::new();
-    let mut unattributed_explanations: Vec<LineExplanation> = Vec::new();
+    let mut extra_explanations: Vec<LineExplanation> = Vec::new();
 
     // Step 2: Place each added line onto its introducing commit (or count as unattributed /
     // excluded). Excluded paths are never blamed.
@@ -391,7 +391,7 @@ fn run_pr_range(
             total_counts.excluded += line_numbers.len() as u64;
             if explain {
                 for &line in line_numbers {
-                    unattributed_explanations.push(LineExplanation {
+                    extra_explanations.push(LineExplanation {
                         file: normed.clone(),
                         line,
                         commit: None,
@@ -437,7 +437,7 @@ fn run_pr_range(
             unattributed_lines += 1;
             total_counts.unknown += 1;
             if explain {
-                unattributed_explanations.push(LineExplanation {
+                extra_explanations.push(LineExplanation {
                     file: normed.clone(),
                     line,
                     commit: None,
@@ -499,24 +499,13 @@ fn run_pr_range(
         }
 
         // Classify
-        let (r, mut expl) = if explain {
-            classify_added_lines_explained(
-                &note,
-                &added_for_commit,
-                &mapping,
-                &exclusion,
-                backing.as_ref(),
-            )
-        } else {
-            let r = classify_added_lines_backed(
-                &note,
-                &added_for_commit,
-                &mapping,
-                &exclusion,
-                backing.as_ref(),
-            );
-            (r, Vec::new())
-        };
+        let (r, expl) = classify_added_lines_explained(
+            &note,
+            &added_for_commit,
+            &mapping,
+            &exclusion,
+            backing.as_ref(),
+        );
 
         // Merge counts
         total_counts.merge(&r.metric.counts);
@@ -532,6 +521,7 @@ fn run_pr_range(
         }
 
         if explain {
+            let mut expl = expl;
             for e in &mut expl {
                 e.commit = Some(commit_sha.to_string());
                 let key = (commit_sha.to_string(), e.file.clone(), e.line);
@@ -566,7 +556,7 @@ fn run_pr_range(
         }
     }
 
-    all_explanations.append(&mut unattributed_explanations);
+    all_explanations.append(&mut extra_explanations);
     all_explanations.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
 
     // Compute merged metric
