@@ -175,6 +175,28 @@ file.txt
 }
 
 #[test]
+fn test_missing_checkpoints_leave_ai_claims_strong_and_warn() {
+    let (repo, cfg) = setup_repo();
+    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "base.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("g.txt"), "ai one\nai two\n").unwrap();
+    git(&repo, &cfg, &["add", "g.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "feature"]);
+    let head = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    write_note(&repo, &cfg, &head, "g.txt\n  s_1::t_ai 1-2\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n");
+
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["counts"]["strong"], 2);
+    assert_eq!(v["unattributed_lines"], 0);
+    assert_eq!(v["per_commit"][0]["checkpoints_found"], false);
+    assert!(v["warnings"].to_string().contains("could NOT be verified"));
+}
+
+#[test]
 fn test_survival_rule_rewritten_and_deleted_lines() {
     let (repo, cfg) = setup_repo();
 
