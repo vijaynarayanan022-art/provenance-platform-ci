@@ -505,8 +505,8 @@ fn run_pr_range(
 
         // Load note
         let evidence = load_evidence(repo, &git_dir, commit_sha, parent.as_deref());
-    let note_found = evidence.note_found;
-    let note = evidence.note;
+        let note_found = evidence.note_found;
+        let note = evidence.note;
         let note_has_ai_claim = has_ai_session_claim(&note);
         let checkpoints_found = evidence.cp_path.is_some() && evidence.cp_error.is_none();
         let backing = evidence.backing;
