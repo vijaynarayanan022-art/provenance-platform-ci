@@ -81,11 +81,11 @@ fn empty_note() -> ParsedNote {
     }
 }
 
-fn has_ai_session_claim(note: &ParsedNote) -> bool {
+fn has_ai_claim(note: &ParsedNote) -> bool {
     note.files
         .iter()
         .flat_map(|file| &file.entries)
-        .any(|entry| entry.kind == ActorKind::AiSession)
+        .any(|entry| matches!(entry.kind, ActorKind::AiSession | ActorKind::Prompt))
 }
 
 fn load_evidence(repo: &Path, git_dir: &Path, sha: &str, parent: Option<&str>) -> Evidence {
@@ -225,7 +225,7 @@ fn run_single_commit(
     );
     let evidence = load_evidence(repo, &git_dir, &sha, parent);
     let note = evidence.note;
-    let note_has_ai_claim = has_ai_session_claim(&note);
+    let note_has_ai_claim = has_ai_claim(&note);
     let note_unreadable = evidence.note_error.is_some();
     let note_found = evidence.note_found;
     let cp_path = evidence.cp_path;
@@ -507,7 +507,7 @@ fn run_pr_range(
         let evidence = load_evidence(repo, &git_dir, commit_sha, parent.as_deref());
         let note_found = evidence.note_found;
         let note = evidence.note;
-        let note_has_ai_claim = has_ai_session_claim(&note);
+        let note_has_ai_claim = has_ai_claim(&note);
         let checkpoints_found = evidence.cp_path.is_some() && evidence.cp_error.is_none();
         let backing = evidence.backing;
         if let Some(err) = &evidence.note_error {

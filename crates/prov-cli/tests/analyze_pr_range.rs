@@ -494,6 +494,25 @@ fn test_missing_notes_on_commit_in_range() {
 }
 
 #[test]
+fn prompt_claim_warns_when_raw_checkpoints_are_missing_in_pr_range_mode() {
+    let (repo, cfg) = setup_repo();
+    std::fs::write(repo.join("f.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("f.txt"), "base\nadded\n").unwrap();
+    git(&repo, &cfg, &["add", "f.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "prompt claim"]);
+    let head = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    write_note(&repo, &cfg, &head, "f.txt\n  prompt_1 2\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n");
+
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--json", "--explain"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["warnings"].to_string().contains("AI claims could NOT be verified"));
+}
+
+#[test]
 fn test_excluded_files_ignored_in_metric() {
     let (repo, cfg) = setup_repo();
 
