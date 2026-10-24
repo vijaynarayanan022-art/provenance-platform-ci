@@ -266,6 +266,7 @@ fn run_single_commit(
     } else if !note_found {
         for explanation in &mut explanations {
             if explanation.reason_code == ReasonCode::NoNoteEntry {
+                explanation.reason_code = ReasonCode::NoNote;
                 explanation.reason = "no note -> unknown".into();
             }
         }

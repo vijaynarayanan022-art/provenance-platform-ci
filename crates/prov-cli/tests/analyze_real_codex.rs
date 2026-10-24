@@ -91,7 +91,7 @@ fn analyze_single_commit_without_note_reports_no_note_reason() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["note_found"], false);
-    assert_eq!(v["explanations"][0]["reason_code"], "no_note_entry");
+    assert_eq!(v["explanations"][0]["reason_code"], "no_note");
     assert_eq!(v["explanations"][0]["reason"], "no note -> unknown");
 }
 
