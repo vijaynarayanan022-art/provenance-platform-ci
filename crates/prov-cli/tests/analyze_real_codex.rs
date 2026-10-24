@@ -84,6 +84,27 @@ fn analyze_warns_when_raw_checkpoints_are_missing() {
 }
 
 #[test]
+fn analyze_human_only_note_does_not_warn_about_missing_checkpoints() {
+    let (repo, cfg) = setup();
+    let note_path = repo.join(".git/human-only-note.txt");
+    std::fs::write(
+        &note_path,
+        "notes.txt\n  h_human 4-9\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    )
+    .unwrap();
+    git(&repo, &cfg, &["notes", "--ref=ai", "add", "-f", "-F", note_path.to_str().unwrap(), "HEAD"]);
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["known_human_lines"], 6);
+    assert_eq!(v["counts"]["unknown"], 6);
+    assert!(!v["warnings"].to_string().contains("raw Git AI checkpoints not found"));
+    assert!(!v["warnings"].to_string().contains("could NOT be verified"));
+}
+
+#[test]
 fn analyze_malformed_raw_checkpoints_are_unverifiable() {
     let (repo, cfg) = setup();
     let parent = git(&repo, &cfg, &["rev-parse", "HEAD^"]);
