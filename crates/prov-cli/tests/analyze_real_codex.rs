@@ -84,6 +84,18 @@ fn analyze_warns_when_raw_checkpoints_are_missing() {
 }
 
 #[test]
+fn analyze_single_commit_without_note_reports_no_note_reason() {
+    let (repo, cfg) = setup();
+    git(&repo, &cfg, &["notes", "--ref=ai", "remove", "HEAD"]);
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["note_found"], false);
+    assert_eq!(v["explanations"][0]["reason_code"], "no_note_entry");
+    assert_eq!(v["explanations"][0]["reason"], "no note -> unknown");
+}
+
+#[test]
 fn prompt_claim_warns_when_raw_checkpoints_are_missing_in_single_commit_mode() {
     let (repo, cfg) = setup();
     let note_path = repo.join(".git/prompt-note.txt");

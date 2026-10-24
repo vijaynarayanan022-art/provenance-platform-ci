@@ -263,6 +263,12 @@ fn run_single_commit(
                 explanation.reason = "note could not be read -> unknown".into();
             }
         }
+    } else if !note_found {
+        for explanation in &mut explanations {
+            if explanation.reason_code == ReasonCode::NoNoteEntry {
+                explanation.reason = "no note -> unknown".into();
+            }
+        }
     }
     let m = &r.metric;
     if r.unbacked_ai_lines > 0 {
