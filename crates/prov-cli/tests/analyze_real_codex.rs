@@ -140,7 +140,7 @@ fn analyze_malformed_raw_checkpoints_are_unverifiable() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["counts"]["strong"], 6);
     assert_eq!(v["raw_checkpoints"]["found"], false);
-    assert!(v["raw_checkpoints"]["error"].as_str().unwrap().len() > 0);
+    assert!(!v["raw_checkpoints"]["error"].as_str().unwrap().is_empty());
     assert!(v["warnings"].to_string().contains("raw checkpoints could not be read"));
     assert!(v["warnings"].to_string().contains("could NOT be verified"));
 }

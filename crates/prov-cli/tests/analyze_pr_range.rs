@@ -238,7 +238,7 @@ fn test_malformed_checkpoints_in_pr_are_unverifiable() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["counts"]["strong"], 1);
     assert_eq!(v["per_commit"][0]["checkpoints_found"], false);
-    assert!(v["per_commit"][0]["checkpoints_error"].as_str().unwrap().len() > 0);
+    assert!(!v["per_commit"][0]["checkpoints_error"].as_str().unwrap().is_empty());
     assert!(v["warnings"].to_string().contains("raw checkpoints could not be read"));
     assert!(v["warnings"].to_string().contains("could NOT be verified"));
 }
