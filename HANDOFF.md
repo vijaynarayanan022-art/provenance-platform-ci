@@ -64,6 +64,7 @@ Fixtures for these are in `crates/prov-gitai/tests/fixtures` and pinned by tests
 - End-to-end tests rebuild the real Codex lab scenario and PR range histories in temporary repositories.
 
 ## Known limitations
+- Single-commit JSON always includes `explanations`; PR mode includes them only with `--explain`.
 - Renamed files lose Git AI note matches and are counted as unknown.
 - Whitespace-only rewrites by a later commit take over blame credit and are counted as unknown; docs have a `FORMAT_TRANSFORMATION` basis for this later case.
 - Blame runs per whole file and can be slow on very large files.
