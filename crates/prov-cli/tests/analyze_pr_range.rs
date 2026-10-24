@@ -299,7 +299,8 @@ fn test_unreadable_note_is_present_and_not_reported_missing() {
     assert_eq!(v["per_commit"][0]["note_found"], true);
     assert!(v["per_commit"][0]["note_error"].as_str().unwrap().contains("unsupported schema_version"));
     assert!(!v["warnings"].to_string().contains("no Git AI note"));
-    assert_eq!(v["explanations"][0]["reason_code"], "no_note_entry");
+    assert_eq!(v["explanations"][0]["reason_code"], "note_unreadable");
+    assert_eq!(v["explanations"][0]["reason"], "note could not be read -> unknown");
 }
 
 #[test]

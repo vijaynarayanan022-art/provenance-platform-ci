@@ -62,6 +62,7 @@ pub enum ReasonCode {
     UnbackedTrace,
     KnownHuman,
     Conflict,
+    NoteUnreadable,
     NoNoteEntry,
     NoNote,
     Unattributed,

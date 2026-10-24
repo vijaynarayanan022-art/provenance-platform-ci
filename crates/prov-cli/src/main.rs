@@ -5,7 +5,7 @@
 
 use prov_core::{Category, LineCounts};
 use prov_gitai::{
-    classify_added_lines_backed, classify_added_lines_explained, parse_blame_porcelain,
+    classify_added_lines_explained, parse_blame_porcelain,
     parse_checkpoints_jsonl, parse_note, parse_unified_diff_added_lines, Backing, BlameLine,
     ActorKind, ExclusionPolicy, LineExplanation, MappingPolicy, NoteMeta, ParsedNote, ReasonCode,
 };
@@ -226,6 +226,7 @@ fn run_single_commit(
     let evidence = load_evidence(repo, &git_dir, &sha, parent);
     let note = evidence.note;
     let note_has_ai_claim = has_ai_session_claim(&note);
+    let note_unreadable = evidence.note_error.is_some();
     let note_found = evidence.note_found;
     let cp_path = evidence.cp_path;
     let cp_count = evidence.cp_count;
@@ -248,13 +249,21 @@ fn run_single_commit(
     }
     if !note_found && warnings.is_empty() { warnings.push("no Git AI note on this commit: every added line is unknown".into()); }
 
-    let r = classify_added_lines_backed(
+    let (r, mut explanations) = classify_added_lines_explained(
         &note,
         &added,
         &MappingPolicy::default(),
         &ExclusionPolicy::with_lockfiles(),
         backing.as_ref(),
     );
+    if note_unreadable {
+        for explanation in &mut explanations {
+            if explanation.reason_code == ReasonCode::NoNoteEntry {
+                explanation.reason_code = ReasonCode::NoteUnreadable;
+                explanation.reason = "note could not be read -> unknown".into();
+            }
+        }
+    }
     let m = &r.metric;
     if r.unbacked_ai_lines > 0 {
         warnings.push(format!(
@@ -275,6 +284,7 @@ fn run_single_commit(
             "known_human_lines": r.known_human_lines,
             "conflicting_lines": r.conflicting_lines,
             "unbacked_ai_lines": r.unbacked_ai_lines,
+            "explanations": explanations,
             "warnings": warnings,
         });
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
@@ -541,7 +551,10 @@ fn run_pr_range(
                 if let Some(&final_l) = orig_to_final.get(&key) {
                     e.line = final_l;
                 }
-                if !evidence.note_present && e.reason_code == ReasonCode::NoNoteEntry {
+                if evidence.note_error.is_some() && e.reason_code == ReasonCode::NoNoteEntry {
+                    e.reason_code = ReasonCode::NoteUnreadable;
+                    e.reason = "note could not be read -> unknown".to_string();
+                } else if !evidence.note_present && e.reason_code == ReasonCode::NoNoteEntry {
                     e.reason_code = ReasonCode::NoNote;
                     e.reason = "no note -> unknown".to_string();
                 }

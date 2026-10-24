@@ -105,6 +105,27 @@ fn analyze_human_only_note_does_not_warn_about_missing_checkpoints() {
 }
 
 #[test]
+fn analyze_unreadable_note_has_note_unreadable_reason() {
+    let (repo, cfg) = setup();
+    let note_path = repo.join(".git/unreadable-note.txt");
+    std::fs::write(
+        &note_path,
+        "notes.txt\n  s_1::t_ai 4-9\n---\n{\"schema_version\":\"authorship/9.0.0\"}\n",
+    )
+    .unwrap();
+    git(&repo, &cfg, &["notes", "--ref=ai", "add", "-f", "-F", note_path.to_str().unwrap(), "HEAD"]);
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["note_found"], true);
+    assert!(v["warnings"].to_string().contains("Git AI note could not be read"));
+    assert!(!v["warnings"].to_string().contains("no Git AI note"));
+    assert_eq!(v["explanations"][0]["reason_code"], "note_unreadable");
+    assert_eq!(v["explanations"][0]["reason"], "note could not be read -> unknown");
+}
+
+#[test]
 fn analyze_malformed_raw_checkpoints_are_unverifiable() {
     let (repo, cfg) = setup();
     let parent = git(&repo, &cfg, &["rev-parse", "HEAD^"]);
