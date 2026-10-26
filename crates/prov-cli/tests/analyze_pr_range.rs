@@ -279,6 +279,33 @@ fn test_pr_human_only_note_with_none_recorded_has_no_checkpoint_warning() {
 }
 
 #[test]
+fn test_pr_editor_marker_output_uses_no_human_terminology() {
+    let (repo, cfg, base, head) = setup_ai_pr(
+        "g.txt\n  h_editor 1-2\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+
+    for args in [
+        vec!["--base", &base, "--head", &head, "--explain"],
+        vec!["--base", &base, "--head", &head, "--json", "--explain"],
+    ] {
+        let out = prov(&repo, &cfg, &args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let whole_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .to_lowercase();
+        assert!(!whole_output.contains("human"), "{whole_output}");
+        if args.contains(&"--json") {
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(value["editor_marked_lines"], 2);
+            assert_eq!(value["explanations"][0]["reason_code"], "editor_marker");
+        }
+    }
+}
+
+#[test]
 fn test_human_only_note_does_not_warn_about_missing_checkpoints_in_pr() {
     let (repo, cfg) = setup_repo();
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
