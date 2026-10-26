@@ -71,7 +71,7 @@ Fixtures for these are in `crates/prov-gitai/tests/fixtures` and pinned by tests
 - Blame runs per whole file and can be slow on very large files.
 - Raw checkpoints exist only on the developer machine for a limited time.
 - none_recorded relies on Git AI's working_logs layout (an old-<parent> folder with no checkpoints.jsonl); if Git AI changes this or prunes only the file, real AI lines may be counted as unknown (the safe direction). The local agent's own evidence record replaces this heuristic.
-- Unverifiable AI claims are currently `ai_probable`; whether they should remain `ai_strong` is an open decision.
+- Unverifiable AI claims are `ai_probable` by design (see the ai_probable definition in the docs); they are never `ai_strong`.
 
 Not built yet: broader rewrite lineage, coverage dimensions, evidence levels beyond categories, storage, signing.
 
