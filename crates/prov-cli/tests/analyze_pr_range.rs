@@ -251,6 +251,26 @@ fn test_pr_none_recorded_does_not_warn_when_ai_claim_matches_no_added_lines() {
 }
 
 #[test]
+fn test_legacy_prompt_claim_with_none_recorded_checkpoints() {
+    let (repo, cfg, base, head) = setup_ai_pr(
+        "g.txt\n  abc123 1-2\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    let folder = repo.join(".git/ai/working_logs").join(format!("old-{base}"));
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(".archived_at"), "archived").unwrap();
+
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--json", "--explain"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["per_commit"][0]["checkpoints_state"], "none_recorded");
+    assert_eq!(value["counts"]["probable"], 2);
+    assert_eq!(value["counts"]["unknown"], 0);
+    assert_eq!(value["explanations"][0]["category"], "ai_probable");
+    assert_eq!(value["explanations"][0]["reason_code"], "ai_unverified");
+    assert!(!value["warnings"].to_string().contains("Git AI recorded no raw checkpoints"));
+}
+
+#[test]
 fn test_pr_missing_checkpoints_state_is_missing() {
     let (repo, cfg, base, head) = setup_ai_pr(
         "g.txt\n  s_1::t_ai 1-2\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
