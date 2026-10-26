@@ -6,7 +6,8 @@
 use prov_core::{Category, LineCounts};
 use prov_gitai::{
     classify_added_lines_explained, parse_blame_porcelain,
-    parse_checkpoints_jsonl, parse_note, parse_unified_diff_added_lines, Backing, BlameLine,
+    parse_checkpoints_jsonl, parse_note, parse_unified_diff_added_lines_with_text, Backing,
+    BlameLine,
     ActorKind, ExclusionPolicy, LineExplanation, MappingPolicy, NoteMeta, ParsedNote, ReasonCode,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -86,6 +87,27 @@ fn has_ai_claim(note: &ParsedNote) -> bool {
         .iter()
         .flat_map(|file| &file.entries)
         .any(|entry| matches!(entry.kind, ActorKind::AiSession | ActorKind::Prompt))
+}
+
+fn filter_blank_added_lines(
+    added: &BTreeMap<String, BTreeMap<u32, String>>,
+) -> (BTreeMap<String, BTreeSet<u32>>, u64) {
+    let mut nonblank = BTreeMap::new();
+    let mut blank_count = 0u64;
+    for (path, lines) in added {
+        let mut kept = BTreeSet::new();
+        for (&line_number, text) in lines {
+            if text.trim().is_empty() {
+                blank_count += 1;
+            } else {
+                kept.insert(line_number);
+            }
+        }
+        if !kept.is_empty() {
+            nonblank.insert(path.clone(), kept);
+        }
+    }
+    (nonblank, blank_count)
 }
 
 fn load_evidence(repo: &Path, git_dir: &Path, sha: &str, parent: Option<&str>) -> Evidence {
@@ -216,7 +238,8 @@ fn run_single_commit(
             &sha,
         ],
     )?;
-    let added = parse_unified_diff_added_lines(&diff);
+    let (added, blank_added_lines) =
+        filter_blank_added_lines(&parse_unified_diff_added_lines_with_text(&diff));
 
     let mut warnings: Vec<String> = Vec::new();
     let git_dir = PathBuf::from(
@@ -282,9 +305,11 @@ fn run_single_commit(
     if json {
         let v = serde_json::json!({
             "schema_version": "prov.analysis/0.1",
+            "counting_policy": "nonblank-v1",
             "commit": sha, "subject": subject, "note_found": note_found,
             "raw_checkpoints": { "found": cp_found, "path": cp_path.as_ref().map(|p| p.display().to_string()), "count": cp_count, "error": cp_error },
             "eligible_added_lines": m.eligible,
+            "blank_added_lines": blank_added_lines,
             "counts": m.counts,
             "ai_deterministic_pct": m.ai_deterministic_pct,
             "ai_linked_pct": m.ai_linked_pct,
@@ -306,6 +331,7 @@ fn run_single_commit(
             "Eligible added lines: {}   (excluded: {})",
             m.eligible, c.excluded
         );
+        println!("Counting policy: nonblank-v1   Blank added lines: {blank_added_lines}");
         println!(
             "  ai_direct {}  ai_strong {}  ai_probable {}  mixed {}  unknown {}",
             c.direct, c.strong, c.probable, c.mixed, c.unknown
@@ -394,7 +420,8 @@ fn run_pr_range(
             &format!("{base_sha}...{head_sha}"),
         ],
     )?;
-    let added_in_head = parse_unified_diff_added_lines(&diff);
+    let (added_in_head, blank_added_lines) =
+        filter_blank_added_lines(&parse_unified_diff_added_lines_with_text(&diff));
 
     let mapping = MappingPolicy::default();
     let exclusion = ExclusionPolicy::with_lockfiles();
@@ -613,11 +640,13 @@ fn run_pr_range(
 
         let mut v = serde_json::json!({
             "schema_version": "prov.analysis/0.1",
+            "counting_policy": "nonblank-v1",
             "mode": "pr_range",
             "base": base_sha,
             "head": head_sha,
             "commits_in_range": commits.len(),
             "eligible_added_lines": metric.eligible,
+            "blank_added_lines": blank_added_lines,
             "counts": metric.counts,
             "ai_deterministic_pct": metric.ai_deterministic_pct,
             "ai_linked_pct": metric.ai_linked_pct,
@@ -646,6 +675,7 @@ fn run_pr_range(
             "Eligible added lines: {}   (excluded: {})",
             metric.eligible, c.excluded
         );
+        println!("Counting policy: nonblank-v1   Blank added lines: {blank_added_lines}");
         println!(
             "  ai_direct {}  ai_strong {}  ai_probable {}  mixed {}  unknown {}",
             c.direct, c.strong, c.probable, c.mixed, c.unknown

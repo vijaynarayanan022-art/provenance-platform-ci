@@ -32,7 +32,18 @@ fn clean_path(raw: &str) -> Option<String> {
 /// mistaken for added lines. Binary files have no hunks and yield nothing.
 /// Limitation: run git with `-c core.quotepath=false`; escaped (quoted) paths are not decoded.
 pub fn parse_unified_diff_added_lines(diff: &str) -> BTreeMap<String, BTreeSet<u32>> {
-    let mut out: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    parse_unified_diff_added_lines_with_text(diff)
+        .into_iter()
+        .map(|(path, lines)| (path, lines.into_keys().collect()))
+        .collect()
+}
+
+/// Parse added lines while retaining each line's text in memory for counting policy filters.
+/// Line contents are returned only to the caller and are never persisted or logged here.
+pub fn parse_unified_diff_added_lines_with_text(
+    diff: &str,
+) -> BTreeMap<String, BTreeMap<u32, String>> {
+    let mut out: BTreeMap<String, BTreeMap<u32, String>> = BTreeMap::new();
     let mut path: Option<String> = None;
     let (mut old_left, mut new_left, mut new_line) = (0u32, 0u32, 0u32);
 
@@ -59,7 +70,9 @@ pub fn parse_unified_diff_added_lines(diff: &str) -> BTreeMap<String, BTreeSet<u
         }
         if line.starts_with('+') && new_left > 0 {
             if let Some(p) = &path {
-                out.entry(p.clone()).or_default().insert(new_line);
+                out.entry(p.clone())
+                    .or_default()
+                    .insert(new_line, line[1..].to_string());
             }
             new_line += 1;
             new_left -= 1;
@@ -115,5 +128,14 @@ mod tests {
         let m = parse_unified_diff_added_lines(d);
         assert!(!m.contains_key("d.txt"));
         assert_eq!(lines(&m, "e.txt"), vec![1]);
+    }
+
+    #[test]
+    fn added_lines_keep_text_in_memory() {
+        let d = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1,3 @@\n+text\n+  \n+\n";
+        let m = parse_unified_diff_added_lines_with_text(d);
+        assert_eq!(m["a.txt"][&1], "text");
+        assert_eq!(m["a.txt"][&2], "  ");
+        assert_eq!(m["a.txt"][&3], "");
     }
 }

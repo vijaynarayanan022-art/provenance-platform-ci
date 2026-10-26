@@ -15,5 +15,5 @@ pub mod note;
 pub use blame::{parse_blame_porcelain, BlameLine};
 pub use checkpoints::{parse_checkpoints_jsonl, Backing, RawCheckpoint};
 pub use classify::{classify_added_lines, classify_added_lines_backed, classify_added_lines_explained, ExclusionPolicy, LineExplanation, MappingPolicy, PrAnalysis, ReasonCode};
-pub use diff::parse_unified_diff_added_lines;
+pub use diff::{parse_unified_diff_added_lines, parse_unified_diff_added_lines_with_text};
 pub use note::{parse_note, ActorKind, Entry, FileAttestation, LineRange, NoteMeta, ParseError, ParsedNote};

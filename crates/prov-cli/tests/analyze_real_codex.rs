@@ -152,6 +152,23 @@ fn analyze_unreadable_note_has_note_unreadable_reason() {
 }
 
 #[test]
+fn analyze_single_commit_with_only_blank_additions_counts_no_eligible_lines() {
+    let (repo, cfg) = setup();
+    std::fs::write(repo.join("blank-only.txt"), "\n \t\n").unwrap();
+    git(&repo, &cfg, &["add", "blank-only.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "blank additions only"]);
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["counting_policy"], "nonblank-v1");
+    assert_eq!(v["blank_added_lines"], 2);
+    assert_eq!(v["eligible_added_lines"], 0);
+    assert_eq!(v["counts"]["unknown"], 0);
+    assert!(v["ai_deterministic_pct"].is_null());
+}
+
+#[test]
 fn analyze_malformed_raw_checkpoints_are_unverifiable() {
     let (repo, cfg) = setup();
     let parent = git(&repo, &cfg, &["rev-parse", "HEAD^"]);

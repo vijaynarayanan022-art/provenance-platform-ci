@@ -220,6 +220,43 @@ fn test_human_only_note_does_not_warn_about_missing_checkpoints_in_pr() {
 }
 
 #[test]
+fn test_pr_counts_only_nonblank_added_lines() {
+    let (repo, cfg) = setup_repo();
+    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "base.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+
+    std::fs::write(repo.join("mixed.txt"), "ai one\n\n \t \nai two\n").unwrap();
+    std::fs::write(repo.join("blank.txt"), "\n \t\n").unwrap();
+    git(&repo, &cfg, &["add", "mixed.txt", "blank.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "AI with blank lines"]);
+    let head = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    write_note(
+        &repo,
+        &cfg,
+        &head,
+        "mixed.txt\n  s_1::t_ai 1,4\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    write_checkpoints(&repo, &base, "{\"kind\":\"AiAgent\",\"trace_id\":\"t_ai\"}\n");
+
+    let json_out = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--json"]);
+    assert!(json_out.status.success(), "{}", String::from_utf8_lossy(&json_out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(v["counting_policy"], "nonblank-v1");
+    assert_eq!(v["blank_added_lines"], 4);
+    assert_eq!(v["eligible_added_lines"], 2);
+    assert_eq!(v["counts"]["strong"], 2);
+    assert_eq!(v["counts"]["excluded"], 0);
+
+    let text_out = prov(&repo, &cfg, &["--base", &base, "--head", &head]);
+    assert!(text_out.status.success(), "{}", String::from_utf8_lossy(&text_out.stderr));
+    let report = String::from_utf8_lossy(&text_out.stdout);
+    assert!(report.contains("Counting policy: nonblank-v1"));
+    assert!(report.contains("Blank added lines: 4"));
+}
+
+#[test]
 fn test_malformed_checkpoints_in_pr_are_unverifiable() {
     let (repo, cfg) = setup_repo();
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
