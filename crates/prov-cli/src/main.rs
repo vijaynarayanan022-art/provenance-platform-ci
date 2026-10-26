@@ -64,6 +64,15 @@ impl CheckpointsState {
             Self::Unreadable => "unreadable",
         }
     }
+
+    fn text_label(self) -> &'static str {
+        match self {
+            Self::Found => "found",
+            Self::NoneRecorded => "none recorded",
+            Self::Missing => "missing",
+            Self::Unreadable => "unreadable",
+        }
+    }
 }
 
 fn find_checkpoints(git_dir: &Path, parent: Option<&str>) -> (Option<PathBuf>, bool) {
@@ -743,7 +752,7 @@ fn run_pr_range(
                 ci.subject,
                 ci.lines_attributed,
                 if ci.note_found { "yes" } else { "no" },
-                if ci.checkpoints_found { "yes" } else { "no" },
+                ci.checkpoints_state.text_label(),
             );
         }
 

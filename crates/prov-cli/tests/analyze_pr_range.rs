@@ -782,6 +782,7 @@ f.txt
     assert!(s.contains("PR range:"));
     assert!(s.contains("Eligible added lines: 2"));
     assert!(s.contains("AI deterministic: 100.0%"));
+    assert!(s.contains("checkpoints:found"));
     assert!(s.contains("--- Per-line explanations ---"));
     assert!(s.contains("f.txt:"));
     assert!(s.contains("L2: ai_strong"));
