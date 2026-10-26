@@ -73,13 +73,14 @@ fn analyze_downgrades_unbacked_human_lines() {
 }
 
 #[test]
-fn analyze_warns_when_raw_checkpoints_are_missing() {
+fn analyze_marks_ai_claims_probable_when_raw_checkpoints_are_missing() {
     let (repo, cfg) = setup();
     std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
     let out = prov(&repo, &cfg, &["--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["raw_checkpoints"]["found"], false);
-    assert_eq!(v["counts"]["strong"], 6, "unverifiable: claims are kept but flagged");
+    assert_eq!(v["counts"]["probable"], 6, "unverifiable claims are probable");
+    assert_eq!(v["counts"]["strong"], 0);
     assert!(v["warnings"].to_string().contains("could NOT be verified"));
 }
 
@@ -107,6 +108,8 @@ fn prompt_claim_warns_when_raw_checkpoints_are_missing_in_single_commit_mode() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["warnings"].to_string().contains("AI claims in the note could NOT be verified"));
+    assert_eq!(v["counts"]["probable"], 6);
+    assert!(v["explanations"].as_array().unwrap().iter().all(|e| e["reason_code"] == "ai_unverified"));
 }
 
 #[test]
@@ -181,7 +184,8 @@ fn analyze_malformed_raw_checkpoints_are_unverifiable() {
     let out = prov(&repo, &cfg, &["--json"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["counts"]["strong"], 6);
+    assert_eq!(v["counts"]["probable"], 6);
+    assert_eq!(v["counts"]["strong"], 0);
     assert_eq!(v["raw_checkpoints"]["found"], false);
     assert!(!v["raw_checkpoints"]["error"].as_str().unwrap().is_empty());
     assert!(v["warnings"].to_string().contains("raw checkpoints could not be read"));

@@ -22,11 +22,11 @@ fn approx(a: Option<f64>, b: f64) {
 fn test2_human_marked_lines_are_not_ai() {
     let note = parse_note(include_str!("fixtures/test2-note.txt")).unwrap();
     let r = classify_added_lines(&note, &added_4_to_9(), &MappingPolicy::default(), &ExclusionPolicy::default());
-    assert_eq!(r.metric.counts.strong, 4);
+    assert_eq!(r.metric.counts.probable, 4);
     assert_eq!(r.metric.counts.unknown, 2);
     assert_eq!(r.known_human_lines, 2);
     assert_eq!(r.metric.eligible, 6);
-    approx(r.metric.ai_deterministic_pct, 400.0 / 6.0);
+    approx(r.metric.ai_deterministic_pct, 0.0);
 }
 
 /// KNOWN LIMITATION of Git AI (observed in lab): human lines typed after the last AI checkpoint
@@ -37,9 +37,9 @@ fn test2_human_marked_lines_are_not_ai() {
 fn test1_unmarked_human_lines_get_credited_to_ai_by_git_ai() {
     let note = parse_note(include_str!("fixtures/test1-note.txt")).unwrap();
     let r = classify_added_lines(&note, &added_4_to_9(), &MappingPolicy::default(), &ExclusionPolicy::default());
-    assert_eq!(r.metric.counts.strong, 6, "Git AI claimed all 6 added lines for the AI session");
+    assert_eq!(r.metric.counts.probable, 6, "the AI claim has no raw checkpoint verification");
     assert_eq!(r.metric.counts.unknown, 0);
-    approx(r.metric.ai_deterministic_pct, 100.0);
+    approx(r.metric.ai_deterministic_pct, 0.0);
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn windows_style_paths_match() {
     let mut added = BTreeMap::new();
     added.insert("app.txt".replace('/', "\\"), (4..=7).collect::<BTreeSet<u32>>());
     let r = classify_added_lines(&note, &added, &MappingPolicy::default(), &ExclusionPolicy::default());
-    assert_eq!(r.metric.counts.strong, 4);
+    assert_eq!(r.metric.counts.probable, 4);
 }
 
 /// REAL tool (Codex CLI via Git AI hooks, Windows). Codex appended 4 lines (4-7); the human then
@@ -89,7 +89,7 @@ fn real_codex_unmarked_human_lines_credited_to_ai() {
     let mut added = BTreeMap::new();
     added.insert("notes.txt".to_string(), (4..=9).collect::<BTreeSet<u32>>());
     let r = classify_added_lines(&note, &added, &MappingPolicy::default(), &ExclusionPolicy::default());
-    assert_eq!(r.metric.counts.strong, 6);
+    assert_eq!(r.metric.counts.probable, 6);
     assert_eq!(r.known_human_lines, 0);
     let traces: Vec<_> = note.files[0].entries.iter().filter_map(|e| e.trace.clone()).collect();
     assert_eq!(traces.len(), 2, "same session, two trace ids; the 2nd covers the human-typed lines");
@@ -117,12 +117,12 @@ fn real_codex_unbacked_trace_becomes_unknown() {
 }
 
 #[test]
-fn without_raw_checkpoints_nothing_is_downgraded() {
+fn without_raw_checkpoints_ai_claims_become_probable() {
     let note = parse_note(include_str!("fixtures/real1-codex-note.txt")).unwrap();
     let mut added = BTreeMap::new();
     added.insert("notes.txt".to_string(), (4..=9).collect::<BTreeSet<u32>>());
     let r = classify_added_lines_backed(&note, &added, &MappingPolicy::default(), &ExclusionPolicy::default(), None);
-    assert_eq!(r.metric.counts.strong, 6);
+    assert_eq!(r.metric.counts.probable, 6);
     assert_eq!(r.unbacked_ai_lines, 0);
 }
 

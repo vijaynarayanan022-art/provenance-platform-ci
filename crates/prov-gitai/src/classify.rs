@@ -148,6 +148,7 @@ pub fn classify_added_lines_explained(
         let file = note.files.iter().find(|f| norm(&f.path) == normed);
         for &line in lines {
             let mut ai = false;
+            let mut ai_verified = false;
             let mut human = false;
             let mut unbacked_here = false;
             let mut reason_parts: Vec<String> = Vec::new();
@@ -157,29 +158,35 @@ pub fn classify_added_lines_explained(
                         match e.kind {
                             ActorKind::AiSession | ActorKind::Prompt => {
                                 let trace_desc = e.trace.as_deref().unwrap_or("none");
-                                let backed = match (backing, e.trace.as_deref()) {
-                                    (Some(b), Some(t)) => b.contains_trace(t),
-                                    _ => true,
-                                };
-                                if backed {
-                                    ai = true;
-                                    if backing.is_some() {
+                                match (backing, e.trace.as_deref()) {
+                                    (Some(b), Some(t)) if b.contains_trace(t) => {
+                                        ai = true;
+                                        ai_verified = true;
                                         reason_parts.push(format!(
                                             "AI session claim, trace {} backed by checkpoint",
                                             trace_desc
                                         ));
-                                    } else {
+                                    }
+                                    (Some(_), Some(_)) => {
+                                        unbacked_here = true;
                                         reason_parts.push(format!(
-                                            "AI session claim, trace {} (no checkpoints to verify)",
+                                            "trace {} not in raw checkpoints -> unknown",
                                             trace_desc
                                         ));
                                     }
-                                } else {
-                                    unbacked_here = true;
-                                    reason_parts.push(format!(
-                                        "trace {} not in raw checkpoints -> unknown",
-                                        trace_desc
-                                    ));
+                                    (Some(_), None) => {
+                                        ai = true;
+                                        reason_parts.push(
+                                            "AI claim has no trace id; could not be verified -> ai_probable".into(),
+                                        );
+                                    }
+                                    (None, _) => {
+                                        ai = true;
+                                        reason_parts.push(format!(
+                                            "AI session claim, trace {} (raw checkpoints unavailable) -> ai_probable",
+                                            trace_desc
+                                        ));
+                                    }
                                 }
                             }
                             ActorKind::KnownHuman => {
@@ -199,12 +206,11 @@ pub fn classify_added_lines_explained(
 
             let (cat, reason_code) = match (ai, human) {
                 (true, false) => {
-                    let rc = if backing.is_some() {
-                        ReasonCode::AiBackedByCheckpoint
+                    if ai_verified {
+                        (mapping.ai_session, ReasonCode::AiBackedByCheckpoint)
                     } else {
-                        ReasonCode::AiUnverified
-                    };
-                    (mapping.ai_session, rc)
+                        (Category::AiProbable, ReasonCode::AiUnverified)
+                    }
                 }
                 (false, true) => {
                     known_human += 1;

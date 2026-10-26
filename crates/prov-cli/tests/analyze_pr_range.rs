@@ -176,7 +176,7 @@ file.txt
 }
 
 #[test]
-fn test_missing_checkpoints_leave_ai_claims_strong_and_warn() {
+fn test_missing_checkpoints_make_ai_claims_probable_and_warn() {
     let (repo, cfg) = setup_repo();
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
     git(&repo, &cfg, &["add", "base.txt"]);
@@ -191,7 +191,8 @@ fn test_missing_checkpoints_leave_ai_claims_strong_and_warn() {
     let out = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--json"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["counts"]["strong"], 2);
+    assert_eq!(v["counts"]["probable"], 2);
+    assert_eq!(v["counts"]["strong"], 0);
     assert_eq!(v["unattributed_lines"], 0);
     assert_eq!(v["per_commit"][0]["checkpoints_found"], false);
     assert!(v["warnings"].to_string().contains("could NOT be verified"));
@@ -247,6 +248,7 @@ fn test_pr_counts_only_nonblank_added_lines() {
     assert_eq!(v["blank_added_lines"], 4);
     assert_eq!(v["eligible_added_lines"], 2);
     assert_eq!(v["counts"]["strong"], 2);
+    assert_eq!(v["counts"]["probable"], 0);
     assert_eq!(v["counts"]["excluded"], 0);
 
     let text_out = prov(&repo, &cfg, &["--base", &base, "--head", &head]);
@@ -273,7 +275,8 @@ fn test_malformed_checkpoints_in_pr_are_unverifiable() {
     let out = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--json"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["counts"]["strong"], 1);
+    assert_eq!(v["counts"]["probable"], 1);
+    assert_eq!(v["counts"]["strong"], 0);
     assert_eq!(v["per_commit"][0]["checkpoints_found"], false);
     assert!(!v["per_commit"][0]["checkpoints_error"].as_str().unwrap().is_empty());
     assert!(v["warnings"].to_string().contains("raw checkpoints could not be read"));
@@ -547,6 +550,8 @@ fn prompt_claim_warns_when_raw_checkpoints_are_missing_in_pr_range_mode() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["warnings"].to_string().contains("AI claims could NOT be verified"));
+    assert_eq!(v["counts"]["probable"], 1);
+    assert_eq!(v["explanations"][0]["reason_code"], "ai_unverified");
 }
 
 #[test]
