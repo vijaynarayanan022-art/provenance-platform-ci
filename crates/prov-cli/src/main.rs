@@ -335,7 +335,10 @@ fn run_single_commit(
         }
     }
     let m = &r.metric;
-    if cp_state == CheckpointsState::NoneRecorded && note_has_ai_claim {
+    if cp_state == CheckpointsState::NoneRecorded
+        && note_has_ai_claim
+        && r.unbacked_ai_lines > 0
+    {
         warnings.push(format!(
             "commit {}: Git AI recorded no raw checkpoints for this commit but the note claims AI; {} line(s) counted as unknown",
             &sha[..sha.len().min(10)],
@@ -616,7 +619,10 @@ fn run_pr_range(
         total_known_human += r.known_human_lines;
         total_conflicts += r.conflicting_lines;
         total_unbacked += r.unbacked_ai_lines;
-        if evidence.cp_state == CheckpointsState::NoneRecorded && note_has_ai_claim {
+        if evidence.cp_state == CheckpointsState::NoneRecorded
+            && note_has_ai_claim
+            && r.unbacked_ai_lines > 0
+        {
             warnings.push(format!(
                 "commit {}: Git AI recorded no raw checkpoints for this commit but the note claims AI; {} line(s) counted as unknown",
                 &commit_sha[..10.min(commit_sha.len())],
