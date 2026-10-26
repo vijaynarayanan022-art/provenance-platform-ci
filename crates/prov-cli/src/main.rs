@@ -47,19 +47,40 @@ fn pct(v: Option<f64>) -> String {
     v.map(|x| format!("{x:.1}%")).unwrap_or_else(|| "n/a".to_string())
 }
 
-fn find_checkpoints(git_dir: &Path, parent: Option<&str>) -> Option<PathBuf> {
-    let key = parent.unwrap_or("initial");
-    for dir in [format!("old-{key}"), key.to_string()] {
-        let p = git_dir
-            .join("ai")
-            .join("working_logs")
-            .join(dir)
-            .join("checkpoints.jsonl");
-        if p.is_file() {
-            return Some(p);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointsState {
+    Found,
+    NoneRecorded,
+    Missing,
+    Unreadable,
+}
+
+impl CheckpointsState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Found => "found",
+            Self::NoneRecorded => "none_recorded",
+            Self::Missing => "missing",
+            Self::Unreadable => "unreadable",
         }
     }
-    None
+}
+
+fn find_checkpoints(git_dir: &Path, parent: Option<&str>) -> (Option<PathBuf>, bool) {
+    let key = parent.unwrap_or("initial");
+    let mut existing_folder = false;
+    for dir in [format!("old-{key}"), key.to_string()] {
+        let folder = git_dir
+            .join("ai")
+            .join("working_logs")
+            .join(dir);
+        existing_folder |= folder.is_dir();
+        let p = folder.join("checkpoints.jsonl");
+        if p.is_file() {
+            return (Some(p), true);
+        }
+    }
+    (None, existing_folder)
 }
 
 /// Evidence loaded for one commit. Parse failures never abort the analysis.
@@ -73,6 +94,7 @@ struct Evidence {
     cp_path: Option<PathBuf>,
     cp_count: usize,
     cp_error: Option<String>,
+    cp_state: CheckpointsState,
 }
 
 fn empty_note() -> ParsedNote {
@@ -121,19 +143,25 @@ fn load_evidence(repo: &Path, git_dir: &Path, sha: &str, parent: Option<&str>) -
         None => (empty_note(), false, None),
     };
 
-    let cp_path = find_checkpoints(git_dir, parent);
-    let (backing, cp_count, cp_error) = match &cp_path {
+    let (cp_path, folder_found) = find_checkpoints(git_dir, parent);
+    let (backing, cp_count, cp_error, cp_state) = match &cp_path {
         Some(p) => match std::fs::read_to_string(p) {
             Ok(text) => match parse_checkpoints_jsonl(&text) {
                 Ok(cps) => {
                     let n = cps.len();
-                    (Some(Backing::from_checkpoints(&cps)), n, None)
+                    (Some(Backing::from_checkpoints(&cps)), n, None, CheckpointsState::Found)
                 }
-                Err(e) => (None, 0, Some(e.to_string())),
+                Err(e) => (None, 0, Some(e.to_string()), CheckpointsState::Unreadable),
             },
-            Err(e) => (None, 0, Some(e.to_string())),
+            Err(e) => (None, 0, Some(e.to_string()), CheckpointsState::Unreadable),
         },
-        None => (None, 0, None),
+        None if folder_found => (
+            Some(Backing::default()),
+            0,
+            None,
+            CheckpointsState::NoneRecorded,
+        ),
+        None => (None, 0, None, CheckpointsState::Missing),
     };
 
     Evidence {
@@ -145,6 +173,7 @@ fn load_evidence(repo: &Path, git_dir: &Path, sha: &str, parent: Option<&str>) -
         cp_path,
         cp_count,
         cp_error,
+        cp_state,
     }
 }
 
@@ -157,6 +186,7 @@ struct CommitInfo {
     note_error: Option<String>,
     checkpoints_found: bool,
     checkpoints_error: Option<String>,
+    checkpoints_state: CheckpointsState,
     lines_attributed: u64,
 }
 
@@ -254,6 +284,7 @@ fn run_single_commit(
     let cp_path = evidence.cp_path;
     let cp_count = evidence.cp_count;
     let cp_found = cp_path.is_some() && evidence.cp_error.is_none();
+    let cp_state = evidence.cp_state;
     let cp_error = evidence.cp_error;
     let backing = evidence.backing;
     if let Some(err) = evidence.note_error {
@@ -307,7 +338,7 @@ fn run_single_commit(
             "schema_version": "prov.analysis/0.2",
             "counting_policy": "nonblank-v1",
             "commit": sha, "subject": subject, "note_found": note_found,
-            "raw_checkpoints": { "found": cp_found, "path": cp_path.as_ref().map(|p| p.display().to_string()), "count": cp_count, "error": cp_error },
+            "raw_checkpoints": { "found": cp_found, "state": cp_state.as_str(), "path": cp_path.as_ref().map(|p| p.display().to_string()), "count": cp_count, "error": cp_error },
             "eligible_added_lines": m.eligible,
             "blank_added_lines": blank_added_lines,
             "counts": m.counts,
@@ -543,6 +574,7 @@ fn run_pr_range(
         let note = evidence.note;
         let note_has_ai_claim = has_ai_claim(&note);
         let checkpoints_found = evidence.cp_path.is_some() && evidence.cp_error.is_none();
+        let checkpoints_state = evidence.cp_state;
         let backing = evidence.backing;
         if let Some(err) = &evidence.note_error {
             warnings.push(format!("commit {}: Git AI note could not be read ({err}); {} line(s) counted as unknown", &commit_sha[..10.min(commit_sha.len())], commit_line_count));
@@ -603,6 +635,7 @@ fn run_pr_range(
             note_error: evidence.note_error,
             checkpoints_found,
             checkpoints_error: evidence.cp_error,
+            checkpoints_state,
             lines_attributed: commit_line_count,
         });
 
@@ -633,6 +666,7 @@ fn run_pr_range(
                     "note_error": ci.note_error,
                     "checkpoints_found": ci.checkpoints_found,
                     "checkpoints_error": ci.checkpoints_error,
+                    "checkpoints_state": ci.checkpoints_state.as_str(),
                     "lines_in_final": ci.lines_attributed,
                 })
             })

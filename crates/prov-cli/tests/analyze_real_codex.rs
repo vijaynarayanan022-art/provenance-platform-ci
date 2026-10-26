@@ -85,6 +85,82 @@ fn analyze_marks_ai_claims_probable_when_raw_checkpoints_are_missing() {
 }
 
 #[test]
+fn analyze_none_recorded_checkpoints_make_ai_trace_unbacked() {
+    let (repo, cfg) = setup();
+    let parent = git(&repo, &cfg, &["rev-parse", "HEAD^"]);
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let folder = repo.join(".git/ai/working_logs").join(format!("old-{parent}"));
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(".archived_at"), "archived").unwrap();
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["raw_checkpoints"]["state"], "none_recorded");
+    assert_eq!(v["counts"]["unknown"], 6);
+    assert_eq!(v["counts"]["probable"], 0);
+    assert_eq!(v["unbacked_ai_lines"], 6);
+}
+
+#[test]
+fn analyze_root_commit_with_empty_old_initial_is_none_recorded() {
+    let (repo, cfg) = setup();
+    let root = git(&repo, &cfg, &["rev-list", "--max-parents=0", "HEAD"]);
+    let note_path = repo.join(".git/root-note.txt");
+    std::fs::write(
+        &note_path,
+        "notes.txt\n  s_root::t_root 1-3\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    )
+    .unwrap();
+    git(&repo, &cfg, &["notes", "--ref=ai", "add", "-f", "-F", note_path.to_str().unwrap(), &root]);
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let folder = repo.join(".git/ai/working_logs/old-initial");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(".archived_at"), "archived").unwrap();
+
+    let out = prov(&repo, &cfg, &["--commit", &root, "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["raw_checkpoints"]["state"], "none_recorded");
+    assert_eq!(v["counts"]["unknown"], 3);
+    assert_eq!(v["unbacked_ai_lines"], 3);
+}
+
+#[test]
+fn analyze_missing_checkpoints_state_is_missing() {
+    let (repo, cfg) = setup();
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["raw_checkpoints"]["state"], "missing");
+    assert_eq!(v["counts"]["probable"], 6);
+}
+
+#[test]
+fn analyze_human_only_note_with_none_recorded_has_no_checkpoint_warning() {
+    let (repo, cfg) = setup();
+    let note_path = repo.join(".git/editor-only-note.txt");
+    std::fs::write(
+        &note_path,
+        "notes.txt\n  h_editor 4-9\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    )
+    .unwrap();
+    git(&repo, &cfg, &["notes", "--ref=ai", "add", "-f", "-F", note_path.to_str().unwrap(), "HEAD"]);
+    let parent = git(&repo, &cfg, &["rev-parse", "HEAD^"]);
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let folder = repo.join(".git/ai/working_logs").join(format!("old-{parent}"));
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(".archived_at"), "archived").unwrap();
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["raw_checkpoints"]["state"], "none_recorded");
+    assert!(!v["warnings"].to_string().contains("raw checkpoints"));
+}
+
+#[test]
 fn analyze_single_commit_without_note_reports_no_note_reason() {
     let (repo, cfg) = setup();
     git(&repo, &cfg, &["notes", "--ref=ai", "remove", "HEAD"]);
