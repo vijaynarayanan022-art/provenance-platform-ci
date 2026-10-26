@@ -100,6 +100,10 @@ fn analyze_none_recorded_checkpoints_make_ai_trace_unbacked() {
     assert_eq!(v["counts"]["unknown"], 6);
     assert_eq!(v["counts"]["probable"], 0);
     assert_eq!(v["unbacked_ai_lines"], 6);
+    assert!(v["warnings"].to_string().contains(
+        "Git AI recorded no raw checkpoints for this commit but the note claims AI; 6 line(s) counted as unknown"
+    ));
+    assert!(!v["warnings"].to_string().contains("could NOT be verified"));
 }
 
 #[test]

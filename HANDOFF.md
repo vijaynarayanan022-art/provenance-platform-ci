@@ -70,6 +70,7 @@ Fixtures for these are in `crates/prov-gitai/tests/fixtures` and pinned by tests
 - Whitespace-only rewrites by a later commit take over blame credit and are counted as unknown; docs have a `FORMAT_TRANSFORMATION` basis for this later case.
 - Blame runs per whole file and can be slow on very large files.
 - Raw checkpoints exist only on the developer machine for a limited time.
+- none_recorded relies on Git AI's working_logs layout (an old-<parent> folder with no checkpoints.jsonl); if Git AI changes this or prunes only the file, real AI lines may be counted as unknown (the safe direction). The local agent's own evidence record replaces this heuristic.
 - Unverifiable AI claims are currently `ai_probable`; whether they should remain `ai_strong` is an open decision.
 
 Not built yet: broader rewrite lineage, coverage dimensions, evidence levels beyond categories, storage, signing.
