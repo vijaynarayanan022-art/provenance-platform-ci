@@ -62,7 +62,7 @@ fn analyze_downgrades_unbacked_human_lines() {
     let out = prov(&repo, &cfg, &["--json"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["schema_version"], "prov.analysis/0.1");
+    assert_eq!(v["schema_version"], "prov.analysis/0.2");
     assert_eq!(v["eligible_added_lines"], 6);
     assert_eq!(v["counts"]["strong"], 4);
     assert_eq!(v["counts"]["unknown"], 2);
@@ -127,7 +127,7 @@ fn analyze_human_only_note_does_not_warn_about_missing_checkpoints() {
     let out = prov(&repo, &cfg, &["--json"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["known_human_lines"], 6);
+    assert_eq!(v["editor_marked_lines"], 6);
     assert_eq!(v["counts"]["unknown"], 6);
     assert!(!v["warnings"].to_string().contains("raw Git AI checkpoints not found"));
     assert!(!v["warnings"].to_string().contains("could NOT be verified"));
@@ -152,6 +152,38 @@ fn analyze_unreadable_note_has_note_unreadable_reason() {
     assert!(!v["warnings"].to_string().contains("no Git AI note"));
     assert_eq!(v["explanations"][0]["reason_code"], "note_unreadable");
     assert_eq!(v["explanations"][0]["reason"], "note could not be read -> unknown");
+}
+
+#[test]
+fn analyze_editor_marker_output_uses_no_human_terminology() {
+    let (repo, cfg) = setup();
+    git(&repo, &cfg, &["commit", "--amend", "-q", "-m", "codex addition"]);
+    let note_path = repo.join(".git/editor-marker-note.txt");
+    std::fs::write(
+        &note_path,
+        "notes.txt\n  h_editor 4-9\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    )
+    .unwrap();
+    git(&repo, &cfg, &["notes", "--ref=ai", "add", "-f", "-F", note_path.to_str().unwrap(), "HEAD"]);
+
+    for args in [&["--json"][..], &[][..]] {
+        let out = prov(&repo, &cfg, args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let whole_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .to_lowercase();
+        assert!(!whole_output.contains("human"), "{whole_output}");
+        if !args.is_empty() {
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(value["schema_version"], "prov.analysis/0.2");
+            assert_eq!(value["editor_marked_lines"], 6);
+            assert_eq!(value["explanations"][0]["reason_code"], "editor_marker");
+            assert_eq!(value["explanations"][0]["reason"], "editor marker -> unknown");
+        }
+    }
 }
 
 #[test]

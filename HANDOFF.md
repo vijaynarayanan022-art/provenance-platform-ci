@@ -55,12 +55,13 @@ Fixtures for these are in `crates/prov-gitai/tests/fixtures` and pinned by tests
 
 ## What is built in this repo
 - `prov-core`: `Category`, `Basis` codes, score bands, `LineCounts`, `PrMetric` (golden test: 30/20/10/5/35 -> 50% / 65%; excluded lines never change %).
-- `prov-gitai`: note parser, mapping policy (AI session -> `ai_strong` by default, known-human -> `unknown` + separate human signal, conflicts -> `unknown`), exclusion policy.
-- `prov-gitai::diff`: parser for `git diff-tree -p --unified=0` -> added line numbers per file.
+- `prov-gitai`: note parser, mapping policy (AI session -> `ai_strong` when verified; unverifiable AI claims -> `ai_probable`; editor markers and conflicts -> `unknown`), exclusion policy.
+- `prov-gitai::diff`: parser for `git diff-tree -p --unified=0` -> added line numbers and in-memory added-line text per file.
 - `prov-gitai::checkpoints`: raw checkpoint reader + `Backing` (trace ids with real AI evidence); `classify_added_lines_backed` downgrades unbacked AI claims to `unknown`.
-- `prov-cli` (binary `prov`): `prov analyze [--repo PATH] [--commit REV] [--json]` reports one commit; `--base REV --head REV` analyzes a PR range using merge-base diff semantics. Merge commits are rejected. JSON outputs use `prov.analysis/0.1`.
-- PR range reports place surviving added lines on commits using blame; unplaceable lines count as unknown and appear in `unattributed_lines`. `--explain` emits per-line categories and reason codes.
-- Evidence loading is shared by single-commit and PR modes. Unreadable notes count as unknown; unreadable or missing raw checkpoints make AI claims unverifiable and leave note claims at `ai_strong`.
+- `prov-cli` (binary `prov`): `prov analyze [--repo PATH] [--commit REV] [--json]` reports one commit; `--base REV --head REV` analyzes a PR range using merge-base diff semantics. Merge commits are rejected. JSON outputs use `prov.analysis/0.2`.
+- Counting policy `nonblank-v1` excludes empty or whitespace-only additions before placement, blame, and classification; both output formats report `blank_added_lines`.
+- PR range reports place surviving added lines on commits using blame; unplaceable lines count as unknown and appear in `unattributed_lines`. `--explain` emits per-line categories and reason codes. Editor marker lines are reported as `editor_marked_lines` with reason code `editor_marker`.
+- Evidence loading is shared by single-commit and PR modes. Unreadable notes count as unknown; unverifiable AI claims (missing or unreadable checkpoints, or a claim without a trace id) count as `ai_probable`, while checkpoint-backed claims count as `ai_strong`.
 - End-to-end tests rebuild the real Codex lab scenario and PR range histories in temporary repositories.
 
 ## Known limitations
@@ -69,7 +70,7 @@ Fixtures for these are in `crates/prov-gitai/tests/fixtures` and pinned by tests
 - Whitespace-only rewrites by a later commit take over blame credit and are counted as unknown; docs have a `FORMAT_TRANSFORMATION` basis for this later case.
 - Blame runs per whole file and can be slow on very large files.
 - Raw checkpoints exist only on the developer machine for a limited time.
-- Unverifiable AI claims currently remain `ai_strong`; whether these should be `ai_probable` is an open decision.
+- Unverifiable AI claims are currently `ai_probable`; whether they should remain `ai_strong` is an open decision.
 
 Not built yet: broader rewrite lineage, coverage dimensions, evidence levels beyond categories, storage, signing.
 

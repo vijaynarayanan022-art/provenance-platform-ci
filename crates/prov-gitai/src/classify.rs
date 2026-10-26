@@ -60,7 +60,7 @@ pub enum ReasonCode {
     AiBackedByCheckpoint,
     AiUnverified,
     UnbackedTrace,
-    KnownHuman,
+    EditorMarker,
     Conflict,
     NoteUnreadable,
     NoNoteEntry,
@@ -191,7 +191,7 @@ pub fn classify_added_lines_explained(
                             }
                             ActorKind::KnownHuman => {
                                 human = true;
-                                reason_parts.push("known-human marker -> unknown (no human category)".into());
+                                reason_parts.push("editor marker -> unknown".into());
                             }
                         }
                     }
@@ -214,11 +214,11 @@ pub fn classify_added_lines_explained(
                 }
                 (false, true) => {
                     known_human += 1;
-                    (Category::Unknown, ReasonCode::KnownHuman)
+                    (Category::Unknown, ReasonCode::EditorMarker)
                 }
                 (true, true) => {
                     conflicts += 1;
-                    reason_parts.push("conflicting AI + human claims -> unknown".into());
+                    reason_parts.push("conflicting AI + editor marker claims -> unknown".into());
                     (Category::Unknown, ReasonCode::Conflict)
                 }
                 (false, false) => {

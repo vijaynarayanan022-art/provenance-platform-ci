@@ -152,7 +152,7 @@ file.txt
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
 
     assert_eq!(v["mode"], "pr_range");
-    assert_eq!(v["schema_version"], "prov.analysis/0.1");
+    assert_eq!(v["schema_version"], "prov.analysis/0.2");
     assert_eq!(v["commits_in_range"], 2);
     assert_eq!(v["eligible_added_lines"], 8);
     assert_eq!(v["counts"]["strong"], 6); // 4 from c1 + 2 from c2
@@ -215,7 +215,7 @@ fn test_human_only_note_does_not_warn_about_missing_checkpoints_in_pr() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["counts"]["unknown"], 1);
-    assert_eq!(v["known_human_lines"], 1);
+    assert_eq!(v["editor_marked_lines"], 1);
     assert!(!v["warnings"].to_string().contains("raw checkpoints not found"));
     assert!(!v["warnings"].to_string().contains("could NOT be verified"));
 }

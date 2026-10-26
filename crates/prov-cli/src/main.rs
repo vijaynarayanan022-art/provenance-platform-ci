@@ -304,7 +304,7 @@ fn run_single_commit(
 
     if json {
         let v = serde_json::json!({
-            "schema_version": "prov.analysis/0.1",
+            "schema_version": "prov.analysis/0.2",
             "counting_policy": "nonblank-v1",
             "commit": sha, "subject": subject, "note_found": note_found,
             "raw_checkpoints": { "found": cp_found, "path": cp_path.as_ref().map(|p| p.display().to_string()), "count": cp_count, "error": cp_error },
@@ -313,7 +313,7 @@ fn run_single_commit(
             "counts": m.counts,
             "ai_deterministic_pct": m.ai_deterministic_pct,
             "ai_linked_pct": m.ai_linked_pct,
-            "known_human_lines": r.known_human_lines,
+            "editor_marked_lines": r.known_human_lines,
             "conflicting_lines": r.conflicting_lines,
             "unbacked_ai_lines": r.unbacked_ai_lines,
             "explanations": explanations,
@@ -342,7 +342,7 @@ fn run_single_commit(
             pct(m.ai_linked_pct)
         );
         println!(
-            "Human-signal lines (counted as unknown): {}   Conflicts: {}   Unbacked AI claims: {}",
+            "Editor-marked lines (counted as unknown): {}   Conflicts: {}   Unbacked AI claims: {}",
             r.known_human_lines, r.conflicting_lines, r.unbacked_ai_lines
         );
         match &cp_path {
@@ -639,7 +639,7 @@ fn run_pr_range(
             .collect();
 
         let mut v = serde_json::json!({
-            "schema_version": "prov.analysis/0.1",
+            "schema_version": "prov.analysis/0.2",
             "counting_policy": "nonblank-v1",
             "mode": "pr_range",
             "base": base_sha,
@@ -650,7 +650,7 @@ fn run_pr_range(
             "counts": metric.counts,
             "ai_deterministic_pct": metric.ai_deterministic_pct,
             "ai_linked_pct": metric.ai_linked_pct,
-            "known_human_lines": total_known_human,
+            "editor_marked_lines": total_known_human,
             "conflicting_lines": total_conflicts,
             "unbacked_ai_lines": total_unbacked,
             "unattributed_lines": unattributed_lines,
@@ -686,7 +686,7 @@ fn run_pr_range(
             pct(metric.ai_linked_pct)
         );
         println!(
-            "Human-signal lines (counted as unknown): {}   Conflicts: {}   Unbacked AI claims: {}",
+            "Editor-marked lines (counted as unknown): {}   Conflicts: {}   Unbacked AI claims: {}",
             total_known_human, total_conflicts, total_unbacked
         );
         println!();
