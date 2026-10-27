@@ -8,3 +8,4 @@ license.workspace = true
 prov-core = { path = "../prov-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
