@@ -40,6 +40,8 @@ pub struct RawLineAttribution {
 pub struct RawEntry {
     #[serde(default)]
     pub file: String,
+    #[serde(default)]
+    pub blob_sha: Option<String>,
     #[serde(default, deserialize_with = "null_default")]
     pub line_attributions: Vec<RawLineAttribution>,
 }

@@ -57,11 +57,13 @@ Fixtures for these are in `crates/prov-gitai/tests/fixtures` and pinned by tests
 - `prov-core`: `Category`, `Basis` codes, score bands, `LineCounts`, `PrMetric` (golden test: 30/20/10/5/35 -> 50% / 65%; excluded lines never change %).
 - `prov-gitai`: note parser, mapping policy (AI session -> `ai_strong` when verified; unverifiable AI claims -> `ai_probable`; editor markers and conflicts -> `unknown`), exclusion policy.
 - `prov-gitai::diff`: parser for `git diff-tree -p --unified=0` -> added line numbers and in-memory added-line text per file.
-- `prov-gitai::checkpoints`: raw checkpoint reader + `Backing` (trace ids with real AI evidence); `classify_added_lines_backed` downgrades unbacked AI claims to `unknown`.
+- `prov-gitai::checkpoints`: raw checkpoint reader + `Backing` (trace ids with real AI evidence), exposing checkpoint file paths, blob hashes, traces, and timestamps.
+- `prov-gitai::linecheck`: verifies checkpoint blobs with SHA-256 and aligns blob text against committed file lines after CRLF/LF normalization. Common prefixes and suffixes are trimmed before LCS; middle regions above 4 million DP cells are skipped.
+- `prov-gitai` uses the RustCrypto `sha2` crate (MIT/Apache-2.0) to validate blob contents.
 - `prov-cli` (binary `prov`): `prov analyze [--repo PATH] [--commit REV] [--json]` reports one commit; `--base REV --head REV` analyzes a PR range using merge-base diff semantics. Merge commits are rejected. JSON outputs use `prov.analysis/0.2`.
 - Counting policy `nonblank-v1` excludes empty or whitespace-only additions before placement, blame, and classification; both output formats report `blank_added_lines`.
 - PR range reports place surviving added lines on commits using blame; unplaceable lines count as unknown and appear in `unattributed_lines`. `--explain` emits per-line categories and reason codes. Editor marker lines are reported as `editor_marked_lines` with reason code `editor_marker`.
-- Evidence loading is shared by single-commit and PR modes. Unreadable notes count as unknown; unverifiable AI claims (missing or unreadable checkpoints, or a claim without a trace id) count as `ai_probable`, while checkpoint-backed claims count as `ai_strong`.
+- Evidence loading is shared by single-commit and PR modes. Unreadable notes count as unknown; unverifiable AI claims (missing or unreadable checkpoints, or a claim without a trace id) count as `ai_probable`. For backed AI traces, unchanged blob-aligned lines count as `ai_strong`, replaced lines count as `mixed`, and inserted lines count as `unknown`. Missing or invalid blobs fall back to trace-level classification with a warning. JSON includes the additive `line_check` status, and `--explain` includes `ai_edited_after_checkpoint` and `inserted_after_checkpoint` reason codes.
 - End-to-end tests rebuild the real Codex lab scenario and PR range histories in temporary repositories.
 
 ## Known limitations
@@ -70,6 +72,8 @@ Fixtures for these are in `crates/prov-gitai/tests/fixtures` and pinned by tests
 - Whitespace-only rewrites by a later commit take over blame credit and are counted as unknown; docs have a `FORMAT_TRANSFORMATION` basis for this later case.
 - Blame runs per whole file and can be slow on very large files.
 - Raw checkpoints exist only on the developer machine for a limited time.
+- The line-level check relies on Git AI's blobs layout: a checkpoint entry's `blob_sha` names `.git/ai/working_logs/old-<parent-sha>/blobs/<blob_sha>`, and that filename must equal the SHA-256 of the blob bytes. Git AI prunes blobs with checkpoints (7 days in release builds).
+- Pairing replaced lines within changed regions is a heuristic; repeated or similar lines can yield ambiguous LCS alignments. Large middle regions over the 4 million DP-cell cap fall back to trace-level verification.
 - none_recorded relies on Git AI's working_logs layout (an old-<parent> folder with no checkpoints.jsonl); if Git AI changes this or prunes only the file, real AI lines may be counted as unknown (the safe direction). The local agent's own evidence record replaces this heuristic.
 - Unverifiable AI claims are `ai_probable` by design (see the ai_probable definition in the docs); they are never `ai_strong`.
 

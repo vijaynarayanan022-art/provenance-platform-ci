@@ -10,10 +10,12 @@ pub mod blame;
 pub mod checkpoints;
 pub mod classify;
 pub mod diff;
+pub mod linecheck;
 pub mod note;
 
 pub use blame::{parse_blame_porcelain, BlameLine};
 pub use checkpoints::{parse_checkpoints_jsonl, Backing, RawCheckpoint};
-pub use classify::{classify_added_lines, classify_added_lines_backed, classify_added_lines_explained, ExclusionPolicy, LineExplanation, MappingPolicy, PrAnalysis, ReasonCode};
+pub use classify::{classify_added_lines, classify_added_lines_backed, classify_added_lines_explained, classify_added_lines_explained_with_line_checks, ExclusionPolicy, LineExplanation, MappingPolicy, PrAnalysis, ReasonCode};
 pub use diff::{parse_unified_diff_added_lines, parse_unified_diff_added_lines_with_text};
+pub use linecheck::{align_lines, read_verified_blob, sha256_hex, AlignmentError, BlobError, LineChecks, LineDisposition};
 pub use note::{parse_note, ActorKind, Entry, FileAttestation, LineRange, NoteMeta, ParseError, ParsedNote};
