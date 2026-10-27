@@ -234,6 +234,43 @@ fn test_pr_none_recorded_checkpoints_make_ai_trace_unbacked() {
 }
 
 #[test]
+fn test_pr_none_recorded_does_not_warn_when_ai_claim_matches_no_added_lines() {
+    let (repo, cfg, base, head) = setup_ai_pr(
+        "g.txt\n  s_1::t_ai 100-101\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    let folder = repo.join(".git/ai/working_logs").join(format!("old-{base}"));
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(".archived_at"), "archived").unwrap();
+
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["per_commit"][0]["checkpoints_state"], "none_recorded");
+    assert_eq!(v["unbacked_ai_lines"], 0);
+    assert!(!v["warnings"].to_string().contains("Git AI recorded no raw checkpoints"));
+}
+
+#[test]
+fn test_legacy_prompt_claim_with_none_recorded_checkpoints() {
+    let (repo, cfg, base, head) = setup_ai_pr(
+        "g.txt\n  abc123 1-2\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    let folder = repo.join(".git/ai/working_logs").join(format!("old-{base}"));
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(".archived_at"), "archived").unwrap();
+
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--json", "--explain"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["per_commit"][0]["checkpoints_state"], "none_recorded");
+    assert_eq!(value["counts"]["probable"], 2);
+    assert_eq!(value["counts"]["unknown"], 0);
+    assert_eq!(value["explanations"][0]["category"], "ai_probable");
+    assert_eq!(value["explanations"][0]["reason_code"], "ai_unverified");
+    assert!(!value["warnings"].to_string().contains("Git AI recorded no raw checkpoints"));
+}
+
+#[test]
 fn test_pr_missing_checkpoints_state_is_missing() {
     let (repo, cfg, base, head) = setup_ai_pr(
         "g.txt\n  s_1::t_ai 1-2\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
@@ -259,6 +296,33 @@ fn test_pr_human_only_note_with_none_recorded_has_no_checkpoint_warning() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["per_commit"][0]["checkpoints_state"], "none_recorded");
     assert!(!v["warnings"].to_string().contains("raw checkpoints"));
+}
+
+#[test]
+fn test_pr_editor_marker_output_uses_no_human_terminology() {
+    let (repo, cfg, base, head) = setup_ai_pr(
+        "g.txt\n  h_editor 1-2\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+
+    for args in [
+        vec!["--base", &base, "--head", &head, "--explain"],
+        vec!["--base", &base, "--head", &head, "--json", "--explain"],
+    ] {
+        let out = prov(&repo, &cfg, &args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let whole_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .to_lowercase();
+        assert!(!whole_output.contains("human"), "{whole_output}");
+        if args.contains(&"--json") {
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(value["editor_marked_lines"], 2);
+            assert_eq!(value["explanations"][0]["reason_code"], "editor_marker");
+        }
+    }
 }
 
 #[test]
@@ -782,6 +846,7 @@ f.txt
     assert!(s.contains("PR range:"));
     assert!(s.contains("Eligible added lines: 2"));
     assert!(s.contains("AI deterministic: 100.0%"));
+    assert!(s.contains("checkpoints:found"));
     assert!(s.contains("--- Per-line explanations ---"));
     assert!(s.contains("f.txt:"));
     assert!(s.contains("L2: ai_strong"));

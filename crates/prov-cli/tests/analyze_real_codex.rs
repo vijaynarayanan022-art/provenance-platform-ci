@@ -107,6 +107,30 @@ fn analyze_none_recorded_checkpoints_make_ai_trace_unbacked() {
 }
 
 #[test]
+fn analyze_none_recorded_does_not_warn_when_ai_claim_matches_no_added_lines() {
+    let (repo, cfg) = setup();
+    let note_path = repo.join(".git/out-of-range-ai-note.txt");
+    std::fs::write(
+        &note_path,
+        "notes.txt\n  s_1::t_ai 100-105\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    )
+    .unwrap();
+    git(&repo, &cfg, &["notes", "--ref=ai", "add", "-f", "-F", note_path.to_str().unwrap(), "HEAD"]);
+    let parent = git(&repo, &cfg, &["rev-parse", "HEAD^"]);
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let folder = repo.join(".git/ai/working_logs").join(format!("old-{parent}"));
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(".archived_at"), "archived").unwrap();
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["raw_checkpoints"]["state"], "none_recorded");
+    assert_eq!(v["unbacked_ai_lines"], 0);
+    assert!(!v["warnings"].to_string().contains("Git AI recorded no raw checkpoints"));
+}
+
+#[test]
 fn analyze_root_commit_with_empty_old_initial_is_none_recorded() {
     let (repo, cfg) = setup();
     let root = git(&repo, &cfg, &["rev-list", "--max-parents=0", "HEAD"]);
