@@ -135,20 +135,32 @@ struct LineCheckOutput {
     warnings: Vec<String>,
 }
 
+struct LineCheckRequest<'a> {
+    repo: &'a Path,
+    checkpoints_path: Option<&'a Path>,
+    sha: &'a str,
+    note: &'a ParsedNote,
+    checkpoints: &'a [RawCheckpoint],
+    backing: Option<&'a Backing>,
+    added: &'a BTreeMap<String, BTreeSet<u32>>,
+    exclusion: &'a ExclusionPolicy,
+}
+
 fn normalize_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
-fn line_check_for_commit(
-    repo: &Path,
-    checkpoints_path: Option<&Path>,
-    sha: &str,
-    note: &ParsedNote,
-    checkpoints: &[RawCheckpoint],
-    backing: Option<&Backing>,
-    added: &BTreeMap<String, BTreeSet<u32>>,
-    exclusion: &ExclusionPolicy,
-) -> LineCheckOutput {
+fn line_check_for_commit(request: LineCheckRequest<'_>) -> LineCheckOutput {
+    let LineCheckRequest {
+        repo,
+        checkpoints_path,
+        sha,
+        note,
+        checkpoints,
+        backing,
+        added,
+        exclusion,
+    } = request;
     let mut claims: BTreeMap<String, BTreeMap<String, BTreeSet<u32>>> = BTreeMap::new();
     for file in &note.files {
         let path = normalize_path(&file.path);
@@ -489,16 +501,16 @@ fn run_single_commit(
     let cp_state = evidence.cp_state;
     let cp_error = evidence.cp_error;
     let backing = evidence.backing;
-    let line_check = line_check_for_commit(
+    let line_check = line_check_for_commit(LineCheckRequest {
         repo,
-        cp_path.as_deref(),
-        &sha,
-        &note,
-        &evidence.raw_checkpoints,
-        backing.as_ref(),
-        &added,
-        &ExclusionPolicy::with_lockfiles(),
-    );
+        checkpoints_path: cp_path.as_deref(),
+        sha: &sha,
+        note: &note,
+        checkpoints: &evidence.raw_checkpoints,
+        backing: backing.as_ref(),
+        added: &added,
+        exclusion: &ExclusionPolicy::with_lockfiles(),
+    });
     warnings.extend(line_check.warnings.iter().cloned());
     if let Some(err) = evidence.note_error {
         let line_count: usize = added.values().map(BTreeSet::len).sum();
@@ -805,16 +817,16 @@ fn run_pr_range(
         let checkpoints_found = evidence.cp_path.is_some() && evidence.cp_error.is_none();
         let checkpoints_state = evidence.cp_state;
         let backing = evidence.backing;
-        let line_check = line_check_for_commit(
+        let line_check = line_check_for_commit(LineCheckRequest {
             repo,
-            evidence.cp_path.as_deref(),
-            commit_sha,
-            &note,
-            &evidence.raw_checkpoints,
-            backing.as_ref(),
-            &added_for_commit,
-            &exclusion,
-        );
+            checkpoints_path: evidence.cp_path.as_deref(),
+            sha: commit_sha,
+            note: &note,
+            checkpoints: &evidence.raw_checkpoints,
+            backing: backing.as_ref(),
+            added: &added_for_commit,
+            exclusion: &exclusion,
+        });
         warnings.extend(line_check.warnings.iter().cloned());
         if let Some(err) = &evidence.note_error {
             warnings.push(format!("commit {}: Git AI note could not be read ({err}); {} line(s) counted as unknown", &commit_sha[..10.min(commit_sha.len())], commit_line_count));
