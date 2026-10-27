@@ -128,6 +128,9 @@ fn analyze_none_recorded_does_not_warn_when_ai_claim_matches_no_added_lines() {
     assert_eq!(v["raw_checkpoints"]["state"], "none_recorded");
     assert_eq!(v["unbacked_ai_lines"], 0);
     assert!(!v["warnings"].to_string().contains("Git AI recorded no raw checkpoints"));
+
+    let text = prov(&repo, &cfg, &[]);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("Raw checkpoints: none recorded"));
 }
 
 #[test]
@@ -163,6 +166,8 @@ fn analyze_missing_checkpoints_state_is_missing() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["raw_checkpoints"]["state"], "missing");
     assert_eq!(v["counts"]["probable"], 6);
+    let text = prov(&repo, &cfg, &[]);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("Raw checkpoints: missing"));
 }
 
 #[test]
@@ -326,6 +331,8 @@ fn analyze_malformed_raw_checkpoints_are_unverifiable() {
     assert!(!v["raw_checkpoints"]["error"].as_str().unwrap().is_empty());
     assert!(v["warnings"].to_string().contains("raw checkpoints could not be read"));
     assert!(v["warnings"].to_string().contains("could NOT be verified"));
+    let text = prov(&repo, &cfg, &[]);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("Raw checkpoints: unreadable"));
 }
 
 #[test]
@@ -334,6 +341,7 @@ fn analyze_text_report_and_usage_error() {
     let out = prov(&repo, &cfg, &[]);
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("AI deterministic: 66.7%"), "{s}");
+    assert!(s.contains("Raw checkpoints: found"), "{s}");
     let bad = Command::new(env!("CARGO_BIN_EXE_prov")).arg("nope").output().unwrap();
     assert_eq!(bad.status.code(), Some(2));
 }

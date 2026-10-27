@@ -394,13 +394,18 @@ fn run_single_commit(
             "Editor-marked lines (counted as unknown): {}   Conflicts: {}   Unbacked AI claims: {}",
             r.known_human_lines, r.conflicting_lines, r.unbacked_ai_lines
         );
-        match &cp_path {
-            Some(p) => println!(
-                "Raw checkpoints: {} record(s) from {}",
-                cp_count,
-                p.display()
-            ),
-            None => println!("Raw checkpoints: not found"),
+        match cp_state {
+            CheckpointsState::Found => {
+                let path = cp_path.as_ref().expect("found checkpoints have a path");
+                println!(
+                    "Raw checkpoints: found ({} record(s) from {})",
+                    cp_count,
+                    path.display()
+                );
+            }
+            CheckpointsState::NoneRecorded => println!("Raw checkpoints: none recorded"),
+            CheckpointsState::Missing => println!("Raw checkpoints: missing"),
+            CheckpointsState::Unreadable => println!("Raw checkpoints: unreadable"),
         }
         for w in &warnings {
             println!("WARNING: {w}");
