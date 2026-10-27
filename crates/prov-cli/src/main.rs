@@ -5,9 +5,10 @@
 
 use prov_core::{Category, LineCounts};
 use prov_gitai::{
-    classify_added_lines_explained, parse_blame_porcelain,
-    parse_checkpoints_jsonl, parse_note, parse_unified_diff_added_lines_with_text, Backing,
-    BlameLine,
+    align_lines, classify_added_lines_explained_with_line_checks, parse_blame_porcelain,
+    parse_checkpoints_jsonl, parse_note, parse_unified_diff_added_lines_with_text,
+    read_verified_blob, AlignmentError, Backing, BlobError, LineChecks, LineDisposition,
+    BlameLine, RawCheckpoint,
     ActorKind, ExclusionPolicy, LineExplanation, MappingPolicy, NoteMeta, ParsedNote, ReasonCode,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -104,6 +105,195 @@ struct Evidence {
     cp_count: usize,
     cp_error: Option<String>,
     cp_state: CheckpointsState,
+    raw_checkpoints: Vec<RawCheckpoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineCheckState {
+    Verified,
+    BlobMissing,
+    BlobHashMismatch,
+    SkippedTooLarge,
+    NotApplicable,
+}
+
+impl LineCheckState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::BlobMissing => "blob_missing",
+            Self::BlobHashMismatch => "blob_hash_mismatch",
+            Self::SkippedTooLarge => "skipped_too_large",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+}
+
+struct LineCheckOutput {
+    state: LineCheckState,
+    checks: LineChecks,
+    warnings: Vec<String>,
+}
+
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn line_check_for_commit(
+    repo: &Path,
+    checkpoints_path: Option<&Path>,
+    sha: &str,
+    note: &ParsedNote,
+    checkpoints: &[RawCheckpoint],
+    backing: Option<&Backing>,
+    added: &BTreeMap<String, BTreeSet<u32>>,
+    exclusion: &ExclusionPolicy,
+) -> LineCheckOutput {
+    let mut claims: BTreeMap<String, BTreeMap<String, BTreeSet<u32>>> = BTreeMap::new();
+    for file in &note.files {
+        let path = normalize_path(&file.path);
+        if exclusion.excludes(&path) {
+            continue;
+        }
+        let Some((_, added_lines)) = added.iter().find(|(p, _)| normalize_path(p) == path) else {
+            continue;
+        };
+        for entry in &file.entries {
+            if entry.kind != ActorKind::AiSession {
+                continue;
+            }
+            let Some(trace) = entry.trace.as_deref() else { continue };
+            if !backing.is_some_and(|b| b.contains_trace(trace)) {
+                continue;
+            }
+            let claimed_lines: BTreeSet<u32> = added_lines
+                .iter()
+                .copied()
+                .filter(|line| entry.ranges.iter().any(|range| range.contains(*line)))
+                .collect();
+            if !claimed_lines.is_empty() {
+                claims
+                    .entry(path.clone())
+                    .or_default()
+                    .entry(trace.to_string())
+                    .or_default()
+                    .extend(claimed_lines);
+            }
+        }
+    }
+
+    if claims.is_empty() {
+        return LineCheckOutput {
+            state: LineCheckState::NotApplicable,
+            checks: LineChecks::default(),
+            warnings: vec![],
+        };
+    }
+
+    let blobs_dir = checkpoints_path.and_then(Path::parent).map(|p| p.join("blobs"));
+    let mut checks = LineChecks::default();
+    let mut warnings = Vec::new();
+    let mut overall = LineCheckState::Verified;
+
+    for (path, traces) in claims {
+        let committed_text = match git(repo, &["show", &format!("{sha}:{path}")]) {
+            Ok(text) => text,
+            Err(_) => {
+                overall = combine_line_check_state(overall, LineCheckState::BlobMissing);
+                warnings.push(line_check_warning(sha, &path, LineCheckState::BlobMissing));
+                continue;
+            }
+        };
+
+        let mut staged = Vec::new();
+        let mut file_error = None;
+        for (trace, claimed_lines) in traces {
+            let latest = checkpoints
+                .iter()
+                .filter(|checkpoint| checkpoint.trace_id.as_deref() == Some(trace.as_str()))
+                .flat_map(|checkpoint| {
+                    checkpoint
+                        .entries
+                        .iter()
+                        .filter(|entry| normalize_path(&entry.file) == path)
+                        .map(move |entry| (checkpoint, entry))
+                })
+                .max_by_key(|(checkpoint, _)| checkpoint.timestamp);
+            let Some((_, entry)) = latest else {
+                file_error = Some(LineCheckState::BlobMissing);
+                break;
+            };
+            let Some(blob_sha) = entry.blob_sha.as_deref() else {
+                file_error = Some(LineCheckState::BlobMissing);
+                break;
+            };
+            let Some(blobs_dir) = blobs_dir.as_deref() else {
+                file_error = Some(LineCheckState::BlobMissing);
+                break;
+            };
+            let blob = match read_verified_blob(blobs_dir, blob_sha) {
+                Ok(bytes) => bytes,
+                Err(BlobError::Missing) => {
+                    file_error = Some(LineCheckState::BlobMissing);
+                    break;
+                }
+                Err(BlobError::HashMismatch) => {
+                    file_error = Some(LineCheckState::BlobHashMismatch);
+                    break;
+                }
+            };
+            let Ok(blob_text) = String::from_utf8(blob) else {
+                file_error = Some(LineCheckState::BlobMissing);
+                break;
+            };
+            let alignment = match align_lines(&blob_text, &committed_text) {
+                Ok(result) => result,
+                Err(AlignmentError::TooLarge) => {
+                    file_error = Some(LineCheckState::SkippedTooLarge);
+                    break;
+                }
+            };
+            staged.push((trace, claimed_lines, alignment));
+        }
+
+        if let Some(state) = file_error {
+            overall = combine_line_check_state(overall, state);
+            warnings.push(line_check_warning(sha, &path, state));
+            continue;
+        }
+        for (trace, claimed_lines, alignment) in staged {
+            for line in claimed_lines {
+                if let Some(disposition) = line
+                    .checked_sub(1)
+                    .and_then(|index| alignment.get(index as usize))
+                {
+                    if *disposition != LineDisposition::Unchanged {
+                        checks.insert(&path, &trace, line, *disposition);
+                    }
+                }
+            }
+        }
+    }
+
+    LineCheckOutput { state: overall, checks, warnings }
+}
+
+fn combine_line_check_state(current: LineCheckState, new: LineCheckState) -> LineCheckState {
+    let rank = |state| match state {
+        LineCheckState::Verified | LineCheckState::NotApplicable => 0,
+        LineCheckState::SkippedTooLarge => 1,
+        LineCheckState::BlobMissing => 2,
+        LineCheckState::BlobHashMismatch => 3,
+    };
+    if rank(new) > rank(current) { new } else { current }
+}
+
+fn line_check_warning(sha: &str, path: &str, state: LineCheckState) -> String {
+    format!(
+        "commit {}: line-level check unavailable for {path} ({}); AI claims verified at trace level only",
+        &sha[..sha.len().min(10)],
+        state.as_str()
+    )
 }
 
 fn empty_note() -> ParsedNote {
@@ -153,24 +343,25 @@ fn load_evidence(repo: &Path, git_dir: &Path, sha: &str, parent: Option<&str>) -
     };
 
     let (cp_path, folder_found) = find_checkpoints(git_dir, parent);
-    let (backing, cp_count, cp_error, cp_state) = match &cp_path {
+    let (backing, cp_count, cp_error, cp_state, raw_checkpoints) = match &cp_path {
         Some(p) => match std::fs::read_to_string(p) {
             Ok(text) => match parse_checkpoints_jsonl(&text) {
                 Ok(cps) => {
                     let n = cps.len();
-                    (Some(Backing::from_checkpoints(&cps)), n, None, CheckpointsState::Found)
+                    (Some(Backing::from_checkpoints(&cps)), n, None, CheckpointsState::Found, cps)
                 }
-                Err(e) => (None, 0, Some(e.to_string()), CheckpointsState::Unreadable),
+                Err(e) => (None, 0, Some(e.to_string()), CheckpointsState::Unreadable, vec![]),
             },
-            Err(e) => (None, 0, Some(e.to_string()), CheckpointsState::Unreadable),
+            Err(e) => (None, 0, Some(e.to_string()), CheckpointsState::Unreadable, vec![]),
         },
         None if folder_found => (
             Some(Backing::default()),
             0,
             None,
             CheckpointsState::NoneRecorded,
+            vec![],
         ),
-        None => (None, 0, None, CheckpointsState::Missing),
+        None => (None, 0, None, CheckpointsState::Missing, vec![]),
     };
 
     Evidence {
@@ -183,6 +374,7 @@ fn load_evidence(repo: &Path, git_dir: &Path, sha: &str, parent: Option<&str>) -
         cp_count,
         cp_error,
         cp_state,
+        raw_checkpoints,
     }
 }
 
@@ -196,6 +388,7 @@ struct CommitInfo {
     checkpoints_found: bool,
     checkpoints_error: Option<String>,
     checkpoints_state: CheckpointsState,
+    line_check: LineCheckState,
     lines_attributed: u64,
 }
 
@@ -296,6 +489,17 @@ fn run_single_commit(
     let cp_state = evidence.cp_state;
     let cp_error = evidence.cp_error;
     let backing = evidence.backing;
+    let line_check = line_check_for_commit(
+        repo,
+        cp_path.as_deref(),
+        &sha,
+        &note,
+        &evidence.raw_checkpoints,
+        backing.as_ref(),
+        &added,
+        &ExclusionPolicy::with_lockfiles(),
+    );
+    warnings.extend(line_check.warnings.iter().cloned());
     if let Some(err) = evidence.note_error {
         let line_count: usize = added.values().map(BTreeSet::len).sum();
         warnings.push(format!(
@@ -312,12 +516,13 @@ fn run_single_commit(
     }
     if !note_found && warnings.is_empty() { warnings.push("no Git AI note on this commit: every added line is unknown".into()); }
 
-    let (r, mut explanations) = classify_added_lines_explained(
+    let (r, mut explanations) = classify_added_lines_explained_with_line_checks(
         &note,
         &added,
         &MappingPolicy::default(),
         &ExclusionPolicy::with_lockfiles(),
         backing.as_ref(),
+        Some(&line_check.checks),
     );
     if note_unreadable {
         for explanation in &mut explanations {
@@ -357,6 +562,7 @@ fn run_single_commit(
             "counting_policy": "nonblank-v1",
             "commit": sha, "subject": subject, "note_found": note_found,
             "raw_checkpoints": { "found": cp_found, "state": cp_state.as_str(), "path": cp_path.as_ref().map(|p| p.display().to_string()), "count": cp_count, "error": cp_error },
+            "line_check": line_check.state.as_str(),
             "eligible_added_lines": m.eligible,
             "blank_added_lines": blank_added_lines,
             "counts": m.counts,
@@ -599,6 +805,17 @@ fn run_pr_range(
         let checkpoints_found = evidence.cp_path.is_some() && evidence.cp_error.is_none();
         let checkpoints_state = evidence.cp_state;
         let backing = evidence.backing;
+        let line_check = line_check_for_commit(
+            repo,
+            evidence.cp_path.as_deref(),
+            commit_sha,
+            &note,
+            &evidence.raw_checkpoints,
+            backing.as_ref(),
+            &added_for_commit,
+            &exclusion,
+        );
+        warnings.extend(line_check.warnings.iter().cloned());
         if let Some(err) = &evidence.note_error {
             warnings.push(format!("commit {}: Git AI note could not be read ({err}); {} line(s) counted as unknown", &commit_sha[..10.min(commit_sha.len())], commit_line_count));
         }
@@ -611,12 +828,13 @@ fn run_pr_range(
         }
 
         // Classify
-        let (r, expl) = classify_added_lines_explained(
+        let (r, expl) = classify_added_lines_explained_with_line_checks(
             &note,
             &added_for_commit,
             &mapping,
             &exclusion,
             backing.as_ref(),
+            Some(&line_check.checks),
         );
 
         // Merge counts
@@ -668,6 +886,7 @@ fn run_pr_range(
             checkpoints_found,
             checkpoints_error: evidence.cp_error,
             checkpoints_state,
+            line_check: line_check.state,
             lines_attributed: commit_line_count,
         });
 
@@ -699,6 +918,7 @@ fn run_pr_range(
                     "checkpoints_found": ci.checkpoints_found,
                     "checkpoints_error": ci.checkpoints_error,
                     "checkpoints_state": ci.checkpoints_state.as_str(),
+                    "line_check": ci.line_check.as_str(),
                     "lines_in_final": ci.lines_attributed,
                 })
             })
@@ -784,11 +1004,12 @@ fn run_pr_range(
                         None => String::new(),
                     };
                     println!(
-                        "    L{}: {}{} - {}",
+                        "    L{}: {}{} - {} [{}]",
                         e.line,
                         e.category.as_str(),
                         commit_str,
-                        e.reason
+                        e.reason,
+                        e.reason_code.as_str()
                     );
                 }
             }

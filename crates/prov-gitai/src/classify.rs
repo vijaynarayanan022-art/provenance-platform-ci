@@ -1,4 +1,5 @@
 use crate::checkpoints::Backing;
+use crate::linecheck::{LineChecks, LineDisposition};
 use crate::note::{ActorKind, ParsedNote};
 use prov_core::{Category, LineCounts, PrMetric};
 use std::collections::{BTreeMap, BTreeSet};
@@ -66,6 +67,27 @@ pub enum ReasonCode {
     NoNoteEntry,
     NoNote,
     Unattributed,
+    AiEditedAfterCheckpoint,
+    InsertedAfterCheckpoint,
+}
+
+impl ReasonCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExcludedByPolicy => "excluded_by_policy",
+            Self::AiBackedByCheckpoint => "ai_backed_by_checkpoint",
+            Self::AiUnverified => "ai_unverified",
+            Self::UnbackedTrace => "unbacked_trace",
+            Self::EditorMarker => "editor_marker",
+            Self::Conflict => "conflict",
+            Self::NoteUnreadable => "note_unreadable",
+            Self::NoNoteEntry => "no_note_entry",
+            Self::NoNote => "no_note",
+            Self::Unattributed => "unattributed",
+            Self::AiEditedAfterCheckpoint => "ai_edited_after_checkpoint",
+            Self::InsertedAfterCheckpoint => "inserted_after_checkpoint",
+        }
+    }
 }
 
 /// Per-line explanation for the `--explain` output.
@@ -123,6 +145,21 @@ pub fn classify_added_lines_explained(
     exclusion: &ExclusionPolicy,
     backing: Option<&Backing>,
 ) -> (PrAnalysis, Vec<LineExplanation>) {
+    classify_added_lines_explained_with_line_checks(
+        note, added, mapping, exclusion, backing, None,
+    )
+}
+
+/// Classify added lines with optional line-level post-checkpoint verdicts. If no verdict set is
+/// supplied, behavior is identical to trace-level classification.
+pub fn classify_added_lines_explained_with_line_checks(
+    note: &ParsedNote,
+    added: &BTreeMap<String, BTreeSet<u32>>,
+    mapping: &MappingPolicy,
+    exclusion: &ExclusionPolicy,
+    backing: Option<&Backing>,
+    line_checks: Option<&LineChecks>,
+) -> (PrAnalysis, Vec<LineExplanation>) {
     let mut unbacked = 0u64;
     let mut counts = LineCounts::default();
     let mut known_human = 0u64;
@@ -151,6 +188,8 @@ pub fn classify_added_lines_explained(
             let mut ai_verified = false;
             let mut human = false;
             let mut unbacked_here = false;
+            let mut edited_after_checkpoint = false;
+            let mut inserted_after_checkpoint = false;
             let mut reason_parts: Vec<String> = Vec::new();
             if let Some(f) = file {
                 for e in &f.entries {
@@ -162,10 +201,20 @@ pub fn classify_added_lines_explained(
                                     (Some(b), Some(t)) if b.contains_trace(t) => {
                                         ai = true;
                                         ai_verified = true;
-                                        reason_parts.push(format!(
-                                            "AI session claim, trace {} backed by checkpoint",
-                                            trace_desc
-                                        ));
+                                        match line_checks.and_then(|checks| checks.get(&normed, t, line)) {
+                                            Some(LineDisposition::Replaced) => {
+                                                edited_after_checkpoint = true;
+                                                reason_parts.push("line changed after checkpoint -> mixed".into());
+                                            }
+                                            Some(LineDisposition::Inserted) => {
+                                                inserted_after_checkpoint = true;
+                                                reason_parts.push("line inserted after checkpoint -> unknown".into());
+                                            }
+                                            _ => reason_parts.push(format!(
+                                                "AI session claim, trace {} backed by checkpoint",
+                                                trace_desc
+                                            )),
+                                        }
                                     }
                                     (Some(_), Some(_)) => {
                                         unbacked_here = true;
@@ -204,7 +253,7 @@ pub fn classify_added_lines_explained(
                 unbacked += 1;
             }
 
-            let (cat, reason_code) = match (ai, human) {
+            let (mut cat, mut reason_code) = match (ai, human) {
                 (true, false) => {
                     if ai_verified {
                         (mapping.ai_session, ReasonCode::AiBackedByCheckpoint)
@@ -230,6 +279,13 @@ pub fn classify_added_lines_explained(
                     (Category::Unknown, rc)
                 }
             };
+            if !human && inserted_after_checkpoint {
+                cat = Category::Unknown;
+                reason_code = ReasonCode::InsertedAfterCheckpoint;
+            } else if !human && edited_after_checkpoint {
+                cat = Category::Mixed;
+                reason_code = ReasonCode::AiEditedAfterCheckpoint;
+            }
             counts.add(cat, 1);
 
             explanations.push(LineExplanation {

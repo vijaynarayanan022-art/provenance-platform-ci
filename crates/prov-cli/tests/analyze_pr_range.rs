@@ -104,6 +104,44 @@ fn setup_ai_pr(note_content: &str) -> (PathBuf, PathBuf, String, String) {
     (repo, cfg, base, head)
 }
 
+fn setup_linecheck_pr(content: &str, note_content: &str) -> (PathBuf, PathBuf, String, String) {
+    let (repo, cfg) = setup_repo();
+    std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+    git(&repo, &cfg, &["add", "base.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("g.txt"), content).unwrap();
+    git(&repo, &cfg, &["add", "g.txt"]);
+    git(&repo, &cfg, &["commit", "-q", "-m", "feature"]);
+    let head = git(&repo, &cfg, &["rev-parse", "HEAD"]);
+    write_note(&repo, &cfg, &head, note_content);
+    (repo, cfg, base, head)
+}
+
+fn append_blob_checkpoint(
+    repo: &Path,
+    parent: &str,
+    trace: &str,
+    file: &str,
+    blob: &str,
+) {
+    let folder = repo.join(".git/ai/working_logs").join(format!("old-{parent}"));
+    let blobs = folder.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let blob_sha = prov_gitai::sha256_hex(blob.as_bytes());
+    std::fs::write(blobs.join(&blob_sha), blob).unwrap();
+    let checkpoint = serde_json::json!({
+        "kind": "AiAgent",
+        "trace_id": trace,
+        "timestamp": 123,
+        "entries": [{ "file": file, "blob_sha": blob_sha }]
+    });
+    let path = folder.join("checkpoints.jsonl");
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    writeln!(file, "{checkpoint}").unwrap();
+}
+
 #[test]
 fn test_multicommit_pr_analysis_and_aggregation() {
     let (repo, cfg) = setup_repo();
@@ -386,6 +424,60 @@ fn test_pr_counts_only_nonblank_added_lines() {
 }
 
 #[test]
+fn test_pr_linecheck_counts_replacement_blank_and_unbacked_lines() {
+    let blob = "first\nAI second\nthird\n";
+    let committed = "first\nHuman rewrite\nthird\n\nnew one\nnew two\n";
+    let note = "g.txt\n  s_1::t_trace 1-3\n  s_2::t_later 5-6\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n";
+    let (repo, cfg, base, head) = setup_linecheck_pr(committed, note);
+    append_blob_checkpoint(&repo, &base, "t_trace", "g.txt", blob);
+
+    let out = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--json", "--explain"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["per_commit"][0]["line_check"], "verified");
+    assert_eq!(value["blank_added_lines"], 1);
+    assert_eq!(value["counts"]["strong"], 2);
+    assert_eq!(value["counts"]["mixed"], 1);
+    assert_eq!(value["counts"]["unknown"], 2);
+    assert_eq!(value["ai_deterministic_pct"], 40.0);
+    assert_eq!(value["ai_linked_pct"], 60.0);
+    assert_eq!(value["explanations"].as_array().unwrap().iter()
+        .find(|line| line["line"] == 2).unwrap()["reason_code"], "ai_edited_after_checkpoint");
+
+    let text = prov(&repo, &cfg, &["--base", &base, "--head", &head, "--explain"]);
+    assert!(text.status.success(), "{}", String::from_utf8_lossy(&text.stderr));
+    let report = String::from_utf8_lossy(&text.stdout);
+    assert!(report.contains("L2: mixed"));
+    assert!(report.contains("ai_edited_after_checkpoint"));
+    assert!(report.contains("unbacked_trace"));
+}
+
+#[test]
+fn test_linecheck_reason_codes_are_in_text_and_json_without_human_output() {
+    let blob = "first\nsecond\nthird\nmarker\nlast\n";
+    let committed = "first\nedited\nthird\ninserted\nmarker\nlast\n";
+    let note = "g.txt\n  s_1::t_trace 1-6\n  h_editor 5\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n";
+    let (repo, cfg, base, head) = setup_linecheck_pr(committed, note);
+    append_blob_checkpoint(&repo, &base, "t_trace", "g.txt", blob);
+
+    for args in [
+        vec!["--base", &base, "--head", &head, "--explain"],
+        vec!["--base", &base, "--head", &head, "--json", "--explain"],
+    ] {
+        let out = prov(&repo, &cfg, &args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let whole_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ).to_lowercase();
+        assert!(!whole_output.contains("human"), "{whole_output}");
+        assert!(whole_output.contains("ai_edited_after_checkpoint"), "{whole_output}");
+        assert!(whole_output.contains("inserted_after_checkpoint"), "{whole_output}");
+    }
+}
+
+#[test]
 fn test_malformed_checkpoints_in_pr_are_unverifiable() {
     let (repo, cfg) = setup_repo();
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
@@ -646,6 +738,7 @@ fn test_missing_notes_on_commit_in_range() {
 
     let per_commit = v["per_commit"].as_array().unwrap();
     assert_eq!(per_commit[0]["note_found"], false);
+    assert_eq!(per_commit[0]["line_check"], "not_applicable");
 
     let warnings = v["warnings"].as_array().unwrap();
     assert!(

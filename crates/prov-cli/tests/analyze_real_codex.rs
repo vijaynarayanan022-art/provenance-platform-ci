@@ -56,6 +56,49 @@ fn prov(repo: &Path, cfg: &Path, extra: &[&str]) -> std::process::Output {
         .output().unwrap()
 }
 
+fn commit_added_file(repo: &Path, cfg: &Path, path: &str, text: &str) -> (String, String) {
+    let parent = git(repo, cfg, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join(path), text).unwrap();
+    git(repo, cfg, &["add", path]);
+    git(repo, cfg, &["commit", "-q", "-m", "linecheck fixture"]);
+    let head = git(repo, cfg, &["rev-parse", "HEAD"]);
+    (parent, head)
+}
+
+fn write_note(repo: &Path, cfg: &Path, commit: &str, text: &str) {
+    let note_path = repo.join(".git/linecheck-note.txt");
+    std::fs::write(&note_path, text).unwrap();
+    git(repo, cfg, &["notes", "--ref=ai", "add", "-f", "-F", note_path.to_str().unwrap(), commit]);
+}
+
+fn write_blob_checkpoint(
+    repo: &Path,
+    parent: &str,
+    trace: &str,
+    file: &str,
+    expected_blob: &str,
+    stored_blob: Option<&str>,
+) {
+    let folder = repo.join(".git/ai/working_logs").join(format!("old-{parent}"));
+    let blobs = folder.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    let blob_sha = prov_gitai::sha256_hex(expected_blob.as_bytes());
+    if let Some(contents) = stored_blob {
+        std::fs::write(blobs.join(&blob_sha), contents).unwrap();
+    }
+    let checkpoint = serde_json::json!({
+        "kind": "AiAgent",
+        "trace_id": trace,
+        "timestamp": 123,
+        "entries": [{ "file": file, "blob_sha": blob_sha }]
+    });
+    std::fs::write(
+        folder.join("checkpoints.jsonl"),
+        format!("{}\n", checkpoint),
+    )
+    .unwrap();
+}
+
 #[test]
 fn analyze_downgrades_unbacked_human_lines() {
     let (repo, cfg) = setup();
@@ -201,6 +244,7 @@ fn analyze_single_commit_without_note_reports_no_note_reason() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["note_found"], false);
+    assert_eq!(v["line_check"], "not_applicable");
     assert_eq!(v["explanations"][0]["reason_code"], "no_note");
     assert_eq!(v["explanations"][0]["reason"], "no note -> unknown");
 }
@@ -344,4 +388,170 @@ fn analyze_text_report_and_usage_error() {
     assert!(s.contains("Raw checkpoints: found"), "{s}");
     let bad = Command::new(env!("CARGO_BIN_EXE_prov")).arg("nope").output().unwrap();
     assert_eq!(bad.status.code(), Some(2));
+}
+
+#[test]
+fn linecheck_untouched_ai_lines_remain_strong() {
+    let (repo, cfg) = setup();
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let blob = "first\nsecond\nthird\n";
+    let (parent, head) = commit_added_file(&repo, &cfg, "g.txt", blob);
+    write_note(
+        &repo,
+        &cfg,
+        &head,
+        "g.txt\n  s_1::t_trace 1-3\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    write_blob_checkpoint(&repo, &parent, "t_trace", "g.txt", blob, Some(blob));
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["line_check"], "verified");
+    assert_eq!(value["counts"]["strong"], 3);
+    assert_eq!(value["counts"]["mixed"], 0);
+}
+
+#[test]
+fn linecheck_detects_replacement_and_preserves_other_claims() {
+    let (repo, cfg) = setup();
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let blob = "first\nAI second\nthird\n";
+    let file = "first\nHuman rewrite\nthird\n\nnew one\nnew two\n";
+    let (parent, head) = commit_added_file(&repo, &cfg, "g.txt", file);
+    write_note(
+        &repo,
+        &cfg,
+        &head,
+        "g.txt\n  s_1::t_trace 1-3\n  s_2::t_later 5-6\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    write_blob_checkpoint(&repo, &parent, "t_trace", "g.txt", blob, Some(blob));
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["line_check"], "verified");
+    assert_eq!(value["blank_added_lines"], 1);
+    assert_eq!(value["counts"]["strong"], 2);
+    assert_eq!(value["counts"]["mixed"], 1);
+    assert_eq!(value["counts"]["unknown"], 2);
+    assert_eq!(value["ai_deterministic_pct"], 40.0);
+    assert_eq!(value["ai_linked_pct"], 60.0);
+    let edited = value["explanations"].as_array().unwrap().iter()
+        .find(|line| line["line"] == 2).unwrap();
+    assert_eq!(edited["category"], "mixed");
+    assert_eq!(edited["reason_code"], "ai_edited_after_checkpoint");
+}
+
+#[test]
+fn linecheck_marks_inserted_lines_unknown() {
+    let (repo, cfg) = setup();
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let blob = "first\nsecond\nthird\n";
+    let file = "first\ninserted\nsecond\nthird\n";
+    let (parent, head) = commit_added_file(&repo, &cfg, "g.txt", file);
+    write_note(
+        &repo,
+        &cfg,
+        &head,
+        "g.txt\n  s_1::t_trace 1-4\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    write_blob_checkpoint(&repo, &parent, "t_trace", "g.txt", blob, Some(blob));
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["line_check"], "verified");
+    assert_eq!(value["counts"]["strong"], 3);
+    assert_eq!(value["counts"]["unknown"], 1);
+    assert_eq!(value["explanations"][1]["reason_code"], "inserted_after_checkpoint");
+}
+
+#[test]
+fn linecheck_missing_blob_falls_back_to_trace_level() {
+    let (repo, cfg) = setup();
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let blob = "first\nsecond\nthird\n";
+    let (parent, head) = commit_added_file(&repo, &cfg, "g.txt", blob);
+    write_note(
+        &repo,
+        &cfg,
+        &head,
+        "g.txt\n  s_1::t_trace 1-3\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    write_blob_checkpoint(&repo, &parent, "t_trace", "g.txt", blob, None);
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["line_check"], "blob_missing");
+    assert_eq!(value["counts"]["strong"], 3);
+    assert!(value["warnings"].to_string().contains(
+        "line-level check unavailable for g.txt (blob_missing); AI claims verified at trace level only"
+    ));
+}
+
+#[test]
+fn linecheck_hash_mismatch_falls_back_to_trace_level() {
+    let (repo, cfg) = setup();
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let blob = "first\nsecond\nthird\n";
+    let (parent, head) = commit_added_file(&repo, &cfg, "g.txt", blob);
+    write_note(
+        &repo,
+        &cfg,
+        &head,
+        "g.txt\n  s_1::t_trace 1-3\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    write_blob_checkpoint(&repo, &parent, "t_trace", "g.txt", blob, Some("altered blob"));
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["line_check"], "blob_hash_mismatch");
+    assert_eq!(value["counts"]["strong"], 3);
+    assert!(value["warnings"].to_string().contains("(blob_hash_mismatch)"));
+}
+
+#[test]
+fn linecheck_normalizes_crlf_before_comparing() {
+    let (repo, cfg) = setup();
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let blob = "first\nsecond\nthird\n";
+    let file = "first\r\nsecond\r\nthird\r\n";
+    let (parent, head) = commit_added_file(&repo, &cfg, "g.txt", file);
+    write_note(
+        &repo,
+        &cfg,
+        &head,
+        "g.txt\n  s_1::t_trace 1-3\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    write_blob_checkpoint(&repo, &parent, "t_trace", "g.txt", blob, Some(blob));
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["line_check"], "verified");
+    assert_eq!(value["counts"]["strong"], 3);
+    assert_eq!(value["counts"]["mixed"], 0);
+}
+
+#[test]
+fn linecheck_marks_indentation_only_change_mixed() {
+    let (repo, cfg) = setup();
+    std::fs::remove_dir_all(repo.join(".git/ai")).unwrap();
+    let blob = "first\n  indented\nthird\n";
+    let file = "first\n indented\nthird\n";
+    let (parent, head) = commit_added_file(&repo, &cfg, "g.txt", file);
+    write_note(
+        &repo,
+        &cfg,
+        &head,
+        "g.txt\n  s_1::t_trace 1-3\n---\n{\"schema_version\":\"authorship/3.0.0\"}\n",
+    );
+    write_blob_checkpoint(&repo, &parent, "t_trace", "g.txt", blob, Some(blob));
+
+    let out = prov(&repo, &cfg, &["--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["counts"]["strong"], 2);
+    assert_eq!(value["counts"]["mixed"], 1);
+    assert_eq!(value["explanations"][1]["reason_code"], "ai_edited_after_checkpoint");
 }

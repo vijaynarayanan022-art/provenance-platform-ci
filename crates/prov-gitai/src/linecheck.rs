@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
+use std::collections::HashMap;
 
 const MAX_DP_CELLS: usize = 4_000_000;
 
@@ -22,13 +23,37 @@ pub enum BlobError {
     HashMismatch,
 }
 
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LineChecks {
+    verdicts: HashMap<(String, String, u32), LineDisposition>,
+}
+
+impl LineChecks {
+    pub fn insert(&mut self, path: &str, trace_id: &str, line: u32, verdict: LineDisposition) {
+        self.verdicts.insert(
+            (path.replace('\\', "/"), trace_id.to_string(), line),
+            verdict,
+        );
+    }
+
+    pub fn get(&self, path: &str, trace_id: &str, line: u32) -> Option<LineDisposition> {
+        self.verdicts
+            .get(&(path.replace('\\', "/"), trace_id.to_string(), line))
+            .copied()
+    }
+}
+
 /// Read a checkpoint blob and verify the file name against the SHA-256 of its bytes.
 pub fn read_verified_blob(blobs_dir: &Path, blob_sha: &str) -> Result<Vec<u8>, BlobError> {
     if blob_sha.len() != 64 || !blob_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(BlobError::Missing);
     }
     let content = fs::read(blobs_dir.join(blob_sha)).map_err(|_| BlobError::Missing)?;
-    let actual = format!("{:x}", Sha256::digest(&content));
+    let actual = sha256_hex(&content);
     if !actual.eq_ignore_ascii_case(blob_sha) {
         return Err(BlobError::HashMismatch);
     }
@@ -184,6 +209,21 @@ mod tests {
         assert_eq!(
             dispositions("a\nb\n", "a\r\nb\r\n"),
             vec![LineDisposition::Unchanged; 2]
+        );
+    }
+
+    #[test]
+    fn skips_an_oversized_middle_region() {
+        let old = (0..=2_000).map(|i| format!("old-{i}\n")).collect::<String>();
+        let new = (0..=2_000).map(|i| format!("new-{i}\n")).collect::<String>();
+        assert_eq!(align_lines(&old, &new), Err(AlignmentError::TooLarge));
+    }
+
+    #[test]
+    fn sha256_hex_matches_known_digest() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 }
