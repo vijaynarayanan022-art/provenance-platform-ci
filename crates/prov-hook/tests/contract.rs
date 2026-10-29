@@ -703,6 +703,51 @@ fn fifty_thousand_old_events_do_not_make_hook_read_the_log() {
 
 #[cfg(windows)]
 #[test]
+fn unchanged_dirty_file_metadata_skips_locked_read() {
+    use std::thread;
+    use std::time::{Duration, Instant};
+    let _serial = test_guard();
+    let f = Fixture::new("unchanged-sharing");
+    fs::write(f.repo.join("tracked.txt"), "dirty but stable\n").unwrap();
+    f.hook("PreToolUse", "stable", "stable-tool", None);
+    let file = f.repo.join("tracked.txt");
+    let ready = f.root.join("stable-held-ready");
+    let command = format!(
+        "$f=[IO.File]::Open('{}',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None); Set-Content -LiteralPath '{}' ready; Start-Sleep -Seconds 20",
+        file.display().to_string().replace('\'', "''"),
+        ready.display().to_string().replace('\'', "''")
+    );
+    let mut holder = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &command])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !ready.exists() && start.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready.exists(), "holder did not acquire the file");
+    f.hook("PostToolUse", "stable", "stable-tool", None);
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let events = f.events();
+    assert_eq!(
+        select(&events, "external_change")
+            .iter()
+            .filter(|e| e["path"] == "tracked.txt")
+            .count(),
+        1
+    );
+    assert!(select(&events, "ai_change").is_empty());
+    assert!(!events.iter().any(|e| {
+        e["event"] == "external_change" && e["path"] == "tracked.txt" && e["degraded"] == true
+    }));
+    f.drop_root();
+}
+
+#[cfg(windows)]
+#[test]
 fn one_windows_sharing_violation_degrades_only_that_file() {
     let _serial = test_guard();
     use std::thread;
