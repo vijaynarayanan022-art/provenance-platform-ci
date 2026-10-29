@@ -4,7 +4,14 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TEST_GATE: Mutex<()> = Mutex::new(());
+
+fn test_guard() -> MutexGuard<'static, ()> {
+    TEST_GATE.lock().unwrap()
+}
 
 struct Fixture {
     root: PathBuf,
@@ -48,12 +55,28 @@ impl Fixture {
         tool_id: &str,
         command: Option<&str>,
     ) -> (i32, Vec<u8>, Vec<u8>) {
+        self.hook_at_with_path(cwd, home, event, session, tool_id, command, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn hook_at_with_path(
+        &self,
+        cwd: &Path,
+        home: &Path,
+        event: &str,
+        session: &str,
+        tool_id: &str,
+        command: Option<&str>,
+        path: Option<&std::ffi::OsStr>,
+    ) -> (i32, Vec<u8>, Vec<u8>) {
         let payload = json!({ "hook_event_name": event, "session_id": session, "turn_id": "turn-1", "cwd": cwd,
             "model": "test-model", "tool_name": "PowerShell", "tool_use_id": tool_id,
             "tool_input": { "command": command }, "transcript_path": "IGNORE_ME", "last_assistant_message": "IGNORE_ME" });
-        let mut child = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
-            .arg("codex")
-            .env("PROV_HOME", home)
+        let mut command = Command::new(env!("CARGO_BIN_EXE_prov-hook"));
+        command.arg("codex").env("PROV_HOME", home);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -122,7 +145,9 @@ fn events_in(home: &Path) -> Vec<Value> {
                     .split(|b| *b == b'\n')
                     .filter(|l| !l.is_empty())
                 {
-                    out.push(serde_json::from_slice(line).unwrap());
+                    if let Ok(value) = serde_json::from_slice(line) {
+                        out.push(value);
+                    }
                 }
             }
         }
@@ -138,6 +163,7 @@ fn select<'a>(events: &'a [Value], event: &str) -> Vec<&'a Value> {
 
 #[test]
 fn malformed_stdin_is_silent_and_successful() {
+    let _serial = test_guard();
     let exe = env!("CARGO_BIN_EXE_prov-hook");
     for input in [
         Vec::new(),
@@ -162,6 +188,7 @@ fn malformed_stdin_is_silent_and_successful() {
 
 #[test]
 fn invalid_and_missing_cwd_do_not_write() {
+    let _serial = test_guard();
     let f = Fixture::new("badcwd");
     for cwd in [f.root.join("missing"), f.root.join("not-repo")] {
         if cwd.ends_with("not-repo") {
@@ -177,6 +204,7 @@ fn invalid_and_missing_cwd_do_not_write() {
 
 #[test]
 fn missing_store_folder_is_silent() {
+    let _serial = test_guard();
     let f = Fixture::new("badstore");
     fs::write(f.root.join("store-is-file"), "not a directory").unwrap();
     let (code, out, err) = f.hook_at(
@@ -194,6 +222,7 @@ fn missing_store_folder_is_silent() {
 
 #[test]
 fn ai_change_has_hashes_ranges_and_command_digest() {
+    let _serial = test_guard();
     let f = Fixture::new("ai");
     f.hook("PreToolUse", "s", "tool-1", None);
     fs::write(f.repo.join("tracked.txt"), "one\ntwo changed\n").unwrap();
@@ -211,13 +240,297 @@ fn ai_change_has_hashes_ranges_and_command_digest() {
     assert_eq!(e["after_sha"], sha(b"one\ntwo changed\n"));
     assert_eq!(e["line_ranges"], json!([[2, 2]]));
     assert_eq!(e["command_sha256"], sha(b"Set-Content tracked.txt"));
+    assert_eq!(e["command_length"], "Set-Content tracked.txt".len());
     assert_eq!(select(&all, "window_open").len(), 1);
     assert_eq!(select(&all, "window_close").len(), 1);
     f.drop_root();
 }
 
 #[test]
+fn first_clean_scan_does_not_snapshot_unchanged_files() {
+    let _serial = test_guard();
+    let f = Fixture::new("clean-first");
+    f.hook("PreToolUse", "s", "clean", None);
+    let repo_dir = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let shadow = fs::read_dir(repo_dir.join("shadow"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let shadow: Value = serde_json::from_slice(&fs::read(shadow).unwrap()).unwrap();
+    assert!(shadow["files"].as_object().unwrap().is_empty());
+    assert_eq!(fs::read_dir(repo_dir.join("blobs")).unwrap().count(), 0);
+    assert!(select(&f.events(), "external_change").is_empty());
+    f.drop_root();
+}
+
+#[test]
+fn head_move_is_external_and_never_ai_credited() {
+    let _serial = test_guard();
+    let f = Fixture::new("head-move");
+    f.hook("PreToolUse", "s", "move-head", None);
+    git(&f.repo, &["checkout", "-b", "other"]);
+    fs::write(f.repo.join("tracked.txt"), "committed on other\n").unwrap();
+    git(&f.repo, &["commit", "-am", "other change"]);
+    f.hook("PostToolUse", "s", "move-head", None);
+    let all = f.events();
+    assert!(select(&all, "ai_change").is_empty());
+    let external = select(&all, "external_change");
+    assert!(external.iter().any(|e| e["reason"] == "head_moved"
+        && e["path"] == "tracked.txt"
+        && e["head_moved"] == true));
+    assert!(external
+        .iter()
+        .any(|e| e["before_sha"] == sha(b"one\ntwo\n")
+            && e["after_sha"] == sha(b"committed on other\n")));
+    assert_eq!(select(&all, "window_close")[0]["head_moved"], true);
+    f.drop_root();
+}
+
+#[test]
+fn pull_between_hooks_records_changes_as_external() {
+    let _serial = test_guard();
+    let f = Fixture::new("head-pull");
+    let bare = f.root.join("remote.git");
+    git(
+        &f.root,
+        &[
+            "clone",
+            "--bare",
+            f.repo.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    git(
+        &f.repo,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    let peer = f.root.join("peer");
+    git(
+        &f.root,
+        &["clone", bare.to_str().unwrap(), peer.to_str().unwrap()],
+    );
+    git(&peer, &["config", "user.email", "peer@example.invalid"]);
+    git(&peer, &["config", "user.name", "Peer"]);
+    fs::write(peer.join("tracked.txt"), "remote update\n").unwrap();
+    git(&peer, &["commit", "-am", "remote update"]);
+    git(&peer, &["push", "origin", "HEAD"]);
+    f.hook("PreToolUse", "s", "pull", None);
+    let branch = git_text(&f.repo, &["branch", "--show-current"]);
+    git(&f.repo, &["pull", "--ff-only", "origin", branch.as_str()]);
+    f.hook("PostToolUse", "s", "pull", None);
+    let all = f.events();
+    assert!(select(&all, "ai_change").is_empty());
+    assert!(select(&all, "external_change")
+        .iter()
+        .any(|e| e["reason"] == "head_moved"
+            && e["path"] == "tracked.txt"
+            && e["after_sha"] == sha(b"remote update\n")));
+    f.drop_root();
+}
+
+#[test]
+fn unrelated_branch_does_not_change_repo_identity() {
+    let _serial = test_guard();
+    let f = Fixture::new("orphan-identity");
+    f.hook("Stop", "s", "first", None);
+    let before = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    git(&f.repo, &["branch", "unrelated"]);
+    f.hook("Stop", "s", "second", None);
+    let after = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    assert_eq!(before, after);
+    f.drop_root();
+}
+
+#[test]
+fn second_hook_uses_repo_cache_without_spawning_rev_list() {
+    let _serial = test_guard();
+    let f = Fixture::new("repo-cache");
+    f.hook("Stop", "s", "first", None);
+    let cache = f.home.join("repo-cache");
+    assert_eq!(fs::read_dir(&cache).unwrap().count(), 1);
+    let bin = f.root.join("cache-wrapper");
+    fs::create_dir_all(&bin).unwrap();
+    let real_name = if cfg!(windows) { "where.exe" } else { "which" };
+    let found = Command::new(real_name).arg("git").output().unwrap();
+    assert!(found.status.success());
+    let real_git = String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .to_owned();
+    let count = f.root.join("rev-list-calls");
+    let source = format!(
+        r##"use std::process::Command; use std::io::Write; fn main() {{ let a:Vec<String>=std::env::args().skip(1).collect(); if a.iter().any(|x|x=="rev-list") {{ let mut f=std::fs::OpenOptions::new().create(true).append(true).open({:?}).unwrap(); writeln!(f,"rev-list").unwrap(); }} let s=Command::new({:?}).args(a).status().unwrap(); std::process::exit(s.code().unwrap_or(1)); }}"##,
+        count, real_git
+    );
+    let src = f.root.join("cache-wrapper.rs");
+    fs::write(&src, source).unwrap();
+    let wrapper = bin.join(if cfg!(windows) { "git.exe" } else { "git" });
+    assert!(Command::new("rustc")
+        .arg(&src)
+        .arg("-o")
+        .arg(&wrapper)
+        .status()
+        .unwrap()
+        .success());
+    let old_path = std::env::var_os("PATH").unwrap_or_default();
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let path = std::ffi::OsString::from(format!(
+        "{}{}{}",
+        bin.display(),
+        sep,
+        old_path.to_string_lossy()
+    ));
+    let (code, out, err) =
+        f.hook_at_with_path(&f.repo, &f.home, "Stop", "s", "cached", None, Some(&path));
+    assert_eq!(code, 0);
+    assert!(out.is_empty() && err.is_empty());
+    assert!(!count.exists());
+    f.drop_root();
+}
+
+#[test]
+fn shallow_repository_is_skipped_and_marked() {
+    let _serial = test_guard();
+    let f = Fixture::new("shallow");
+    f.hook("Stop", "s", "initial", None);
+    let head = git_text(&f.repo, &["rev-parse", "HEAD"]);
+    fs::write(f.repo.join(".git").join("shallow"), format!("{head}\n")).unwrap();
+    f.hook("Stop", "s", "shallow", None);
+    let repo_id = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let markers =
+        fs::read_to_string(f.home.join("repos").join(repo_id).join("markers.jsonl")).unwrap();
+    assert!(markers.contains("shallow_repo_skipped"));
+    assert_eq!(select(&f.events(), "turn_end").len(), 1);
+    f.drop_root();
+}
+
+#[test]
+fn fifty_thousand_old_events_do_not_make_hook_read_the_log() {
+    let _serial = test_guard();
+    use std::time::Instant;
+    let f = Fixture::new("bounded-events");
+    f.hook("Stop", "s", "init", None);
+    let repo_dir = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let old_log = repo_dir.join("events").join("old-session.jsonl");
+    fs::write(&old_log, b"{}\n".repeat(50_000)).unwrap();
+    let start = Instant::now();
+    f.hook("Stop", "s", "after-old-events", None);
+    let with_old_events = start.elapsed();
+    let empty = Fixture::new("bounded-events-empty");
+    let start = Instant::now();
+    empty.hook("Stop", "s", "without-old-events", None);
+    let without_old_events = start.elapsed();
+    assert!(
+        with_old_events < without_old_events * 4 + std::time::Duration::from_millis(400),
+        "old-event cost {with_old_events:?}, baseline {without_old_events:?}"
+    );
+    f.drop_root();
+    empty.drop_root();
+}
+
+#[cfg(windows)]
+#[test]
+fn one_windows_sharing_violation_degrades_only_that_file() {
+    let _serial = test_guard();
+    use std::thread;
+    use std::time::{Duration, Instant};
+    let f = Fixture::new("sharing-error");
+    f.hook("PreToolUse", "s", "share", None);
+    let file = f.repo.join("tracked.txt");
+    let ready = f.root.join("held-ready");
+    let command = format!("$p='{}'; $f=[IO.File]::Open($p,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None); $f.SetLength(0); $b=[Text.Encoding]::UTF8.GetBytes('locked edit`n'); $f.Write($b,0,$b.Length); Set-Content -LiteralPath '{}' ready; Start-Sleep -Seconds 20", file.display().to_string().replace('\'', "''"), ready.display().to_string().replace('\'', "''"));
+    let mut holder = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &command])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !ready.exists() && start.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        ready.exists(),
+        "PowerShell did not acquire the exclusive handle"
+    );
+    fs::write(f.repo.join("other.txt"), "another file\n").unwrap();
+    f.hook("PostToolUse", "s", "share", None);
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let all = f.events();
+    assert!(all.iter().any(|e| e["path"] == "tracked.txt"
+        && e["reason"].as_str().is_some_and(|r| r.starts_with("open:"))));
+    assert!(all
+        .iter()
+        .any(|e| e["path"] == "other.txt" && e["event"] == "ai_change"));
+    f.drop_root();
+}
+
+#[cfg(unix)]
+#[test]
+fn one_unix_permission_error_degrades_only_that_file() {
+    let _serial = test_guard();
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("permission-error");
+    f.hook("PreToolUse", "s", "perm", None);
+    fs::write(f.repo.join("tracked.txt"), "changed under denied perms\n").unwrap();
+    let file = f.repo.join("tracked.txt");
+    let mut permissions = fs::metadata(&file).unwrap().permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&file, permissions).unwrap();
+    if fs::read(&file).is_ok() {
+        let mut p = fs::metadata(&file).unwrap().permissions();
+        p.set_mode(0o644);
+        let _ = fs::set_permissions(&file, p);
+        f.drop_root();
+        return;
+    }
+    fs::write(f.repo.join("other.txt"), "another file\n").unwrap();
+    f.hook("PostToolUse", "s", "perm", None);
+    let mut permissions = fs::metadata(&file).unwrap().permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&file, permissions).unwrap();
+    let all = f.events();
+    assert!(all.iter().any(|e| e["path"] == "tracked.txt"
+        && e["reason"].as_str().is_some_and(|r| r.starts_with("open:"))));
+    assert!(all
+        .iter()
+        .any(|e| e["path"] == "other.txt" && e["event"] == "ai_change"));
+    f.drop_root();
+}
+
+#[test]
 fn human_edit_is_external() {
+    let _serial = test_guard();
     let f = Fixture::new("human");
     f.hook("PreToolUse", "s", "first", None);
     f.hook("PostToolUse", "s", "first", None);
@@ -234,6 +547,7 @@ fn human_edit_is_external() {
 
 #[test]
 fn file_filters_deletions_new_files_and_crlf() {
+    let _serial = test_guard();
     let f = Fixture::new("files");
     f.hook("PreToolUse", "s", "t", None);
     fs::write(f.repo.join("new.txt"), "new\n").unwrap();
@@ -245,6 +559,7 @@ fn file_filters_deletions_new_files_and_crlf() {
     fs::write(f.repo.join("oversize.bin"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
     fs::write(f.repo.join("binary.txt"), b"safe\0binary").unwrap();
     fs::write(f.repo.join(".env.local"), "do-not-store-this").unwrap();
+    fs::write(f.repo.join("secrets.rs"), "let secret = \"hidden\";\n").unwrap();
     f.hook("PostToolUse", "s", "t2", None);
     let all = f.events();
     let changes = select(&all, "ai_change");
@@ -262,8 +577,13 @@ fn file_filters_deletions_new_files_and_crlf() {
     );
     assert!(!changes
         .iter()
-        .any(|e| ["oversize.bin", "binary.txt", ".env.local"]
-            .contains(&e["path"].as_str().unwrap_or(""))));
+        .any(|e| ["oversize.bin", "binary.txt"].contains(&e["path"].as_str().unwrap_or(""))));
+    let excluded = changes
+        .iter()
+        .find(|e| e["path"] == ".env.local")
+        .expect("excluded paths still have events");
+    assert_eq!(excluded["excluded"], true);
+    assert!(!excluded["after_sha"].is_null());
     let blobs = f.home.join("repos");
     let mut files = vec![blobs];
     let mut contents = Vec::new();
@@ -281,11 +601,18 @@ fn file_filters_deletions_new_files_and_crlf() {
     assert!(!contents
         .iter()
         .any(|b| b.windows(17).any(|w| w == b"do-not-store-this")));
+    assert!(!contents
+        .iter()
+        .any(|b| b.windows(6).any(|w| w == b"hidden")));
+    assert!(changes.iter().any(|e| e["path"] == "secrets.rs"
+        && e["excluded"] == true
+        && !e["line_ranges"].as_array().unwrap().is_empty()));
     f.drop_root();
 }
 
 #[test]
 fn overlapping_sessions_mark_both_windows() {
+    let _serial = test_guard();
     let f = Fixture::new("overlap");
     f.hook("PreToolUse", "one", "a", None);
     f.hook("PreToolUse", "two", "b", None);
@@ -307,6 +634,7 @@ fn overlapping_sessions_mark_both_windows() {
 
 #[test]
 fn torn_last_event_line_is_ignored_and_post_is_deduped() {
+    let _serial = test_guard();
     let f = Fixture::new("torn");
     f.hook("PreToolUse", "s", "t", None);
     fs::write(f.repo.join("tracked.txt"), "x\n").unwrap();
@@ -316,28 +644,29 @@ fn torn_last_event_line_is_ignored_and_post_is_deduped() {
     assert_eq!(select(&all, "ai_change").len(), 1);
     f.hook("Stop", "s", "stop", None);
     assert_eq!(select(&f.events(), "turn_end").len(), 1);
-    let path = find_event_file(&f.home);
+    let path = f
+        .home
+        .join("repos")
+        .join(
+            fs::read_dir(f.home.join("repos"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .file_name(),
+        )
+        .join("events")
+        .join("s.jsonl");
     let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
     file.write_all(b"{torn").unwrap();
     assert_eq!(f.events().len(), all.len() + 1);
+    f.hook("Stop", "s", "stop-after-torn", None);
+    assert_eq!(select(&f.events(), "turn_end").len(), 2);
     f.drop_root();
 }
-fn find_event_file(home: &Path) -> PathBuf {
-    let mut todo = vec![home.to_path_buf()];
-    while let Some(dir) = todo.pop() {
-        for e in fs::read_dir(dir).unwrap().flatten() {
-            if e.path().is_dir() {
-                todo.push(e.path());
-            } else if e.path().extension().is_some_and(|x| x == "jsonl") {
-                return e.path();
-            }
-        }
-    }
-    panic!("no event log")
-}
-
 #[test]
 fn repo_identity_survives_move_and_unicode_space_path_works() {
+    let _serial = test_guard();
     let f = Fixture::new("move");
     f.hook("Stop", "s", "t", None);
     let before = fs::read_dir(f.home.join("repos")).unwrap().count();
@@ -351,12 +680,16 @@ fn repo_identity_survives_move_and_unicode_space_path_works() {
 }
 
 #[test]
-fn held_repo_lock_times_out_quickly_and_uses_inbox() {
+fn held_repo_lock_times_out_quickly_and_uses_markers() {
+    let _serial = test_guard();
     use fd_lock::RwLock;
     use std::fs::OpenOptions;
     use std::time::Instant;
     let f = Fixture::new("locked");
-    let roots = git_text(&f.repo, &["rev-list", "--max-parents=0", "--all"]);
+    let roots = git_text(
+        &f.repo,
+        &["rev-list", "--first-parent", "--max-parents=0", "HEAD"],
+    );
     let repo_id = sha(roots.as_bytes());
     let git_dir = git_text(&f.repo, &["rev-parse", "--absolute-git-dir"]);
     let worktree_id = sha(git_dir.as_bytes());
@@ -383,14 +716,16 @@ fn held_repo_lock_times_out_quickly_and_uses_inbox() {
         "lock wait exceeded 1.2 seconds: {:?}",
         start.elapsed()
     );
-    let inbox = fs::read_to_string(f.home.join("inbox.jsonl")).unwrap();
-    assert!(inbox.contains("lock_timeout"));
+    let markers = fs::read_to_string(repo_store.join("markers.jsonl")).unwrap();
+    assert!(markers.contains("lock_timeout"));
+    assert!(markers.contains("hook_event_name"));
     assert!(!shadow.exists());
     f.drop_root();
 }
 
 #[test]
 fn a_slow_scan_hits_the_process_time_cap_and_records_degraded() {
+    let _serial = test_guard();
     use std::time::Instant;
     let f = Fixture::new("slow");
     let bin = f.root.join("fake-bin");
@@ -405,7 +740,7 @@ fn a_slow_scan_hits_the_process_time_cap_and_records_degraded() {
         .trim()
         .to_owned();
     let source = format!(
-        r##"use std::process::Command; use std::time::Duration; fn main() {{ let args: Vec<String> = std::env::args().skip(1).collect(); if args.iter().any(|x| x == "ls-files") {{ std::thread::sleep(Duration::from_secs(5)); return; }} let s = Command::new({:?}).args(args).status().unwrap(); std::process::exit(s.code().unwrap_or(1)); }}"##,
+        r##"use std::process::Command; use std::time::Duration; fn main() {{ let args: Vec<String> = std::env::args().skip(1).collect(); if args.iter().any(|x| x == "status") {{ std::thread::sleep(Duration::from_secs(5)); return; }} let s = Command::new({:?}).args(args).status().unwrap(); std::process::exit(s.code().unwrap_or(1)); }}"##,
         git_path
     );
     let src = f.root.join("fake-git.rs");
@@ -446,7 +781,13 @@ fn a_slow_scan_hits_the_process_time_cap_and_records_degraded() {
         elapsed.as_secs_f64() < 2.5,
         "time cap exceeded: {elapsed:?}"
     );
-    let inbox = fs::read_to_string(f.home.join("inbox.jsonl")).unwrap();
-    assert!(inbox.contains("time_cap"));
+    let repo_id = sha(git_text(
+        &f.repo,
+        &["rev-list", "--first-parent", "--max-parents=0", "HEAD"],
+    )
+    .as_bytes());
+    let markers =
+        fs::read_to_string(f.home.join("repos").join(repo_id).join("markers.jsonl")).unwrap();
+    assert!(markers.contains("time_cap"));
     f.drop_root();
 }

@@ -5,7 +5,7 @@ use std::time::Duration;
 fn main() {
     panic::set_hook(Box::new(|_| {}));
     let result = panic::catch_unwind(|| {
-        let watchdog = prov_capture::start_watchdog(Duration::from_millis(1900));
+        let watchdog = prov_capture::start_watchdog(Duration::from_millis(1400));
         let mut args = std::env::args();
         let _ = args.next();
         if args.next().as_deref() != Some("codex") {

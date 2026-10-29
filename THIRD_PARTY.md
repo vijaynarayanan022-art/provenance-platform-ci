@@ -44,4 +44,4 @@ Licences are taken from the resolved Cargo package metadata for this workspace. 
 | windows-targets | 0.52.6 | MIT OR Apache-2.0 |
 | zmij | 1.0.23 | MIT |
 
-Direct dependencies added for evidence capture are `fd-lock`, `serde`, `serde_json`, `sha2`, and `similar`. `prov-hook` uses the local `prov-capture` crate and `serde_json`/`sha2`/`fd-lock` for its executable and contract tests. No network client dependency is used.
+Direct dependencies added for evidence capture are `fd-lock`, `serde`, `serde_json`, `sha2`, and `similar`. The `prov-hook` executable depends only on the local `prov-capture` crate; its `serde_json`, `sha2`, and `fd-lock` dependencies are test-only. No network client dependency is used.
