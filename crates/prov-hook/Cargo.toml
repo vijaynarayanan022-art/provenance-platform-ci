@@ -1,0 +1,11 @@
+[package]
+name = "prov-hook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prov-capture = { path = "../prov-capture" }
+serde_json.workspace = true
+sha2 = "0.10"
+fd-lock = "4"
