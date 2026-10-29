@@ -10,7 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static TEST_GATE: Mutex<()> = Mutex::new(());
 
 fn test_guard() -> MutexGuard<'static, ()> {
-    TEST_GATE.lock().unwrap()
+    TEST_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 struct Fixture {
@@ -157,6 +159,17 @@ fn events_in(home: &Path) -> Vec<Value> {
 fn sha(s: &[u8]) -> String {
     format!("{:x}", Sha256::digest(s))
 }
+fn hook_in_process(
+    f: &Fixture,
+    event: &str,
+    session: &str,
+    tool_id: &str,
+) -> prov_capture::TimingSnapshot {
+    std::env::set_var("PROV_HOME", &f.home);
+    let payload = json!({"hook_event_name":event,"session_id":session,"turn_id":"turn-1","cwd":f.repo,
+        "model":"test-model","tool_name":"PowerShell","tool_use_id":tool_id,"tool_input":{"command":"test command"}});
+    prov_capture::process_json_timed(payload.to_string().as_bytes())
+}
 fn select<'a>(events: &'a [Value], event: &str) -> Vec<&'a Value> {
     events.iter().filter(|e| e["event"] == event).collect()
 }
@@ -271,13 +284,115 @@ fn first_clean_scan_does_not_snapshot_unchanged_files() {
 }
 
 #[test]
+fn excluded_files_use_hash_only_shadow_and_emit_only_on_real_edits() {
+    let _serial = test_guard();
+    let f = Fixture::new("excluded-shadow");
+    fs::write(f.repo.join(".env.local"), "env-original\n").unwrap();
+    fs::write(f.repo.join("secrets.rs"), "secret-original\n").unwrap();
+    git(&f.repo, &["add", ".env.local", "secrets.rs"]);
+    git(&f.repo, &["commit", "-m", "add excluded fixtures"]);
+    fs::write(f.repo.join(".env.local"), "env-first-seen\n").unwrap();
+    fs::write(f.repo.join("secrets.rs"), "secret-first-seen\n").unwrap();
+    for pair in 0..3 {
+        if pair == 2 {
+            fs::write(f.repo.join(".env.local"), "env-real-edit-longer\n").unwrap();
+            fs::write(f.repo.join("secrets.rs"), "secret-real-edit-longer\n").unwrap();
+        }
+        let suffix = pair.to_string();
+        f.hook("PreToolUse", "excluded", &format!("pre-{suffix}"), None);
+        f.hook("PostToolUse", "excluded", &format!("post-{suffix}"), None);
+    }
+    let events = f.events();
+    let external = select(&events, "external_change");
+    assert_eq!(external.len(), 4);
+    for event in &external {
+        assert_eq!(event["excluded"], true);
+        assert!(event["line_ranges"].is_null());
+        assert!(event["after_sha"].as_str().is_some());
+    }
+    assert_eq!(
+        external
+            .iter()
+            .filter(|event| event["before_sha"].is_null())
+            .count(),
+        2
+    );
+    let store = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let shadow_path = fs::read_dir(store.join("shadow"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let shadow: Value = serde_json::from_slice(&fs::read(shadow_path).unwrap()).unwrap();
+    for path in [".env.local", "secrets.rs"] {
+        assert_eq!(shadow["files"][path]["excluded"], true);
+        assert_eq!(shadow["files"][path]["deleted"], false);
+        assert!(shadow["files"][path]["sha256"].as_str().is_some());
+    }
+    for entry in fs::read_dir(store.join("blobs")).unwrap() {
+        let blob = fs::read(entry.unwrap().path()).unwrap();
+        for secret in [
+            b"env-first-seen".as_slice(),
+            b"secret-first-seen".as_slice(),
+            b"env-real-edit-longer".as_slice(),
+            b"secret-real-edit-longer".as_slice(),
+        ] {
+            assert!(!blob.windows(secret.len()).any(|w| w == secret));
+        }
+    }
+    f.drop_root();
+}
+
+#[test]
+fn deletion_tombstone_emits_once_while_path_stays_dirty() {
+    let _serial = test_guard();
+    let f = Fixture::new("deletion-tombstone");
+    f.hook("PreToolUse", "delete", "initial", None);
+    fs::remove_file(f.repo.join("tracked.txt")).unwrap();
+    for pair in 0..3 {
+        f.hook("PreToolUse", "delete", &format!("pre-{pair}"), None);
+        f.hook("PostToolUse", "delete", &format!("post-{pair}"), None);
+    }
+    let events = f.events();
+    let deleted: Vec<_> = select(&events, "external_change")
+        .into_iter()
+        .filter(|event| event["path"] == "tracked.txt" && event["after_sha"].is_null())
+        .collect();
+    assert_eq!(deleted.len(), 1);
+    assert_eq!(deleted[0]["deleted_at"], json!([0]));
+    let store = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let shadow_path = fs::read_dir(store.join("shadow"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let shadow: Value = serde_json::from_slice(&fs::read(shadow_path).unwrap()).unwrap();
+    assert_eq!(shadow["files"]["tracked.txt"]["deleted"], true);
+    f.drop_root();
+}
+
+#[test]
 fn head_move_is_external_and_never_ai_credited() {
     let _serial = test_guard();
     let f = Fixture::new("head-move");
+    let old_branch = git_text(&f.repo, &["branch", "--show-current"]);
     f.hook("PreToolUse", "s", "move-head", None);
     git(&f.repo, &["checkout", "-b", "other"]);
     fs::write(f.repo.join("tracked.txt"), "committed on other\n").unwrap();
     git(&f.repo, &["commit", "-am", "other change"]);
+    fs::write(f.repo.join("tracked.txt"), "edited after head move\n").unwrap();
     f.hook("PostToolUse", "s", "move-head", None);
     let all = f.events();
     assert!(select(&all, "ai_change").is_empty());
@@ -287,9 +402,47 @@ fn head_move_is_external_and_never_ai_credited() {
         && e["head_moved"] == true));
     assert!(external
         .iter()
-        .any(|e| e["before_sha"] == sha(b"one\ntwo\n")
-            && e["after_sha"] == sha(b"committed on other\n")));
+        .any(|e| e["before_sha"] == sha(b"committed on other\n")
+            && e["after_sha"] == sha(b"edited after head move\n")));
+    let head_move = select(&all, "head_move")[0];
+    assert_eq!(head_move["file_count"], 1);
+    assert_eq!(head_move["paths"], json!(["tracked.txt"]));
+    assert_eq!(head_move["commit_in_window"], true);
+    assert_eq!(head_move["branch_before"], old_branch);
+    assert_eq!(head_move["branch_after"], "other");
     assert_eq!(select(&all, "window_close")[0]["head_moved"], true);
+    f.drop_root();
+}
+
+#[test]
+fn thirty_file_commit_emits_one_bounded_head_move_with_few_git_spawns() {
+    let _serial = test_guard();
+    let f = Fixture::new("head-move-thirty");
+    let pre = hook_in_process(&f, "PreToolUse", "many-commit", "many-tool");
+    assert_eq!(pre.git_processes, 2);
+    for i in 0..30 {
+        fs::write(
+            f.repo.join(format!("committed-{i:02}.txt")),
+            format!("line {i}\n"),
+        )
+        .unwrap();
+    }
+    git(&f.repo, &["add", "--all"]);
+    git(&f.repo, &["commit", "-m", "thirty files"]);
+    let start = std::time::Instant::now();
+    let post = hook_in_process(&f, "PostToolUse", "many-commit", "many-tool");
+    assert!(start.elapsed() < std::time::Duration::from_millis(800));
+    assert!(
+        post.git_processes <= 4,
+        "git process count: {}",
+        post.git_processes
+    );
+    let head_move = select(&f.events(), "head_move")[0].clone();
+    assert_eq!(head_move["file_count"], 30);
+    assert_eq!(head_move["paths"].as_array().unwrap().len(), 30);
+    assert_eq!(head_move["truncated"], false);
+    assert_eq!(head_move["commit_in_window"], true);
+    assert!(select(&f.events(), "ai_change").is_empty());
     f.drop_root();
 }
 
@@ -324,6 +477,7 @@ fn pull_between_hooks_records_changes_as_external() {
     f.hook("PreToolUse", "s", "pull", None);
     let branch = git_text(&f.repo, &["branch", "--show-current"]);
     git(&f.repo, &["pull", "--ff-only", "origin", branch.as_str()]);
+    fs::write(f.repo.join("tracked.txt"), "after pull edit\n").unwrap();
     f.hook("PostToolUse", "s", "pull", None);
     let all = f.events();
     assert!(select(&all, "ai_change").is_empty());
@@ -331,7 +485,8 @@ fn pull_between_hooks_records_changes_as_external() {
         .iter()
         .any(|e| e["reason"] == "head_moved"
             && e["path"] == "tracked.txt"
-            && e["after_sha"] == sha(b"remote update\n")));
+            && e["after_sha"] == sha(b"after pull edit\n")));
+    assert_eq!(select(&all, "head_move")[0]["commit_in_window"], true);
     f.drop_root();
 }
 
@@ -404,6 +559,95 @@ fn second_hook_uses_repo_cache_without_spawning_rev_list() {
     assert_eq!(code, 0);
     assert!(out.is_empty() && err.is_empty());
     assert!(!count.exists());
+    f.drop_root();
+}
+
+#[test]
+fn recreated_git_directory_recomputes_repo_identity() {
+    let _serial = test_guard();
+    let f = Fixture::new("repo-recreated");
+    f.hook("Stop", "s", "old", None);
+    let old_id = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    fs::remove_dir_all(&f.repo).unwrap();
+    fs::create_dir_all(&f.repo).unwrap();
+    git(&f.repo, &["init"]);
+    git(&f.repo, &["config", "user.email", "new@example.invalid"]);
+    git(&f.repo, &["config", "user.name", "New Repo"]);
+    fs::write(f.repo.join("new-root.txt"), "new root\n").unwrap();
+    git(&f.repo, &["add", "."]);
+    git(&f.repo, &["commit", "-m", "new repository root"]);
+    f.hook("Stop", "s", "new", None);
+    let ids: Vec<_> = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(ids.iter().any(|id| id != &old_id));
+    assert!(ids.contains(&old_id));
+    f.drop_root();
+}
+
+#[test]
+fn unmerged_paths_are_degraded_without_using_blob_ids() {
+    let _serial = test_guard();
+    let f = Fixture::new("unmerged");
+    git(&f.repo, &["checkout", "-b", "conflict-side"]);
+    fs::write(f.repo.join("tracked.txt"), "side change\n").unwrap();
+    git(&f.repo, &["commit", "-am", "side"]);
+    git(&f.repo, &["checkout", "-"]);
+    fs::write(f.repo.join("tracked.txt"), "main change\n").unwrap();
+    git(&f.repo, &["commit", "-am", "main"]);
+    let merge = Command::new("git")
+        .args(["merge", "conflict-side"])
+        .current_dir(&f.repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .unwrap();
+    assert!(!merge.status.success());
+    f.hook("PostToolUse", "conflict", "merge", None);
+    let all = f.events();
+    assert!(select(&all, "ai_change").is_empty());
+    let conflict = select(&all, "external_change")
+        .into_iter()
+        .find(|event| event["path"] == "tracked.txt")
+        .unwrap();
+    assert_eq!(conflict["reason"], "unmerged");
+    assert_eq!(conflict["degraded"], true);
+    assert!(conflict["before_sha"].is_null() && conflict["after_sha"].is_null());
+    f.drop_root();
+}
+
+#[test]
+fn over_five_hundred_dirty_paths_emit_one_bulk_event_without_snapshots() {
+    let _serial = test_guard();
+    let f = Fixture::new("bulk");
+    for i in 0..501 {
+        fs::write(
+            f.repo.join(format!("bulk-{i:03}.txt")),
+            format!("secretish {i}\n"),
+        )
+        .unwrap();
+    }
+    f.hook("PreToolUse", "bulk", "bulk-tool", None);
+    f.hook("PostToolUse", "bulk", "bulk-tool", None);
+    let events = f.events();
+    let bulk = select(&events, "bulk_change");
+    assert_eq!(bulk.len(), 1);
+    assert_eq!(bulk[0]["dirty_count"], 501);
+    assert_eq!(bulk[0]["reason"], "bulk_change");
+    assert_eq!(select(&events, "ai_change").len(), 0);
+    assert_eq!(select(&events, "window_open")[0]["reason"], "bulk_change");
+    let store = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(fs::read_dir(store.join("blobs")).unwrap().count(), 0);
     f.drop_root();
 }
 
@@ -604,9 +848,9 @@ fn file_filters_deletions_new_files_and_crlf() {
     assert!(!contents
         .iter()
         .any(|b| b.windows(6).any(|w| w == b"hidden")));
-    assert!(changes.iter().any(|e| e["path"] == "secrets.rs"
-        && e["excluded"] == true
-        && !e["line_ranges"].as_array().unwrap().is_empty()));
+    assert!(changes
+        .iter()
+        .any(|e| e["path"] == "secrets.rs" && e["excluded"] == true && e["line_ranges"].is_null()));
     f.drop_root();
 }
 
@@ -712,14 +956,22 @@ fn held_repo_lock_times_out_quickly_and_uses_markers() {
     assert_eq!(code, 0);
     assert!(out.is_empty() && err.is_empty());
     assert!(
+        start.elapsed().as_millis() >= 450,
+        "lock timeout returned before the 500 ms budget: {:?}",
+        start.elapsed()
+    );
+    assert!(
         start.elapsed().as_secs_f64() < 1.2,
         "lock wait exceeded 1.2 seconds: {:?}",
         start.elapsed()
     );
     let markers = fs::read_to_string(repo_store.join("markers.jsonl")).unwrap();
     assert!(markers.contains("lock_timeout"));
-    assert!(markers.contains("hook_event_name"));
+    assert!(markers.contains("\"hook_event_name\":\"PreToolUse\""));
+    assert!(markers.contains("\"tool_use_id\":\"locked-tool\""));
+    assert!(markers.contains("\"session_id\":\"locked-session\""));
     assert!(!shadow.exists());
+    assert!(select(&events_in(&f.home), "window_open").is_empty());
     f.drop_root();
 }
 

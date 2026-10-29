@@ -20,6 +20,7 @@ pub struct TimingSnapshot {
     pub git_status_ns: u64,
     pub hashing_snapshots_ns: u64,
     pub writes_ns: u64,
+    pub sync_ns: u64,
     pub log_work_ns: u64,
 }
 struct TimingAtoms {
@@ -30,6 +31,7 @@ struct TimingAtoms {
     git_status_ns: AtomicU64,
     hashing_snapshots_ns: AtomicU64,
     writes_ns: AtomicU64,
+    sync_ns: AtomicU64,
     log_work_ns: AtomicU64,
 }
 impl TimingAtoms {
@@ -42,6 +44,7 @@ impl TimingAtoms {
             git_status_ns: AtomicU64::new(0),
             hashing_snapshots_ns: AtomicU64::new(0),
             writes_ns: AtomicU64::new(0),
+            sync_ns: AtomicU64::new(0),
             log_work_ns: AtomicU64::new(0),
         }
     }
@@ -54,6 +57,7 @@ impl TimingAtoms {
             &self.git_status_ns,
             &self.hashing_snapshots_ns,
             &self.writes_ns,
+            &self.sync_ns,
             &self.log_work_ns,
         ] {
             a.store(0, Ordering::Relaxed);
@@ -68,6 +72,7 @@ impl TimingAtoms {
             git_status_ns: self.git_status_ns.load(Ordering::Relaxed),
             hashing_snapshots_ns: self.hashing_snapshots_ns.load(Ordering::Relaxed),
             writes_ns: self.writes_ns.load(Ordering::Relaxed),
+            sync_ns: self.sync_ns.load(Ordering::Relaxed),
             log_work_ns: self.log_work_ns.load(Ordering::Relaxed),
         }
     }
@@ -82,7 +87,8 @@ fn add_ns(target: &AtomicU64, duration: Duration) {
 
 const MAX_FILE: u64 = 1024 * 1024;
 const SCAN_BUDGET: Duration = Duration::from_millis(1500);
-const LOCK_BUDGET: Duration = Duration::from_millis(250);
+const LOCK_BUDGET: Duration = Duration::from_millis(500);
+const MAX_DIRTY_PATHS: usize = 500;
 const MAX_RECENT_KEYS: usize = 1000;
 const MAX_WINDOW_AGE_NS: u128 = 60 * 60 * 1_000_000_000;
 const EXCLUSIONS: &[&str] = &[
@@ -118,6 +124,10 @@ struct FileState {
     size: u64,
     mtime_ns: u128,
     sha256: String,
+    #[serde(default)]
+    excluded: bool,
+    #[serde(default)]
+    deleted: bool,
 }
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Shadow {
@@ -131,6 +141,8 @@ struct WindowState {
     head: String,
     branch: String,
     overlap: bool,
+    #[serde(default)]
+    bulk_count: Option<usize>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RecentKey {
@@ -148,6 +160,10 @@ struct RepoState {
 #[derive(Debug, Serialize, Deserialize)]
 struct RepoCache {
     repo_id: String,
+    #[serde(default)]
+    root_check: String,
+    #[serde(default)]
+    git_dir_created_ns: Option<u128>,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +177,7 @@ struct Event {
     before_sha: Option<String>,
     after_sha: Option<String>,
     line_ranges: Option<Vec<[usize; 2]>>,
+    deleted_at: Option<Vec<usize>>,
     session_id: Option<String>,
     turn_id: Option<String>,
     tool_use_id: Option<String>,
@@ -178,6 +195,15 @@ struct Event {
     head: Option<String>,
     branch: Option<String>,
     head_moved: Option<bool>,
+    old_head: Option<String>,
+    new_head: Option<String>,
+    branch_before: Option<String>,
+    branch_after: Option<String>,
+    file_count: Option<usize>,
+    paths: Option<Vec<String>>,
+    truncated: Option<bool>,
+    commit_in_window: Option<bool>,
+    dirty_count: Option<usize>,
 }
 impl Event {
     fn new(
@@ -197,6 +223,7 @@ impl Event {
             before_sha: None,
             after_sha: None,
             line_ranges: None,
+            deleted_at: None,
             session_id: session.map(str::to_owned),
             turn_id: None,
             tool_use_id: tool.map(str::to_owned),
@@ -214,6 +241,15 @@ impl Event {
             head: None,
             branch: None,
             head_moved: None,
+            old_head: None,
+            new_head: None,
+            branch_before: None,
+            branch_after: None,
+            file_count: None,
+            paths: None,
+            truncated: None,
+            commit_in_window: None,
+            dirty_count: None,
         }
     }
 }
@@ -240,6 +276,7 @@ struct DirtyPath {
     path: String,
     head_blob: Option<String>,
     untracked: bool,
+    unmerged: bool,
 }
 #[derive(Clone, Debug)]
 struct FileChange {
@@ -250,6 +287,7 @@ struct FileChange {
     after_bytes: Option<Vec<u8>>,
     excluded: bool,
     degraded: Option<String>,
+    deleted_at: Vec<usize>,
 }
 
 /// Contain all hook work. The executable wraps this in catch_unwind and has a process watchdog.
@@ -362,9 +400,9 @@ pub fn process_json(input: &[u8]) {
     match event_name {
         "PreToolUse" => {
             let scan = timed_scan(&repo.root, &store.join("blobs"), &mut shadow, SCAN_BUDGET);
-            let (changes, incomplete) = match scan {
-                Ok(v) => v,
-                Err(_) => (Vec::new(), true),
+            let (changes, incomplete, bulk_count) = match scan {
+                Ok(v) => (v.changes, v.incomplete, v.bulk_count),
+                Err(_) => (Vec::new(), true, None),
             };
             let after_incomplete = pending_external_flag(&mut state, incomplete);
             if incomplete {
@@ -376,21 +414,35 @@ pub fn process_json(input: &[u8]) {
                     tool_id.as_deref(),
                 );
             }
-            let mut event_batch = Vec::with_capacity(changes.len());
-            for change in changes {
-                let mut e = change_event(
-                    "external_change",
-                    change,
-                    event_name,
-                    &repo_id,
-                    &session,
+            if let Some(count) = bulk_count {
+                let mut e = Event::new(
+                    "bulk_change",
+                    Some(event_name),
+                    Some(&repo_id),
+                    Some(&session),
                     tool_id.as_deref(),
-                    after_incomplete,
                 );
-                e.degraded = e.reason.is_some().then_some(true);
-                event_batch.push(e);
+                e.dirty_count = Some(count);
+                e.degraded = Some(true);
+                e.reason = Some("bulk_change".into());
+                append_line(&event_path, &e);
+            } else {
+                let mut event_batch = Vec::with_capacity(changes.len());
+                for change in changes {
+                    let mut e = change_event(
+                        "external_change",
+                        change,
+                        event_name,
+                        &repo_id,
+                        &session,
+                        tool_id.as_deref(),
+                        after_incomplete,
+                    );
+                    e.degraded = e.reason.is_some().then_some(true);
+                    event_batch.push(e);
+                }
+                append_events(&event_path, &event_batch);
             }
-            append_events(&event_path, &event_batch);
             let now = now_ns();
             let overlap = state
                 .windows
@@ -410,6 +462,7 @@ pub fn process_json(input: &[u8]) {
                 head: head.clone(),
                 branch: branch.clone(),
                 overlap,
+                bulk_count,
             };
             let mut e = Event::new(
                 "window_open",
@@ -423,14 +476,18 @@ pub fn process_json(input: &[u8]) {
             e.head = Some(head);
             e.branch = Some(branch);
             e.degraded = Some(incomplete);
+            if bulk_count.is_some() {
+                e.degraded = Some(true);
+                e.reason = Some("bulk_change".into());
+            }
             append_line(&event_path, &e);
             state.windows.push(window);
         }
         "PostToolUse" => {
             let scan = timed_scan(&repo.root, &store.join("blobs"), &mut shadow, SCAN_BUDGET);
-            let (mut changes, incomplete) = match scan {
-                Ok(v) => v,
-                Err(_) => (Vec::new(), true),
+            let (changes, incomplete, bulk_count) = match scan {
+                Ok(v) => (v.changes, v.incomplete, v.bulk_count),
+                Err(_) => (Vec::new(), true, None),
             };
             if incomplete {
                 state.scan_incomplete_pending = true;
@@ -449,6 +506,8 @@ pub fn process_json(input: &[u8]) {
                 .rposition(|w| w.session_id == session && w.tool_use_id == tool_id);
             let window = ix.map(|i| state.windows.remove(i));
             let opened = window.as_ref().map(|w| w.opened_at);
+            let prior_bulk = window.as_ref().and_then(|w| w.bulk_count);
+            let bulk_window = prior_bulk.is_some() || bulk_count.is_some();
             let overlap = window.as_ref().is_some_and(|w| w.overlap)
                 || state
                     .windows
@@ -457,11 +516,28 @@ pub fn process_json(input: &[u8]) {
             let head_moved = window
                 .as_ref()
                 .is_some_and(|w| w.head != close_head || w.branch != close_branch);
-            if head_moved {
-                if let Some(window) = window.as_ref() {
-                    let extra = head_move_changes(&repo.root, &window.head, &close_head, &changes);
-                    changes.extend(extra);
-                }
+            let head_move = head_moved
+                .then(|| {
+                    let (old_head, old_branch) = window
+                        .as_ref()
+                        .map(|w| (w.head.as_str(), w.branch.as_str()))
+                        .unwrap_or(("unknown", ""));
+                    head_move_summary(&repo.root, old_head, &close_head)
+                        .map(|summary| (old_head.to_owned(), old_branch.to_owned(), summary))
+                })
+                .flatten();
+            if bulk_count.is_some() && prior_bulk.is_none() {
+                let mut e = Event::new(
+                    "bulk_change",
+                    Some(event_name),
+                    Some(&repo_id),
+                    Some(&session),
+                    tool_id.as_deref(),
+                );
+                e.dirty_count = bulk_count;
+                e.degraded = Some(true);
+                e.reason = Some("bulk_change".into());
+                append_line(&event_path, &e);
             }
             let command_sha = hook
                 .tool_input
@@ -484,7 +560,7 @@ pub fn process_json(input: &[u8]) {
                 if duplicate {
                     continue;
                 }
-                let kind = if head_moved {
+                let kind = if head_moved || bulk_window || change.degraded.is_some() {
                     "external_change"
                 } else {
                     "ai_change"
@@ -511,6 +587,9 @@ pub fn process_json(input: &[u8]) {
                 if head_moved {
                     e.reason = Some("head_moved".into());
                     e.head_moved = Some(true);
+                } else if bulk_window {
+                    e.reason = Some("bulk_change".into());
+                    e.degraded = Some(true);
                 }
                 e.degraded = e.reason.is_some().then_some(true);
                 if let Some(id) = &tool_id {
@@ -524,6 +603,26 @@ pub fn process_json(input: &[u8]) {
                 event_batch.push(e);
             }
             append_events(&event_path, &event_batch);
+            if let Some((old_head, old_branch, summary)) = head_move {
+                let mut e = Event::new(
+                    "head_move",
+                    Some(event_name),
+                    Some(&repo_id),
+                    Some(&session),
+                    tool_id.as_deref(),
+                );
+                e.old_head = Some(old_head);
+                e.new_head = Some(close_head.clone());
+                e.branch_before = Some(old_branch);
+                e.branch_after = Some(close_branch.clone());
+                e.file_count = Some(summary.file_count);
+                e.paths = Some(summary.paths);
+                e.truncated = Some(summary.truncated);
+                e.commit_in_window = Some(summary.commit_in_window);
+                e.head_moved = Some(true);
+                e.degraded = Some(true);
+                append_line(&event_path, &e);
+            }
             let mut e = Event::new(
                 "window_close",
                 Some(event_name),
@@ -537,6 +636,10 @@ pub fn process_json(input: &[u8]) {
             e.branch = Some(close_branch);
             e.head_moved = Some(head_moved);
             e.degraded = Some(incomplete);
+            if bulk_window {
+                e.degraded = Some(true);
+                e.reason = Some("bulk_change".into());
+            }
             append_line(&event_path, &e);
         }
         "Stop" => {
@@ -553,8 +656,8 @@ pub fn process_json(input: &[u8]) {
         _ => {}
     }
     cap_state(&mut state);
-    let _ = atomic_json(&state_path, &state);
-    let _ = atomic_json(&shadow_path, &shadow);
+    let _ = atomic_json(&state_path, &state, true);
+    let _ = atomic_json(&shadow_path, &shadow, true);
 }
 
 fn repo_info(cwd: &Path, home: &Path) -> Option<RepoInfo> {
@@ -571,6 +674,11 @@ fn repo_info(cwd: &Path, home: &Path) -> Option<RepoInfo> {
         "{}.json",
         hash(git_dir.to_string_lossy().as_bytes())
     ));
+    let git_dir_created_ns = fs::metadata(&git_dir)
+        .ok()
+        .and_then(|m| m.created().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
     let cached: Option<RepoCache> = read_json(&cache_path);
     if shallow {
         return Some(RepoInfo {
@@ -583,9 +691,11 @@ fn repo_info(cwd: &Path, home: &Path) -> Option<RepoInfo> {
             branch,
         });
     }
-    let repo_id = if let Some(cache) = cached {
-        Some(cache.repo_id)
-    } else {
+    let needs_root_check = cached.as_ref().is_some_and(|cache| {
+        git_dir_created_ns.is_none() || cache.git_dir_created_ns != git_dir_created_ns
+    });
+    let should_compute = cached.is_none() || needs_root_check;
+    let roots = if should_compute {
         let mut roots: Vec<String> = git_text(
             &root_path,
             &["rev-list", "--first-parent", "--max-parents=0", "HEAD"],
@@ -594,15 +704,36 @@ fn repo_info(cwd: &Path, home: &Path) -> Option<RepoInfo> {
         .map(str::to_owned)
         .collect();
         roots.sort();
+        Some(roots)
+    } else {
+        None
+    };
+    let cached_still_matches = cached.as_ref().is_some_and(|cache| {
+        if let Some(created) = git_dir_created_ns {
+            cache.git_dir_created_ns == Some(created)
+        } else {
+            roots
+                .as_ref()
+                .is_some_and(|current| cache.root_check == current.join("\n"))
+        }
+    });
+    let repo_id = if cached_still_matches {
+        cached.as_ref().map(|c| c.repo_id.clone())
+    } else {
+        let roots = roots?;
         if roots.is_empty() {
             return None;
         }
-        let id = hash(roots.join("\n").as_bytes());
+        let root_check = roots.join("\n");
+        let id = hash(root_check.as_bytes());
         let _ = atomic_json(
             &cache_path,
             &RepoCache {
                 repo_id: id.clone(),
+                root_check,
+                git_dir_created_ns,
             },
+            false,
         );
         Some(id)
     };
@@ -778,12 +909,18 @@ fn git_output(
     }
 }
 
+struct ScanResult {
+    changes: Vec<FileChange>,
+    incomplete: bool,
+    bulk_count: Option<usize>,
+}
+
 fn scan(
     root: &Path,
     blobs: &Path,
     shadow: &mut Shadow,
     budget: Duration,
-) -> std::io::Result<(Vec<FileChange>, bool)> {
+) -> std::io::Result<ScanResult> {
     let start = Instant::now();
     let status_start = Instant::now();
     let status = git_output(
@@ -798,16 +935,31 @@ fn scan(
     let dirty = parse_status(&status.stdout);
     let dirty_set: HashSet<String> = dirty.iter().map(|d| d.path.clone()).collect();
     shadow.files.retain(|path, _| dirty_set.contains(path));
+    if dirty.len() > MAX_DIRTY_PATHS {
+        return Ok(ScanResult {
+            changes: Vec::new(),
+            incomplete: false,
+            bulk_count: Some(dirty.len()),
+        });
+    }
     let mut head_ids = Vec::new();
     for d in &dirty {
-        if !d.untracked && !shadow.files.contains_key(&d.path) {
+        if !d.untracked
+            && !d.unmerged
+            && !is_excluded(&d.path)
+            && !shadow.files.contains_key(&d.path)
+        {
             if let Some(id) = &d.head_blob {
                 head_ids.push(id.clone());
             }
         }
     }
     if start.elapsed() >= budget {
-        return Ok((Vec::new(), true));
+        return Ok(ScanResult {
+            changes: Vec::new(),
+            incomplete: true,
+            bulk_count: None,
+        });
     }
     let head_contents = cat_blobs(root, &head_ids).unwrap_or_default();
     let mut changes = Vec::new();
@@ -818,33 +970,27 @@ fn scan(
             break;
         }
         let path = d.path.replace('\\', "/");
-        let old_file = shadow
-            .files
-            .get(&path)
-            .and_then(|s| fs::read(blobs.join(&s.sha256)).ok());
-        if old_file.is_none()
-            && d.head_blob.is_some()
-            && !head_contents.contains_key(d.head_blob.as_ref().unwrap())
-        {
+        let excluded = is_excluded(&path);
+        if d.unmerged {
             changes.push(FileChange {
-                path: path.clone(),
+                path,
                 before: None,
                 after: None,
                 before_bytes: None,
                 after_bytes: None,
-                excluded: is_excluded(&path),
-                degraded: Some("git_before_read:other".into()),
+                excluded,
+                degraded: Some("unmerged".into()),
+                deleted_at: Vec::new(),
             });
             continue;
         }
-        let (before_bytes, before_sha) = if let Some(bytes) = old_file {
-            let sha = hash(&bytes);
-            (Some(bytes), Some(sha))
-        } else if let Some(id) = d.head_blob.as_ref().and_then(|id| head_contents.get(id)) {
-            (Some(id.clone()), Some(hash(id)))
-        } else {
-            (Some(Vec::new()), None)
-        };
+        let previous = shadow.files.get(&path).cloned();
+        let before_sha_hint = previous.as_ref().map(|s| s.sha256.clone()).or_else(|| {
+            d.head_blob
+                .as_ref()
+                .and_then(|id| head_contents.get(id))
+                .map(|bytes| hash(bytes))
+        });
         let full = root.join(raw_path(d.path.as_bytes()));
         let meta = match fs::symlink_metadata(&full) {
             Ok(m) if m.file_type().is_symlink() => {
@@ -854,84 +1000,165 @@ fn scan(
             Ok(m) => Some(m),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                changes.push(file_error(path, before_sha, "metadata", &e));
+                changes.push(file_error(path, before_sha_hint, "metadata", &e));
                 continue;
             }
         };
-        let mut after_bytes = None;
-        if let Some(meta) = meta {
-            if !meta.file_type().is_file() || meta.len() > MAX_FILE {
-                shadow.files.remove(&path);
+        let Some(meta) = meta else {
+            if previous.as_ref().is_some_and(|s| s.deleted) {
                 continue;
             }
-            let f = match File::open(&full) {
-                Ok(f) => f,
-                Err(e) => {
-                    changes.push(file_error(path, before_sha, "open", &e));
-                    continue;
-                }
+            let head_bytes = if excluded {
+                None
+            } else if let Some(prev) = previous.as_ref() {
+                read_blob(&blobs.join(&prev.sha256), &prev.sha256)
+            } else {
+                d.head_blob
+                    .as_ref()
+                    .and_then(|id| head_contents.get(id).cloned())
             };
-            let mut bytes = Vec::with_capacity(meta.len() as usize);
-            if let Err(e) = f.take(MAX_FILE + 1).read_to_end(&mut bytes) {
-                changes.push(file_error(path, before_sha, "read", &e));
-                continue;
-            }
-            if bytes.len() as u64 > MAX_FILE || bytes[..bytes.len().min(8192)].contains(&0) {
-                shadow.files.remove(&path);
-                continue;
-            }
-            after_bytes = Some(bytes);
-        }
-        let excluded = is_excluded(&path);
-        let before_sha =
-            before_sha.or_else(|| before_bytes.as_deref().filter(|b| !b.is_empty()).map(hash));
-        let after_sha = after_bytes.as_deref().map(hash);
-        if before_sha != after_sha {
-            if !excluded {
-                if let Some(bytes) = after_bytes.as_deref() {
-                    if let Err(e) =
-                        write_once(&blobs.join(after_sha.as_deref().unwrap_or("")), bytes)
-                    {
-                        changes.push(file_error(path, before_sha, "snapshot", &e));
-                        continue;
-                    }
-                } else if let Some(bytes) = before_bytes.as_deref() {
-                    let old_sha = hash(bytes);
-                    if let Err(e) = write_once(&blobs.join(old_sha), bytes) {
-                        changes.push(file_error(path, before_sha, "snapshot", &e));
-                        continue;
+            let before_sha = previous
+                .as_ref()
+                .map(|s| s.sha256.clone())
+                .or_else(|| head_bytes.as_deref().map(hash));
+            if before_sha.is_none() && !d.untracked {
+                changes.push(FileChange {
+                    path: path.clone(),
+                    before: None,
+                    after: None,
+                    before_bytes: None,
+                    after_bytes: None,
+                    excluded,
+                    degraded: Some("git_before_read:other".into()),
+                    deleted_at: Vec::new(),
+                });
+            } else {
+                if !excluded {
+                    if let Some(bytes) = head_bytes.as_deref() {
+                        let old_sha = hash(bytes);
+                        if let Err(e) = write_once(&blobs.join(&old_sha), bytes) {
+                            changes.push(file_error(path, before_sha, "snapshot", &e));
+                            continue;
+                        }
                     }
                 }
+                let deleted_at = head_bytes
+                    .as_deref()
+                    .map(|b| deleted_positions(b, b""))
+                    .unwrap_or_default();
+                changes.push(FileChange {
+                    path: path.clone(),
+                    before: before_sha.clone(),
+                    after: None,
+                    before_bytes: if excluded { None } else { head_bytes.clone() },
+                    after_bytes: None,
+                    excluded,
+                    degraded: None,
+                    deleted_at,
+                });
             }
-            changes.push(FileChange {
-                path: path.clone(),
-                before: before_sha.clone(),
-                after: after_sha.clone(),
-                before_bytes: before_bytes.clone(),
-                after_bytes: after_bytes.clone(),
+            let old = previous.unwrap_or(FileState {
+                size: head_bytes.as_ref().map_or(0, |b| b.len() as u64),
+                mtime_ns: 0,
+                sha256: before_sha.unwrap_or_default(),
                 excluded,
-                degraded: None,
+                deleted: false,
             });
-        }
-        if excluded || after_bytes.is_none() {
-            shadow.files.remove(&path);
-        } else if let (Some(sha), Some(bytes)) = (after_sha, after_bytes) {
-            let mtime_ns = fs::metadata(root.join(raw_path(d.path.as_bytes())))
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_nanos());
             shadow.files.insert(
                 path,
                 FileState {
-                    size: bytes.len() as u64,
-                    mtime_ns,
-                    sha256: sha,
+                    deleted: true,
+                    ..old
                 },
             );
+            continue;
+        };
+        if !meta.file_type().is_file() || meta.len() > MAX_FILE {
+            shadow.files.remove(&path);
+            continue;
         }
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        if previous
+            .as_ref()
+            .is_some_and(|s| !s.deleted && s.size == meta.len() && s.mtime_ns == mtime_ns)
+        {
+            continue;
+        }
+        let before_bytes = if excluded {
+            None
+        } else if let Some(prev) = previous.as_ref() {
+            read_blob(&blobs.join(&prev.sha256), &prev.sha256)
+        } else {
+            d.head_blob
+                .as_ref()
+                .and_then(|id| head_contents.get(id).cloned())
+                .or_else(|| d.untracked.then(Vec::new))
+        };
+        let before_sha = previous
+            .as_ref()
+            .map(|s| s.sha256.clone())
+            .or_else(|| before_bytes.as_deref().filter(|b| !b.is_empty()).map(hash));
+        let f = match File::open(&full) {
+            Ok(f) => f,
+            Err(e) => {
+                changes.push(file_error(path, before_sha, "open", &e));
+                continue;
+            }
+        };
+        let mut after_bytes = Vec::with_capacity(meta.len() as usize);
+        if let Err(e) = f.take(MAX_FILE + 1).read_to_end(&mut after_bytes) {
+            changes.push(file_error(path, before_sha, "read", &e));
+            continue;
+        }
+        if after_bytes.len() as u64 > MAX_FILE
+            || after_bytes[..after_bytes.len().min(8192)].contains(&0)
+        {
+            shadow.files.remove(&path);
+            continue;
+        }
+        let after_sha = hash(&after_bytes);
+        if before_sha.as_deref() != Some(&after_sha) {
+            if !excluded {
+                if let Err(e) = write_once(&blobs.join(&after_sha), &after_bytes) {
+                    changes.push(file_error(path, before_sha, "snapshot", &e));
+                    continue;
+                }
+            }
+            let deleted_at = before_bytes
+                .as_deref()
+                .map(|b| deleted_positions(b, &after_bytes))
+                .unwrap_or_default();
+            changes.push(FileChange {
+                path: path.clone(),
+                before: before_sha.clone(),
+                after: Some(after_sha.clone()),
+                before_bytes: if excluded { None } else { before_bytes },
+                after_bytes: Some(after_bytes.clone()),
+                excluded,
+                degraded: None,
+                deleted_at,
+            });
+        }
+        shadow.files.insert(
+            path,
+            FileState {
+                size: after_bytes.len() as u64,
+                mtime_ns,
+                sha256: after_sha,
+                excluded,
+                deleted: false,
+            },
+        );
     }
-    Ok((changes, incomplete))
+    Ok(ScanResult {
+        changes,
+        incomplete,
+        bulk_count: None,
+    })
 }
 
 fn timed_scan(
@@ -939,7 +1166,7 @@ fn timed_scan(
     blobs: &Path,
     shadow: &mut Shadow,
     budget: Duration,
-) -> std::io::Result<(Vec<FileChange>, bool)> {
+) -> std::io::Result<ScanResult> {
     let start = Instant::now();
     let before_status = TIMINGS.git_status_ns.load(Ordering::Relaxed);
     let before_writes = TIMINGS.writes_ns.load(Ordering::Relaxed);
@@ -970,6 +1197,7 @@ fn parse_status(data: &[u8]) -> Vec<DirtyPath> {
                 path: String::from_utf8_lossy(&row[2..]).into_owned(),
                 head_blob: None,
                 untracked: true,
+                unmerged: false,
             });
             continue;
         }
@@ -989,8 +1217,13 @@ fn parse_status(data: &[u8]) -> Vec<DirtyPath> {
         let path = String::from_utf8_lossy(parts[fields]).into_owned();
         out.push(DirtyPath {
             path,
-            head_blob: if typ == b'2' { None } else { head_blob.clone() },
+            head_blob: if typ == b'2' || typ == b'u' {
+                None
+            } else {
+                head_blob.clone()
+            },
             untracked: false,
+            unmerged: typ == b'u',
         });
         if typ == b'2' {
             if let Some(old) = records.next() {
@@ -998,6 +1231,7 @@ fn parse_status(data: &[u8]) -> Vec<DirtyPath> {
                     path: String::from_utf8_lossy(old).into_owned(),
                     head_blob,
                     untracked: false,
+                    unmerged: false,
                 });
             }
         }
@@ -1056,69 +1290,53 @@ fn cat_blobs(root: &Path, ids: &[String]) -> Option<BTreeMap<String, Vec<u8>>> {
     Some(result)
 }
 
-fn head_move_changes(
-    root: &Path,
-    old_head: &str,
-    new_head: &str,
-    existing: &[FileChange],
-) -> Vec<FileChange> {
+struct HeadMoveSummary {
+    file_count: usize,
+    paths: Vec<String>,
+    truncated: bool,
+    commit_in_window: bool,
+}
+
+fn head_move_summary(root: &Path, old_head: &str, new_head: &str) -> Option<HeadMoveSummary> {
     let old = old_head.strip_prefix("detached:").unwrap_or(old_head);
     let new = new_head.strip_prefix("detached:").unwrap_or(new_head);
     if old == "unknown" || new == "unknown" {
-        return Vec::new();
+        return None;
     }
-    let Some(out) = git_output(
+    let out = git_output(
         root,
         &["diff", "--no-renames", "--name-only", "-z", old, new],
         None,
     )
-    .ok() else {
-        return Vec::new();
-    };
+    .ok()?;
     if !out.status.success() {
-        return Vec::new();
+        return None;
     }
-    let known: HashSet<&str> = existing.iter().map(|c| c.path.as_str()).collect();
-    let mut changes = Vec::new();
-    for raw in out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        let path = String::from_utf8_lossy(raw).into_owned();
-        if known.contains(path.as_str()) {
-            continue;
-        }
-        let old_arg = format!("{old}:{path}");
-        let new_arg = format!("{new}:{path}");
-        let before = git_output(root, &["show", old_arg.as_str()], None)
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| o.stdout);
-        let after = git_output(root, &["show", new_arg.as_str()], None)
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| o.stdout);
-        if before
-            .as_ref()
-            .is_some_and(|b| b.len() as u64 > MAX_FILE || b[..b.len().min(8192)].contains(&0))
-            || after
-                .as_ref()
-                .is_some_and(|b| b.len() as u64 > MAX_FILE || b[..b.len().min(8192)].contains(&0))
-        {
-            continue;
-        }
-        let before_sha = before.as_deref().map(hash);
-        let after_sha = after.as_deref().map(hash);
-        if before_sha != after_sha {
-            changes.push(FileChange {
-                excluded: is_excluded(&path),
-                path,
-                before: before_sha,
-                after: after_sha,
-                before_bytes: before,
-                after_bytes: after,
-                degraded: None,
-            });
-        }
-    }
-    changes
+    let all_paths: Vec<&[u8]> = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let file_count = all_paths.len();
+    let paths = all_paths
+        .iter()
+        .take(200)
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    let commit_in_window = git_output(root, &["cat-file", "-p", new], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| {
+            o.stdout
+                .split(|b| *b == b'\n')
+                .any(|line| line.strip_prefix(b"parent ") == Some(old.as_bytes()))
+        });
+    Some(HeadMoveSummary {
+        file_count,
+        paths,
+        truncated: file_count > 200,
+        commit_in_window,
+    })
 }
 
 fn file_error(
@@ -1136,6 +1354,7 @@ fn file_error(
         after_bytes: None,
         excluded,
         degraded: Some(format!("{reason}:{}", e.kind())),
+        deleted_at: Vec::new(),
     }
 }
 fn change_event(
@@ -1151,14 +1370,20 @@ fn change_event(
     e.path = Some(change.path);
     e.before_sha = change.before;
     e.after_sha = change.after;
-    e.line_ranges = match (
-        change.before_bytes.as_deref(),
-        change.after_bytes.as_deref(),
-    ) {
-        (Some(a), Some(b)) => Some(changed_line_ranges(a, b)),
-        (None, Some(b)) => Some(line_ranges(b)),
-        _ => None,
+    e.line_ranges = if change.excluded {
+        None
+    } else {
+        match (
+            change.before_bytes.as_deref(),
+            change.after_bytes.as_deref(),
+        ) {
+            (Some(a), Some(b)) => Some(changed_line_ranges(a, b)),
+            (None, Some(b)) => Some(line_ranges(b)),
+            (Some(_), None) => Some(Vec::new()),
+            _ => None,
+        }
     };
+    e.deleted_at = Some(change.deleted_at);
     e.excluded = Some(change.excluded);
     e.reason = change.degraded;
     e.after_incomplete = Some(after_incomplete);
@@ -1227,25 +1452,36 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
 }
-fn atomic_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+fn atomic_json<T: Serialize>(path: &Path, value: &T, sync: bool) -> std::io::Result<()> {
     let start = Instant::now();
     atomic_bytes(
         path,
         &serde_json::to_vec(value).map_err(std::io::Error::other)?,
+        sync,
     )
     .inspect(|_| add_ns(&TIMINGS.writes_ns, start.elapsed()))
 }
 fn write_once(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let start = Instant::now();
     if path.exists() {
-        add_ns(&TIMINGS.writes_ns, start.elapsed());
-        return Ok(());
+        let expected = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if read_blob(path, expected).is_some() {
+            add_ns(&TIMINGS.writes_ns, start.elapsed());
+            return Ok(());
+        }
     }
-    let result = atomic_bytes(path, bytes);
+    let result = atomic_bytes(path, bytes, false);
     add_ns(&TIMINGS.writes_ns, start.elapsed());
     result
 }
-fn atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn read_blob(path: &Path, expected_sha: &str) -> Option<Vec<u8>> {
+    let bytes = fs::read(path).ok()?;
+    (hash(&bytes) == expected_sha).then_some(bytes)
+}
+fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("no parent"))?;
@@ -1262,7 +1498,11 @@ fn atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     f.write_all(bytes)?;
     f.flush()?;
-    f.sync_all()?;
+    if sync {
+        let sync_start = Instant::now();
+        f.sync_all()?;
+        add_ns(&TIMINGS.sync_ns, sync_start.elapsed());
+    }
     drop(f);
     #[cfg(windows)]
     if path.exists() {
@@ -1294,7 +1534,9 @@ fn atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         if replaced != 0 {
             return Ok(());
         }
-        return Err(std::io::Error::last_os_error());
+        let error = std::io::Error::last_os_error();
+        let _ = fs::remove_file(&temp);
+        return Err(error);
     }
     match fs::rename(&temp, path) {
         Ok(()) => Ok(()),
@@ -1462,10 +1704,29 @@ fn changed_line_ranges(before: &[u8], after: &[u8]) -> Vec<[usize; 2]> {
                 new_line += 1;
                 changed.push(new_line);
             }
-            ChangeTag::Delete => changed.push((new_line + 1).max(1)),
+            ChangeTag::Delete => {}
         }
     }
     ranges(changed)
+}
+fn deleted_positions(before: &[u8], after: &[u8]) -> Vec<usize> {
+    let (Some(old), Some(new)) = (normalized(before), normalized(after)) else {
+        return Vec::new();
+    };
+    let diff = TextDiff::from_lines(&old, &new);
+    let mut new_line = 0usize;
+    let mut deleted = Vec::new();
+    for item in diff.iter_all_changes() {
+        match item.tag() {
+            ChangeTag::Equal | ChangeTag::Insert => {
+                new_line += 1;
+            }
+            ChangeTag::Delete => deleted.push(new_line),
+        }
+    }
+    deleted.sort_unstable();
+    deleted.dedup();
+    deleted
 }
 fn ranges(mut lines: Vec<usize>) -> Vec<[usize; 2]> {
     lines.sort_unstable();
@@ -1552,10 +1813,50 @@ mod tests {
         assert!(changed_line_ranges(b"alpha\n", b"alpha\r\n").is_empty());
     }
     #[test]
+    fn diff_line_ranges_and_deleted_positions_match_new_file_lines() {
+        type DiffCase<'a> = (&'a [u8], &'a [u8], &'a [[usize; 2]], &'a [usize]);
+        let cases: &[DiffCase<'_>] = &[
+            (b"a\nb\nc\n", b"a\nc\n", &[], &[1]),
+            (b"a\nb\n", b"a\n", &[], &[1]),
+            (b"a\nb\nc\n", b"b\nc\n", &[], &[0]),
+            (b"a\nb\nc\n", b"a\nx\nc\n", &[[2, 2]], &[1]),
+            (b"a\nb\n", b"a\nx\nb\n", &[[2, 2]], &[]),
+            (
+                b"a\nb\nc\nd\ne\n",
+                b"x\nb\nd\ny\n",
+                &[[1, 1], [4, 4]],
+                &[0, 2, 3],
+            ),
+        ];
+        for (before, after, ranges_expected, deleted_expected) in cases {
+            let ranges = changed_line_ranges(before, after);
+            assert_eq!(&ranges, ranges_expected);
+            let line_count = normalized(after).unwrap().lines().count();
+            assert!(ranges.iter().all(|r| r[1] <= line_count));
+            assert_eq!(deleted_positions(before, after), *deleted_expected);
+        }
+    }
+    #[test]
     fn exclusion_rules_match_expected_paths() {
         for p in [".env", ".env.local", "x.pem", "id_ed25519", "mysecret.txt"] {
             assert!(is_excluded(p));
         }
+    }
+    #[test]
+    fn corrupt_content_addressed_blob_is_missing_and_repaired() {
+        let dir =
+            std::env::temp_dir().join(format!("prov-blob-{}-{}", std::process::id(), now_ns()));
+        ensure_private_dir(&dir).unwrap();
+        let expected = b"correct blob";
+        let path = dir.join(hash(expected));
+        fs::write(&path, b"corrupt blob").unwrap();
+        assert!(read_blob(&path, path.file_name().unwrap().to_str().unwrap()).is_none());
+        write_once(&path, expected).unwrap();
+        assert_eq!(
+            read_blob(&path, path.file_name().unwrap().to_str().unwrap()).unwrap(),
+            expected
+        );
+        let _ = fs::remove_dir_all(dir);
     }
     #[test]
     fn incomplete_scan_flag_applies_once_to_next_external_window() {
@@ -1565,5 +1866,65 @@ mod tests {
         assert!(pending_external_flag(&mut state, false));
         assert!(!state.scan_incomplete_pending);
         assert!(!pending_external_flag(&mut state, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replace_file_w_replaces_state_and_cleans_temp_file() {
+        let dir =
+            std::env::temp_dir().join(format!("prov-replace-{}-{}", std::process::id(), now_ns()));
+        ensure_private_dir(&dir).unwrap();
+        let file = dir.join("state.json");
+        atomic_bytes(&file, b"old", true).unwrap();
+        atomic_bytes(&file, b"new", true).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"new");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_replace_file_w_cleans_temp_file() {
+        use std::os::windows::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!(
+            "prov-replace-fail-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        ensure_private_dir(&dir).unwrap();
+        let file = dir.join("state.json");
+        atomic_bytes(&file, b"old", true).unwrap();
+        #[link(name = "Kernel32")]
+        unsafe extern "system" {
+            fn CreateFileW(
+                name: *const u16,
+                access: u32,
+                share: u32,
+                security: *mut std::ffi::c_void,
+                disposition: u32,
+                flags: u32,
+                template: *mut std::ffi::c_void,
+            ) -> *mut std::ffi::c_void;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0x8000_0000,
+                0,
+                std::ptr::null_mut(),
+                3,
+                0x80,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle as isize, -1);
+        assert!(atomic_bytes(&file, b"new", true).is_err());
+        unsafe {
+            CloseHandle(handle);
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(dir);
     }
 }
