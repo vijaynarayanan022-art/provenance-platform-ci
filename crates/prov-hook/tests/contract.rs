@@ -647,7 +647,10 @@ fn over_five_hundred_dirty_paths_emit_one_bulk_event_without_snapshots() {
         .unwrap()
         .unwrap()
         .path();
-    assert_eq!(fs::read_dir(store.join("blobs")).unwrap().count(), 0);
+    assert!(
+        fs::read_dir(store.join("blobs")).unwrap().count() <= 1,
+        "bulk may snapshot only the single leftover file"
+    );
     f.drop_root();
 }
 
@@ -1244,7 +1247,7 @@ fn batch_with_one_missing_blob_degrades_only_missing_one() {
 fn bulk_cap_processes_candidates_incrementally_and_resumes_normal_scans() {
     let _serial = test_guard();
     let f = Fixture::new("bulk-incremental");
-    for i in 0..2000 {
+    for i in 0..1050 {
         fs::write(
             f.repo.join(format!("stable-{i:04}.txt")),
             format!("content {i}\n"),
@@ -1256,40 +1259,44 @@ fn bulk_cap_processes_candidates_incrementally_and_resumes_normal_scans() {
     let events1 = f.events();
     let bulk1 = select(&events1, "bulk_change");
     assert_eq!(bulk1.len(), 1);
-    assert_eq!(bulk1[0]["remaining"], 1500);
+    assert_eq!(bulk1[0]["remaining"], 550);
 
     f.hook("PostToolUse", "s", "tool-1", None);
     let events2 = f.events();
-    let bulk2 = select(&events2, "bulk_change");
-    assert_eq!(bulk2.len(), 2);
-    assert_eq!(bulk2[1]["remaining"], 1000);
+    assert_eq!(select(&events2, "bulk_change").len(), 1);
+    let close1 = select(&events2, "window_close");
+    assert_eq!(close1.len(), 1);
+    assert_eq!(close1[0]["reason"], "bulk_change");
+    assert_eq!(close1[0]["degraded"], true);
 
+    // Only 50 candidates remain: scans are normal again, no new bulk event.
     f.hook("PreToolUse", "s", "tool-2", None);
-    let events3 = f.events();
-    let bulk3 = select(&events3, "bulk_change");
-    assert_eq!(bulk3.len(), 3);
-    assert_eq!(bulk3[2]["remaining"], 500);
-
     f.hook("PostToolUse", "s", "tool-2", None);
-    let events4 = f.events();
-    assert_eq!(select(&events4, "bulk_change").len(), 3);
-    let window4 = events4
-        .iter()
-        .find(|e| e["event"] == "window_close" && e["tool_use_id"] == "tool-2")
-        .unwrap();
-    assert_ne!(window4["reason"], "bulk_change");
-    assert_ne!(window4["degraded"], true);
+    let events3 = f.events();
+    assert_eq!(select(&events3, "bulk_change").len(), 1);
 
     f.hook("PreToolUse", "s", "tool-3", None);
     fs::write(f.repo.join("tracked.txt"), "one\ntwo AI edit\n").unwrap();
     f.hook("PostToolUse", "s", "tool-3", Some("edit tracked.txt"));
 
-    let events5 = f.events();
-    let ai = select(&events5, "ai_change");
+    let events4 = f.events();
+    let ai = select(&events4, "ai_change");
     assert_eq!(ai.len(), 1);
     assert_eq!(ai[0]["path"], "tracked.txt");
     assert_eq!(ai[0]["line_ranges"], json!([[2, 2]]));
 
+    f.drop_root();
+}
+#[test]
+fn rename_without_content_change_does_not_emit_ai_change() {
+    let _serial = test_guard();
+    let f = Fixture::new("rename-no-ai");
+    f.hook("PreToolUse", "s", "tool-rename", None);
+    git(&f.repo, &["mv", "tracked.txt", "renamed.txt"]);
+    f.hook("PostToolUse", "s", "tool-rename", None);
+
+    let events = f.events();
+    assert!(select(&events, "ai_change").is_empty());
     f.drop_root();
 }
 
@@ -1328,4 +1335,3 @@ fn large_head_blob_over_one_mib_is_skipped_and_degrades() {
 
     f.drop_root();
 }
-

@@ -283,6 +283,7 @@ struct DirtyPath {
     head_blob: Option<String>,
     untracked: bool,
     unmerged: bool,
+    renamed: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BeforeContent {
@@ -1053,6 +1054,8 @@ fn scan(
                 continue;
             }
             let after_sha = hash(&after_bytes);
+            // Bulk mode writes hash-only shadow entries for dirty paths without storing the blob,
+            // so later derivation must treat the prior content as unknown rather than empty.
             shadow.files.insert(
                 path,
                 FileState {
@@ -1152,6 +1155,8 @@ fn scan(
                     None => BeforeContent::Unavailable,
                 }
             }
+        } else if d.unmerged || d.renamed {
+            BeforeContent::Unavailable
         } else if d.untracked || d.head_blob.is_none() {
             BeforeContent::KnownEmpty
         } else if let Some(ref blob_id) = d.head_blob {
@@ -1366,6 +1371,7 @@ fn parse_status(data: &[u8]) -> Vec<DirtyPath> {
                 head_blob: None,
                 untracked: true,
                 unmerged: false,
+                renamed: false,
             });
             continue;
         }
@@ -1392,6 +1398,7 @@ fn parse_status(data: &[u8]) -> Vec<DirtyPath> {
             },
             untracked: false,
             unmerged: typ == b'u',
+            renamed: typ == b'2',
         });
         if typ == b'2' {
             if let Some(old) = records.next() {
@@ -1400,6 +1407,7 @@ fn parse_status(data: &[u8]) -> Vec<DirtyPath> {
                     head_blob,
                     untracked: false,
                     unmerged: false,
+                    renamed: true,
                 });
             }
         }
