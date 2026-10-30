@@ -1,5 +1,5 @@
 use similar::{capture_diff_slices, Algorithm, DiffTag};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepKind {
@@ -57,24 +57,27 @@ enum Owner {
 
 pub fn derive_lines(ev: &Evidence, committed: &[u8]) -> Vec<LineLabel> {
     let parent = split_lines(&ev.parent);
-    let mut ambiguous_history = has_duplicate_lines(&parent);
     let mut previous = parent.clone();
     let mut owners = vec![Owner::Base; previous.len()];
 
     for step in &ev.steps {
         let next = split_lines(&step.after);
-        ambiguous_history |= has_duplicate_lines(&next);
         owners = replay(&previous, &owners, &next, step.kind);
         previous = next;
     }
 
     let committed_lines = split_lines(committed);
-    ambiguous_history |= has_duplicate_lines(&committed_lines);
     let committed_owners = replay(&previous, &owners, &committed_lines, StepKind::Unknown);
     let added = added_lines(&parent, &committed_lines);
-    let mut occurrences: HashMap<&[u8], usize> = HashMap::new();
-    for line in &committed_lines {
-        *occurrences.entry(line.as_slice()).or_default() += 1;
+    // A strong label needs an unambiguous copy: if an identical committed line has a different
+    // owner, the diff may have paired the wrong copy, so the line is downgraded.
+    let mut seen: HashMap<&[u8], (Owner, bool)> = HashMap::new();
+    for (index, line) in committed_lines.iter().enumerate() {
+        let owner = committed_owners[index];
+        let entry = seen.entry(line.as_slice()).or_insert((owner, false));
+        if entry.0 != owner {
+            entry.1 = true;
+        }
     }
 
     committed_lines
@@ -85,9 +88,7 @@ pub fn derive_lines(ev: &Evidence, committed: &[u8]) -> Vec<LineLabel> {
                 Label::Unknown
             } else {
                 match committed_owners[index] {
-                    Owner::Ai if !ambiguous_history && occurrences[line.as_slice()] == 1 => {
-                        Label::AiStrong
-                    }
+                    Owner::Ai if !seen[line.as_slice()].1 => Label::AiStrong,
                     Owner::Ai | Owner::AiWeak => Label::AiProbable,
                     Owner::AiEdited => Label::Mixed,
                     Owner::Base | Owner::External | Owner::Gap => Label::Unknown,
@@ -101,13 +102,6 @@ pub fn derive_lines(ev: &Evidence, committed: &[u8]) -> Vec<LineLabel> {
             }
         })
         .collect()
-}
-
-fn has_duplicate_lines(lines: &[Vec<u8>]) -> bool {
-    let mut seen = HashMap::with_capacity(lines.len());
-    lines
-        .iter()
-        .any(|line| seen.insert(line.as_slice(), ()).is_some())
 }
 
 pub fn count(labels: &[LineLabel]) -> Counts {
@@ -177,6 +171,22 @@ fn replay(old: &[Vec<u8>], owners: &[Owner], new: &[Vec<u8>], kind: StepKind) ->
         for op in &ops[start..cursor] {
             for new_index in op.new_range() {
                 next_owners[new_index] = inserted_owner;
+            }
+        }
+    }
+    // A step that inserts or deletes text identical to a carried AI line makes the match
+    // ambiguous (the diff may have paired the wrong copy), so that carried line is downgraded.
+    let mut touched: HashSet<&[u8]> = HashSet::new();
+    for op in ops.iter().filter(|op| op.tag() != DiffTag::Equal) {
+        touched.extend(old[op.old_range()].iter().map(Vec::as_slice));
+        touched.extend(new[op.new_range()].iter().map(Vec::as_slice));
+    }
+    if !touched.is_empty() {
+        for op in ops.iter().filter(|op| op.tag() == DiffTag::Equal) {
+            for index in op.new_range() {
+                if next_owners[index] == Owner::Ai && touched.contains(new[index].as_slice()) {
+                    next_owners[index] = Owner::AiWeak;
+                }
             }
         }
     }
@@ -456,6 +466,128 @@ mod tests {
         for tiny in [false, true] {
             for case in 0..3000 {
                 fuzz_case(0x9e37_79b9_7f4a_7c15 ^ case as u64, case, tiny);
+            }
+        }
+    }
+
+    #[test]
+    fn human_copy_of_ai_text_then_ai_copy_removed_is_not_strong() {
+        // Regression: the diff pairs the surviving human "v4" with the old AI "v4".
+        let ev = evidence(
+            b"v3\nv1\n",
+            vec![
+                step(StepKind::External, b"v0\nv1\n"),
+                step(StepKind::Ai { degraded: false }, b"v0\nv4\n"),
+                step(StepKind::External, b"v0\nv4\nv4\n"),
+                step(StepKind::External, b"v0\nv4\nv3\n"),
+            ],
+        );
+        let labels = derive_lines(&ev, b"v0\nv4\nv3\n");
+        assert_ne!(labels[1].label, Label::AiStrong);
+    }
+
+    #[test]
+    fn ai_function_next_to_existing_braces_stays_mostly_strong() {
+        let parent = b"fn a() {\n}\n";
+        let after = b"fn a() {\n}\n\nfn b() {\n    let x = 1;\n}\n";
+        let ev = evidence(parent, vec![step(StepKind::Ai { degraded: false }, after)]);
+        let counts = count(&derive_lines(&ev, after));
+        assert_eq!(counts.e, 3);
+        assert!(
+            counts.s >= 2,
+            "realistic AI code must not be all probable: {counts:?}"
+        );
+    }
+
+    fn stress_run(vocab: usize, cases: u64) -> (u64, u64) {
+        let (mut leaks, mut strong) = (0u64, 0u64);
+        for case in 0..cases {
+            let mut rng = XorShift((0x00C0_FFEE ^ case.wrapping_mul(0x9e37_79b9_7f4a_7c15)) | 1);
+            let mut counter = 0u64;
+            let mut text = |rng: &mut XorShift| -> Vec<u8> {
+                counter += 1;
+                if vocab == 0 {
+                    format!("u{case}-{counter}").into_bytes()
+                } else {
+                    format!("v{}", rng.below(vocab)).into_bytes()
+                }
+            };
+            let initial = rng.below(6);
+            let mut file: Vec<(Vec<u8>, Author)> = (0..initial)
+                .map(|_| (text(&mut rng), Author::Base))
+                .collect();
+            let parent = bytes_of(&file);
+            let mut steps = Vec::new();
+            for _ in 0..(2 + rng.below(24)) {
+                let actor = if rng.below(2) == 0 {
+                    Author::Human
+                } else {
+                    Author::Ai
+                };
+                match rng.below(5) {
+                    0 | 1 => {
+                        let t = text(&mut rng);
+                        let at = rng.below(file.len() + 1);
+                        file.insert(at, (t, actor));
+                    }
+                    2 => {
+                        if !file.is_empty() {
+                            let at = rng.below(file.len());
+                            file.remove(at);
+                        }
+                    }
+                    3 => {
+                        if !file.is_empty() {
+                            let at = rng.below(file.len());
+                            let mut t = text(&mut rng);
+                            let mut guard = 0;
+                            while t == file[at].0 && guard < 50 {
+                                t = text(&mut rng);
+                                guard += 1;
+                            }
+                            if t != file[at].0 {
+                                file[at] = (t, actor);
+                            }
+                        }
+                    }
+                    _ => {
+                        let at = rng.below(file.len() + 1);
+                        for k in 0..(2 + rng.below(3)) {
+                            let t = text(&mut rng);
+                            file.insert(at + k, (t, actor));
+                        }
+                    }
+                }
+                let kind = match actor {
+                    Author::Ai => StepKind::Ai { degraded: false },
+                    _ => StepKind::External,
+                };
+                steps.push(step(kind, &bytes_of(&file)));
+            }
+            let committed = bytes_of(&file);
+            let labels = derive_lines(&evidence(&parent, steps), &committed);
+            for ((_, author), label) in file.iter().zip(labels.iter()) {
+                if label.label == Label::AiStrong {
+                    strong += 1;
+                    if !matches!(author, Author::Ai) {
+                        leaks += 1;
+                    }
+                }
+            }
+        }
+        (leaks, strong)
+    }
+
+    #[test]
+    fn stress_never_labels_non_ai_lines_strong_across_vocabularies() {
+        for vocab in [0usize, 2, 3, 6, 12] {
+            let (leaks, strong) = stress_run(vocab, 12_000);
+            assert_eq!(
+                leaks, 0,
+                "vocab={vocab}: {leaks} non-AI lines labelled strong"
+            );
+            if vocab == 0 {
+                assert!(strong > 0);
             }
         }
     }
