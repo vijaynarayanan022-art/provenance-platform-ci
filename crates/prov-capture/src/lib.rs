@@ -143,6 +143,8 @@ struct WindowState {
     overlap: bool,
     #[serde(default)]
     bulk_count: Option<usize>,
+    #[serde(default)]
+    bulk_remaining: Option<usize>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RecentKey {
@@ -204,6 +206,8 @@ struct Event {
     truncated: Option<bool>,
     commit_in_window: Option<bool>,
     dirty_count: Option<usize>,
+    remaining: Option<usize>,
+    bulk_partial: Option<bool>,
 }
 impl Event {
     fn new(
@@ -250,6 +254,8 @@ impl Event {
             truncated: None,
             commit_in_window: None,
             dirty_count: None,
+            remaining: None,
+            bulk_partial: None,
         }
     }
 }
@@ -278,15 +284,20 @@ struct DirtyPath {
     untracked: bool,
     unmerged: bool,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BeforeContent {
+    Known(Vec<u8>),
+    KnownEmpty,
+    Unavailable,
+}
 #[derive(Clone, Debug)]
 struct FileChange {
     path: String,
     before: Option<String>,
     after: Option<String>,
-    before_bytes: Option<Vec<u8>>,
-    after_bytes: Option<Vec<u8>>,
     excluded: bool,
     degraded: Option<String>,
+    line_ranges: Option<Vec<[usize; 2]>>,
     deleted_at: Vec<usize>,
 }
 
@@ -400,9 +411,9 @@ pub fn process_json(input: &[u8]) {
     match event_name {
         "PreToolUse" => {
             let scan = timed_scan(&repo.root, &store.join("blobs"), &mut shadow, SCAN_BUDGET);
-            let (changes, incomplete, bulk_count) = match scan {
-                Ok(v) => (v.changes, v.incomplete, v.bulk_count),
-                Err(_) => (Vec::new(), true, None),
+            let (changes, incomplete, bulk_count, bulk_remaining) = match scan {
+                Ok(v) => (v.changes, v.incomplete, v.bulk_count, v.bulk_remaining),
+                Err(_) => (Vec::new(), true, None, None),
             };
             let after_incomplete = pending_external_flag(&mut state, incomplete);
             if incomplete {
@@ -423,8 +434,10 @@ pub fn process_json(input: &[u8]) {
                     tool_id.as_deref(),
                 );
                 e.dirty_count = Some(count);
+                e.remaining = bulk_remaining;
                 e.degraded = Some(true);
                 e.reason = Some("bulk_change".into());
+                e.bulk_partial = Some(true);
                 append_line(&event_path, &e);
             } else {
                 let mut event_batch = Vec::with_capacity(changes.len());
@@ -463,6 +476,7 @@ pub fn process_json(input: &[u8]) {
                 branch: branch.clone(),
                 overlap,
                 bulk_count,
+                bulk_remaining,
             };
             let mut e = Event::new(
                 "window_open",
@@ -475,19 +489,20 @@ pub fn process_json(input: &[u8]) {
             e.overlap = Some(overlap);
             e.head = Some(head);
             e.branch = Some(branch);
-            e.degraded = Some(incomplete);
+            e.degraded = Some(incomplete || bulk_count.is_some());
             if bulk_count.is_some() {
                 e.degraded = Some(true);
                 e.reason = Some("bulk_change".into());
+                e.bulk_partial = Some(true);
             }
             append_line(&event_path, &e);
             state.windows.push(window);
         }
         "PostToolUse" => {
             let scan = timed_scan(&repo.root, &store.join("blobs"), &mut shadow, SCAN_BUDGET);
-            let (changes, incomplete, bulk_count) = match scan {
-                Ok(v) => (v.changes, v.incomplete, v.bulk_count),
-                Err(_) => (Vec::new(), true, None),
+            let (changes, incomplete, bulk_count, bulk_remaining) = match scan {
+                Ok(v) => (v.changes, v.incomplete, v.bulk_count, v.bulk_remaining),
+                Err(_) => (Vec::new(), true, None, None),
             };
             if incomplete {
                 state.scan_incomplete_pending = true;
@@ -535,8 +550,10 @@ pub fn process_json(input: &[u8]) {
                     tool_id.as_deref(),
                 );
                 e.dirty_count = bulk_count;
+                e.remaining = bulk_remaining;
                 e.degraded = Some(true);
                 e.reason = Some("bulk_change".into());
+                e.bulk_partial = Some(true);
                 append_line(&event_path, &e);
             }
             let command_sha = hook
@@ -590,6 +607,7 @@ pub fn process_json(input: &[u8]) {
                 } else if bulk_window {
                     e.reason = Some("bulk_change".into());
                     e.degraded = Some(true);
+                    e.bulk_partial = Some(true);
                 }
                 e.degraded = e.reason.is_some().then_some(true);
                 if let Some(id) = &tool_id {
@@ -635,10 +653,11 @@ pub fn process_json(input: &[u8]) {
             e.head = Some(close_head);
             e.branch = Some(close_branch);
             e.head_moved = Some(head_moved);
-            e.degraded = Some(incomplete);
+            e.degraded = Some(incomplete || bulk_window);
             if bulk_window {
                 e.degraded = Some(true);
                 e.reason = Some("bulk_change".into());
+                e.bulk_partial = Some(true);
             }
             append_line(&event_path, &e);
         }
@@ -913,6 +932,7 @@ struct ScanResult {
     changes: Vec<FileChange>,
     incomplete: bool,
     bulk_count: Option<usize>,
+    bulk_remaining: Option<usize>,
 }
 
 fn scan(
@@ -935,15 +955,125 @@ fn scan(
     let dirty = parse_status(&status.stdout);
     let dirty_set: HashSet<String> = dirty.iter().map(|d| d.path.clone()).collect();
     shadow.files.retain(|path, _| dirty_set.contains(path));
-    if dirty.len() > MAX_DIRTY_PATHS {
+
+    let mut candidates = Vec::new();
+    for d in &dirty {
+        let path = d.path.replace('\\', "/");
+        if let Some(s) = shadow.files.get(&path) {
+            let full = root.join(raw_path(d.path.as_bytes()));
+            match fs::symlink_metadata(&full) {
+                Ok(m) => {
+                    if m.file_type().is_symlink() {
+                        candidates.push(d.clone());
+                    } else {
+                        let mtime_ns = m
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map_or(0, |d| d.as_nanos());
+                        if s.deleted || s.size != m.len() || s.mtime_ns != mtime_ns {
+                            candidates.push(d.clone());
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if !s.deleted {
+                        candidates.push(d.clone());
+                    }
+                }
+                Err(_) => {
+                    candidates.push(d.clone());
+                }
+            }
+        } else {
+            candidates.push(d.clone());
+        }
+    }
+
+    let total_candidates = candidates.len();
+    let is_bulk = total_candidates > MAX_DIRTY_PATHS;
+    let to_process = if is_bulk {
+        &candidates[..MAX_DIRTY_PATHS]
+    } else {
+        &candidates[..]
+    };
+    let remaining = total_candidates.saturating_sub(MAX_DIRTY_PATHS);
+
+    if is_bulk {
+        for d in to_process {
+            if start.elapsed() >= budget {
+                break;
+            }
+            let path = d.path.replace('\\', "/");
+            let excluded = is_excluded(&path);
+            let full = root.join(raw_path(d.path.as_bytes()));
+            let meta = match fs::symlink_metadata(&full) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    shadow.files.remove(&path);
+                    continue;
+                }
+                Ok(m) => Some(m),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => continue,
+            };
+            let Some(meta) = meta else {
+                shadow.files.insert(
+                    path,
+                    FileState {
+                        size: 0,
+                        mtime_ns: 0,
+                        sha256: String::new(),
+                        excluded,
+                        deleted: true,
+                    },
+                );
+                continue;
+            };
+            if !meta.file_type().is_file() || meta.len() > MAX_FILE {
+                shadow.files.remove(&path);
+                continue;
+            }
+            let mtime_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            let f = match File::open(&full) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let mut after_bytes = Vec::with_capacity(meta.len() as usize);
+            if f.take(MAX_FILE + 1).read_to_end(&mut after_bytes).is_err() {
+                continue;
+            }
+            if after_bytes.len() as u64 > MAX_FILE
+                || after_bytes[..after_bytes.len().min(8192)].contains(&0)
+            {
+                shadow.files.remove(&path);
+                continue;
+            }
+            let after_sha = hash(&after_bytes);
+            shadow.files.insert(
+                path,
+                FileState {
+                    size: after_bytes.len() as u64,
+                    mtime_ns,
+                    sha256: after_sha,
+                    excluded,
+                    deleted: false,
+                },
+            );
+        }
         return Ok(ScanResult {
             changes: Vec::new(),
-            incomplete: false,
+            incomplete: start.elapsed() >= budget,
             bulk_count: Some(dirty.len()),
+            bulk_remaining: Some(remaining),
         });
     }
+
     let mut head_ids = Vec::new();
-    for d in &dirty {
+    for d in to_process {
         if !d.untracked
             && !d.unmerged
             && !is_excluded(&d.path)
@@ -959,12 +1089,19 @@ fn scan(
             changes: Vec::new(),
             incomplete: true,
             bulk_count: None,
+            bulk_remaining: None,
         });
     }
-    let head_contents = cat_blobs(root, &head_ids).unwrap_or_default();
+    let sizes = check_blob_sizes(root, &head_ids).unwrap_or_default();
+    let ids_to_fetch: Vec<String> = head_ids
+        .into_iter()
+        .filter(|id| sizes.get(id).is_some_and(|&s| s <= MAX_FILE as usize))
+        .collect();
+    let head_contents = cat_blobs(root, &ids_to_fetch).unwrap_or_default();
+
     let mut changes = Vec::new();
     let mut incomplete = start.elapsed() > budget;
-    for d in dirty {
+    for d in to_process {
         if start.elapsed() >= budget {
             incomplete = true;
             break;
@@ -976,21 +1113,14 @@ fn scan(
                 path,
                 before: None,
                 after: None,
-                before_bytes: None,
-                after_bytes: None,
                 excluded,
                 degraded: Some("unmerged".into()),
+                line_ranges: None,
                 deleted_at: Vec::new(),
             });
             continue;
         }
         let previous = shadow.files.get(&path).cloned();
-        let before_sha_hint = previous.as_ref().map(|s| s.sha256.clone()).or_else(|| {
-            d.head_blob
-                .as_ref()
-                .and_then(|id| head_contents.get(id))
-                .map(|bytes| hash(bytes))
-        });
         let full = root.join(raw_path(d.path.as_bytes()));
         let meta = match fs::symlink_metadata(&full) {
             Ok(m) if m.file_type().is_symlink() => {
@@ -1000,65 +1130,87 @@ fn scan(
             Ok(m) => Some(m),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
+                let before_sha_hint = previous.as_ref().map(|s| s.sha256.clone()).or_else(|| {
+                    d.head_blob
+                        .as_ref()
+                        .and_then(|id| head_contents.get(id))
+                        .map(|bytes| hash(bytes))
+                });
                 changes.push(file_error(path, before_sha_hint, "metadata", &e));
                 continue;
             }
         };
+
+        let before_content = if excluded {
+            BeforeContent::Unavailable
+        } else if let Some(prev) = previous.as_ref() {
+            if prev.deleted {
+                BeforeContent::KnownEmpty
+            } else {
+                match read_blob(&blobs.join(&prev.sha256), &prev.sha256) {
+                    Some(bytes) => BeforeContent::Known(bytes),
+                    None => BeforeContent::Unavailable,
+                }
+            }
+        } else if d.untracked || d.head_blob.is_none() {
+            BeforeContent::KnownEmpty
+        } else if let Some(ref blob_id) = d.head_blob {
+            match head_contents.get(blob_id) {
+                Some(bytes) => BeforeContent::Known(bytes.clone()),
+                None => BeforeContent::Unavailable,
+            }
+        } else {
+            BeforeContent::Unavailable
+        };
+
+        let before_sha = match &before_content {
+            BeforeContent::Known(bytes) => Some(hash(bytes)),
+            BeforeContent::KnownEmpty => None,
+            BeforeContent::Unavailable => previous.as_ref().map(|s| s.sha256.clone()),
+        };
+
         let Some(meta) = meta else {
             if previous.as_ref().is_some_and(|s| s.deleted) {
                 continue;
             }
-            let head_bytes = if excluded {
-                None
-            } else if let Some(prev) = previous.as_ref() {
-                read_blob(&blobs.join(&prev.sha256), &prev.sha256)
-            } else {
-                d.head_blob
-                    .as_ref()
-                    .and_then(|id| head_contents.get(id).cloned())
-            };
-            let before_sha = previous
-                .as_ref()
-                .map(|s| s.sha256.clone())
-                .or_else(|| head_bytes.as_deref().map(hash));
-            if before_sha.is_none() && !d.untracked {
-                changes.push(FileChange {
-                    path: path.clone(),
-                    before: None,
-                    after: None,
-                    before_bytes: None,
-                    after_bytes: None,
-                    excluded,
-                    degraded: Some("git_before_read:other".into()),
-                    deleted_at: Vec::new(),
-                });
-            } else {
-                if !excluded {
-                    if let Some(bytes) = head_bytes.as_deref() {
-                        let old_sha = hash(bytes);
-                        if let Err(e) = write_once(&blobs.join(&old_sha), bytes) {
-                            changes.push(file_error(path, before_sha, "snapshot", &e));
-                            continue;
-                        }
-                    }
+            match before_content {
+                BeforeContent::Unavailable if !excluded => {
+                    changes.push(FileChange {
+                        path: path.clone(),
+                        before: before_sha.clone(),
+                        after: None,
+                        excluded,
+                        degraded: Some("before_unavailable".into()),
+                        line_ranges: None,
+                        deleted_at: Vec::new(),
+                    });
                 }
-                let deleted_at = head_bytes
-                    .as_deref()
-                    .map(|b| deleted_positions(b, b""))
-                    .unwrap_or_default();
-                changes.push(FileChange {
-                    path: path.clone(),
-                    before: before_sha.clone(),
-                    after: None,
-                    before_bytes: if excluded { None } else { head_bytes.clone() },
-                    after_bytes: None,
-                    excluded,
-                    degraded: None,
-                    deleted_at,
-                });
+                BeforeContent::Known(ref old_bytes) => {
+                    let (_, deleted_at) = diff_changes_and_deletions(old_bytes, b"");
+                    changes.push(FileChange {
+                        path: path.clone(),
+                        before: before_sha.clone(),
+                        after: None,
+                        excluded,
+                        degraded: None,
+                        line_ranges: Some(Vec::new()),
+                        deleted_at,
+                    });
+                }
+                _ => {
+                    changes.push(FileChange {
+                        path: path.clone(),
+                        before: before_sha.clone(),
+                        after: None,
+                        excluded,
+                        degraded: None,
+                        line_ranges: if excluded { None } else { Some(Vec::new()) },
+                        deleted_at: Vec::new(),
+                    });
+                }
             }
             let old = previous.unwrap_or(FileState {
-                size: head_bytes.as_ref().map_or(0, |b| b.len() as u64),
+                size: 0,
                 mtime_ns: 0,
                 sha256: before_sha.unwrap_or_default(),
                 excluded,
@@ -1073,6 +1225,7 @@ fn scan(
             );
             continue;
         };
+
         if !meta.file_type().is_file() || meta.len() > MAX_FILE {
             shadow.files.remove(&path);
             continue;
@@ -1082,26 +1235,6 @@ fn scan(
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_nanos());
-        if previous
-            .as_ref()
-            .is_some_and(|s| !s.deleted && s.size == meta.len() && s.mtime_ns == mtime_ns)
-        {
-            continue;
-        }
-        let before_bytes = if excluded {
-            None
-        } else if let Some(prev) = previous.as_ref() {
-            read_blob(&blobs.join(&prev.sha256), &prev.sha256)
-        } else {
-            d.head_blob
-                .as_ref()
-                .and_then(|id| head_contents.get(id).cloned())
-                .or_else(|| d.untracked.then(Vec::new))
-        };
-        let before_sha = previous
-            .as_ref()
-            .map(|s| s.sha256.clone())
-            .or_else(|| before_bytes.as_deref().filter(|b| !b.is_empty()).map(hash));
         let f = match File::open(&full) {
             Ok(f) => f,
             Err(e) => {
@@ -1128,20 +1261,54 @@ fn scan(
                     continue;
                 }
             }
-            let deleted_at = before_bytes
-                .as_deref()
-                .map(|b| deleted_positions(b, &after_bytes))
-                .unwrap_or_default();
-            changes.push(FileChange {
-                path: path.clone(),
-                before: before_sha.clone(),
-                after: Some(after_sha.clone()),
-                before_bytes: if excluded { None } else { before_bytes },
-                after_bytes: Some(after_bytes.clone()),
-                excluded,
-                degraded: None,
-                deleted_at,
-            });
+            match before_content {
+                BeforeContent::Unavailable if !excluded => {
+                    changes.push(FileChange {
+                        path: path.clone(),
+                        before: before_sha,
+                        after: Some(after_sha.clone()),
+                        excluded,
+                        degraded: Some("before_unavailable".into()),
+                        line_ranges: None,
+                        deleted_at: Vec::new(),
+                    });
+                }
+                BeforeContent::Known(ref old_bytes) => {
+                    let (ranges, deleted_at) = diff_changes_and_deletions(old_bytes, &after_bytes);
+                    changes.push(FileChange {
+                        path: path.clone(),
+                        before: before_sha,
+                        after: Some(after_sha.clone()),
+                        excluded,
+                        degraded: None,
+                        line_ranges: Some(ranges),
+                        deleted_at,
+                    });
+                }
+                BeforeContent::KnownEmpty => {
+                    let (ranges, deleted_at) = diff_changes_and_deletions(b"", &after_bytes);
+                    changes.push(FileChange {
+                        path: path.clone(),
+                        before: None,
+                        after: Some(after_sha.clone()),
+                        excluded,
+                        degraded: None,
+                        line_ranges: Some(ranges),
+                        deleted_at,
+                    });
+                }
+                _ => {
+                    changes.push(FileChange {
+                        path: path.clone(),
+                        before: before_sha,
+                        after: Some(after_sha.clone()),
+                        excluded,
+                        degraded: None,
+                        line_ranges: None,
+                        deleted_at: Vec::new(),
+                    });
+                }
+            }
         }
         shadow.files.insert(
             path,
@@ -1158,6 +1325,7 @@ fn scan(
         changes,
         incomplete,
         bulk_count: None,
+        bulk_remaining: None,
     })
 }
 
@@ -1256,6 +1424,37 @@ fn split_prefix(row: &[u8], fields: usize) -> Vec<&[u8]> {
     out.push(&row[start..]);
     out
 }
+fn check_blob_sizes(root: &Path, ids: &[String]) -> Option<BTreeMap<String, usize>> {
+    if ids.is_empty() {
+        return Some(BTreeMap::new());
+    }
+    let mut input = Vec::new();
+    for id in ids {
+        input.extend_from_slice(id.as_bytes());
+        input.push(b'\n');
+    }
+    let out = git_output(root, &["cat-file", "--batch-check"], Some(&input)).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut data = out.stdout.as_slice();
+    let mut result = BTreeMap::new();
+    while !data.is_empty() {
+        let nl = data.iter().position(|b| *b == b'\n')?;
+        let header = &data[..nl];
+        data = &data[nl + 1..];
+        let fields: Vec<_> = header.split(|b| *b == b' ').collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let id = String::from_utf8_lossy(fields[0]).into_owned();
+        if let Ok(len) = String::from_utf8_lossy(fields[2]).parse::<usize>() {
+            result.insert(id, len);
+        }
+    }
+    Some(result)
+}
+
 fn cat_blobs(root: &Path, ids: &[String]) -> Option<BTreeMap<String, Vec<u8>>> {
     if ids.is_empty() {
         return Some(BTreeMap::new());
@@ -1277,6 +1476,9 @@ fn cat_blobs(root: &Path, ids: &[String]) -> Option<BTreeMap<String, Vec<u8>>> {
         data = &data[nl + 1..];
         let fields: Vec<_> = header.split(|b| *b == b' ').collect();
         if fields.len() < 3 {
+            if fields.len() == 2 && fields[1] == b"missing" {
+                continue;
+            }
             return None;
         }
         let id = String::from_utf8_lossy(fields[0]).into_owned();
@@ -1350,10 +1552,9 @@ fn file_error(
         path,
         before,
         after: None,
-        before_bytes: None,
-        after_bytes: None,
         excluded,
         degraded: Some(format!("{reason}:{}", e.kind())),
+        line_ranges: None,
         deleted_at: Vec::new(),
     }
 }
@@ -1370,18 +1571,10 @@ fn change_event(
     e.path = Some(change.path);
     e.before_sha = change.before;
     e.after_sha = change.after;
-    e.line_ranges = if change.excluded {
+    e.line_ranges = if change.excluded || change.degraded.is_some() {
         None
     } else {
-        match (
-            change.before_bytes.as_deref(),
-            change.after_bytes.as_deref(),
-        ) {
-            (Some(a), Some(b)) => Some(changed_line_ranges(a, b)),
-            (None, Some(b)) => Some(line_ranges(b)),
-            (Some(_), None) => Some(Vec::new()),
-            _ => None,
-        }
+        change.line_ranges
     };
     e.deleted_at = Some(change.deleted_at);
     e.excluded = Some(change.excluded);
@@ -1669,64 +1862,37 @@ fn normalized(bytes: &[u8]) -> Option<String> {
         .ok()
         .map(|s| s.replace("\r\n", "\n"))
 }
-fn line_ranges(bytes: &[u8]) -> Vec<[usize; 2]> {
-    let Some(text) = normalized(bytes) else {
-        return Vec::new();
-    };
-    let diff = TextDiff::from_lines("", &text);
-    let mut changed = Vec::new();
-    let mut line = 0usize;
-    for op in diff.ops() {
-        for item in diff.iter_changes(op) {
-            match item.tag() {
-                ChangeTag::Equal => line += 1,
-                ChangeTag::Insert => {
-                    line += 1;
-                    changed.push(line);
-                }
-                ChangeTag::Delete => {}
-            }
-        }
-    }
-    ranges(changed)
-}
-fn changed_line_ranges(before: &[u8], after: &[u8]) -> Vec<[usize; 2]> {
+pub fn diff_changes_and_deletions(before: &[u8], after: &[u8]) -> (Vec<[usize; 2]>, Vec<usize>) {
     let (Some(old), Some(new)) = (normalized(before), normalized(after)) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let diff = TextDiff::from_lines(&old, &new);
     let mut new_line = 0usize;
     let mut changed = Vec::new();
+    let mut deleted = Vec::new();
     for item in diff.iter_all_changes() {
         match item.tag() {
-            ChangeTag::Equal => new_line += 1,
+            ChangeTag::Equal => {
+                new_line += 1;
+            }
             ChangeTag::Insert => {
                 new_line += 1;
                 changed.push(new_line);
             }
-            ChangeTag::Delete => {}
-        }
-    }
-    ranges(changed)
-}
-fn deleted_positions(before: &[u8], after: &[u8]) -> Vec<usize> {
-    let (Some(old), Some(new)) = (normalized(before), normalized(after)) else {
-        return Vec::new();
-    };
-    let diff = TextDiff::from_lines(&old, &new);
-    let mut new_line = 0usize;
-    let mut deleted = Vec::new();
-    for item in diff.iter_all_changes() {
-        match item.tag() {
-            ChangeTag::Equal | ChangeTag::Insert => {
-                new_line += 1;
+            ChangeTag::Delete => {
+                deleted.push(new_line);
             }
-            ChangeTag::Delete => deleted.push(new_line),
         }
     }
     deleted.sort_unstable();
     deleted.dedup();
-    deleted
+    (ranges(changed), deleted)
+}
+pub fn changed_line_ranges(before: &[u8], after: &[u8]) -> Vec<[usize; 2]> {
+    diff_changes_and_deletions(before, after).0
+}
+pub fn deleted_positions(before: &[u8], after: &[u8]) -> Vec<usize> {
+    diff_changes_and_deletions(before, after).1
 }
 fn ranges(mut lines: Vec<usize>) -> Vec<[usize; 2]> {
     lines.sort_unstable();
@@ -1835,6 +2001,16 @@ mod tests {
             assert!(ranges.iter().all(|r| r[1] <= line_count));
             assert_eq!(deleted_positions(before, after), *deleted_expected);
         }
+    }
+    #[test]
+    fn combined_diff_computes_both_ranges_and_deletions_in_one_pass() {
+        let before = b"line1\nline2\nline3\nline4\nline5\n";
+        let after = b"line1\ninserted\nline2\nline4_modified\n";
+        let (ranges, deleted) = diff_changes_and_deletions(before, after);
+        assert_eq!(ranges, changed_line_ranges(before, after));
+        assert_eq!(deleted, deleted_positions(before, after));
+        assert_eq!(ranges, vec![[2, 2], [4, 4]]);
+        assert_eq!(deleted, vec![3]);
     }
     #[test]
     fn exclusion_rules_match_expected_paths() {

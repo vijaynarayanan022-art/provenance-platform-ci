@@ -1088,3 +1088,244 @@ fn a_slow_scan_hits_the_process_time_cap_and_records_degraded() {
     assert!(markers.contains("time_cap"));
     f.drop_root();
 }
+
+#[test]
+fn tracked_dirty_file_with_deleted_snapshot_degrades_and_never_ai_credited() {
+    let _serial = test_guard();
+    let f = Fixture::new("deleted-snapshot");
+    fs::write(f.repo.join("tracked.txt"), "one\ntwo dirty\n").unwrap();
+    f.hook("PreToolUse", "s", "tool-1", None);
+
+    let store = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let blobs_dir = store.join("blobs");
+    for entry in fs::read_dir(&blobs_dir).unwrap().flatten() {
+        fs::remove_file(entry.path()).unwrap();
+    }
+
+    fs::write(f.repo.join("tracked.txt"), "one\ntwo dirty edited\n").unwrap();
+    f.hook("PostToolUse", "s", "tool-1", Some("edit tracked.txt"));
+
+    let all = f.events();
+    assert!(
+        select(&all, "ai_change").is_empty(),
+        "must never credit missing before as ai_change"
+    );
+
+    let external = select(&all, "external_change");
+    let target = external
+        .iter()
+        .find(|e| e["path"] == "tracked.txt" && e["hook_event_name"] == "PostToolUse")
+        .expect("must emit external_change from PostToolUse");
+    assert_eq!(target["reason"], "before_unavailable");
+    assert_eq!(target["degraded"], true);
+    assert!(target["line_ranges"].is_null());
+
+    f.drop_root();
+}
+
+#[test]
+fn corrupt_snapshot_hash_mismatch_degrades_and_never_ai_credited() {
+    let _serial = test_guard();
+    let f = Fixture::new("corrupt-snapshot");
+    fs::write(f.repo.join("tracked.txt"), "one\ntwo dirty\n").unwrap();
+    f.hook("PreToolUse", "s", "tool-1", None);
+
+    let store = fs::read_dir(f.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let blobs_dir = store.join("blobs");
+    for entry in fs::read_dir(&blobs_dir).unwrap().flatten() {
+        fs::write(entry.path(), b"corrupted snapshot bytes").unwrap();
+    }
+
+    fs::write(f.repo.join("tracked.txt"), "one\ntwo dirty edited\n").unwrap();
+    f.hook("PostToolUse", "s", "tool-1", Some("edit tracked.txt"));
+
+    let all = f.events();
+    assert!(
+        select(&all, "ai_change").is_empty(),
+        "must never credit corrupt before as ai_change"
+    );
+
+    let external = select(&all, "external_change");
+    let target = external
+        .iter()
+        .find(|e| e["path"] == "tracked.txt" && e["hook_event_name"] == "PostToolUse")
+        .expect("must emit external_change from PostToolUse");
+    assert_eq!(target["reason"], "before_unavailable");
+    assert_eq!(target["degraded"], true);
+    assert!(target["line_ranges"].is_null());
+
+    f.drop_root();
+}
+
+#[test]
+fn missing_head_blob_degrades_and_never_ai_credited() {
+    let _serial = test_guard();
+    let f = Fixture::new("missing-head-blob");
+    let blob_sha = git_text(&f.repo, &["rev-parse", "HEAD:tracked.txt"]);
+    let obj_path = f
+        .repo
+        .join(".git")
+        .join("objects")
+        .join(&blob_sha[..2])
+        .join(&blob_sha[2..]);
+    fs::remove_file(obj_path).unwrap();
+
+    fs::write(f.repo.join("tracked.txt"), "one\ntwo changed\n").unwrap();
+    f.hook("PostToolUse", "s", "tool-1", Some("edit tracked.txt"));
+
+    let all = f.events();
+    assert!(
+        select(&all, "ai_change").is_empty(),
+        "must not credit missing head blob as ai_change"
+    );
+
+    let external = select(&all, "external_change");
+    let target = external
+        .iter()
+        .find(|e| e["path"] == "tracked.txt")
+        .expect("must emit external_change");
+    assert_eq!(target["reason"], "before_unavailable");
+    assert_eq!(target["degraded"], true);
+    assert!(target["line_ranges"].is_null());
+
+    f.drop_root();
+}
+
+#[test]
+fn batch_with_one_missing_blob_degrades_only_missing_one() {
+    let _serial = test_guard();
+    let f = Fixture::new("batch-missing-blob");
+    fs::write(f.repo.join("second.txt"), "alpha\nbeta\n").unwrap();
+    git(&f.repo, &["add", "second.txt"]);
+    git(&f.repo, &["commit", "-m", "add second"]);
+
+    let missing_sha = git_text(&f.repo, &["rev-parse", "HEAD:tracked.txt"]);
+    let obj_path = f
+        .repo
+        .join(".git")
+        .join("objects")
+        .join(&missing_sha[..2])
+        .join(&missing_sha[2..]);
+    fs::remove_file(obj_path).unwrap();
+
+    fs::write(f.repo.join("tracked.txt"), "one\ntwo modified\n").unwrap();
+    fs::write(f.repo.join("second.txt"), "alpha\nbeta modified\n").unwrap();
+    f.hook("PostToolUse", "s", "tool-1", Some("edit both"));
+
+    let all = f.events();
+    let ai = select(&all, "ai_change");
+    assert_eq!(ai.len(), 1, "only valid blob gets ai_change");
+    assert_eq!(ai[0]["path"], "second.txt");
+    assert_eq!(ai[0]["line_ranges"], json!([[2, 2]]));
+
+    let external = select(&all, "external_change");
+    let target = external
+        .iter()
+        .find(|e| e["path"] == "tracked.txt")
+        .expect("tracked.txt must degrade");
+    assert_eq!(target["reason"], "before_unavailable");
+    assert_eq!(target["degraded"], true);
+    assert!(target["line_ranges"].is_null());
+
+    f.drop_root();
+}
+
+#[test]
+fn bulk_cap_processes_candidates_incrementally_and_resumes_normal_scans() {
+    let _serial = test_guard();
+    let f = Fixture::new("bulk-incremental");
+    for i in 0..2000 {
+        fs::write(
+            f.repo.join(format!("stable-{i:04}.txt")),
+            format!("content {i}\n"),
+        )
+        .unwrap();
+    }
+
+    f.hook("PreToolUse", "s", "tool-1", None);
+    let events1 = f.events();
+    let bulk1 = select(&events1, "bulk_change");
+    assert_eq!(bulk1.len(), 1);
+    assert_eq!(bulk1[0]["remaining"], 1500);
+
+    f.hook("PostToolUse", "s", "tool-1", None);
+    let events2 = f.events();
+    let bulk2 = select(&events2, "bulk_change");
+    assert_eq!(bulk2.len(), 2);
+    assert_eq!(bulk2[1]["remaining"], 1000);
+
+    f.hook("PreToolUse", "s", "tool-2", None);
+    let events3 = f.events();
+    let bulk3 = select(&events3, "bulk_change");
+    assert_eq!(bulk3.len(), 3);
+    assert_eq!(bulk3[2]["remaining"], 500);
+
+    f.hook("PostToolUse", "s", "tool-2", None);
+    let events4 = f.events();
+    assert_eq!(select(&events4, "bulk_change").len(), 3);
+    let window4 = events4
+        .iter()
+        .find(|e| e["event"] == "window_close" && e["tool_use_id"] == "tool-2")
+        .unwrap();
+    assert_ne!(window4["reason"], "bulk_change");
+    assert_ne!(window4["degraded"], true);
+
+    f.hook("PreToolUse", "s", "tool-3", None);
+    fs::write(f.repo.join("tracked.txt"), "one\ntwo AI edit\n").unwrap();
+    f.hook("PostToolUse", "s", "tool-3", Some("edit tracked.txt"));
+
+    let events5 = f.events();
+    let ai = select(&events5, "ai_change");
+    assert_eq!(ai.len(), 1);
+    assert_eq!(ai[0]["path"], "tracked.txt");
+    assert_eq!(ai[0]["line_ranges"], json!([[2, 2]]));
+
+    f.drop_root();
+}
+
+#[test]
+fn large_head_blob_over_one_mib_is_skipped_and_degrades() {
+    let _serial = test_guard();
+    let f = Fixture::new("large-blob");
+    let large_data = vec![b'a'; 3 * 1024 * 1024];
+    fs::write(f.repo.join("large.txt"), &large_data).unwrap();
+    git(&f.repo, &["add", "large.txt"]);
+    git(&f.repo, &["commit", "-m", "add 3mb file"]);
+
+    fs::write(f.repo.join("large.txt"), "small change\n").unwrap();
+    let start = std::time::Instant::now();
+    f.hook("PostToolUse", "s", "tool-large", Some("edit large"));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(1500),
+        "hook should finish quickly: {:?}",
+        elapsed
+    );
+
+    let all = f.events();
+    assert!(
+        select(&all, "ai_change").is_empty(),
+        "large blob must never be ai credited"
+    );
+    let external = select(&all, "external_change");
+    let target = external
+        .iter()
+        .find(|e| e["path"] == "large.txt")
+        .expect("must emit external_change");
+    assert_eq!(target["reason"], "before_unavailable");
+    assert_eq!(target["degraded"], true);
+    assert!(target["line_ranges"].is_null());
+
+    f.drop_root();
+}
+
