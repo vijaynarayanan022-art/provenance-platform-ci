@@ -1,3 +1,5 @@
+pub mod derive;
+
 use fd_lock::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

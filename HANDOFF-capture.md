@@ -74,3 +74,5 @@ The command-line fsmonitor experiment used `-c core.fsmonitor=true -c core.untra
 ## Verification
 
 Windows verification: `cargo fmt --package prov-capture --package prov-hook` completed; `cargo clippy --workspace --all-targets -- -D warnings` passed; `cargo test --workspace` passed **135 tests, 0 failed**. Contract tests cover dirty-only scans, excluded hash-only entries, tombstones, line ranges/deletions, bulk summaries, HEAD commit/checkout/pull movement, cache recreation, unmerged entries, lock markers, corrupt blobs, and Windows atomic replacement including failed-replacement temp cleanup. Linux/macOS compilation was unavailable in this environment.
+
+`prov_capture::derive` provides a pure, deterministic byte-line replay API that carries ownership through capture snapshots and labels added committed lines as AI strong/probable, mixed, or unknown. It uses `similar` for line alignment, treats post-evidence edits as unknown, and conservatively downgrades duplicate committed text. Its unit suite includes fixed-seed human/AI edit fuzzing in unique-text and duplicate-heavy modes.
