@@ -241,15 +241,18 @@ fn derive_commit_with_events(
             continue;
         }
 
+        let normalized_parent = normalize_eol(&parent_content);
+        let normalized_committed = normalize_eol(&committed_content);
         let selected_events = events_for_path(
+            store,
             event_records,
             event_index,
             &file.path,
             parent_time,
-            &parent_content,
+            &normalized_parent,
         );
         let (mut steps, mut evidence) =
-            steps_for_events(store, &selected_events, &committed_content, commit_time);
+            steps_for_events(store, &selected_events, &normalized_committed, commit_time);
         if evidence == "missing_blob" {
             unreadable_files += 1;
             output_files.push(unknown_file(file.path, evidence, added_count));
@@ -257,20 +260,20 @@ fn derive_commit_with_events(
         }
 
         if (reconstruct_all || reconstruct_paths.contains(file.path.as_str()))
-            && steps.last().map(|step| step.after.as_slice()) != Some(committed_content.as_slice())
+            && steps.last().map(|step| step.after.as_slice()) != Some(normalized_committed.as_slice())
         {
             steps.push(Step {
                 kind: StepKind::Ai { degraded: true },
-                after: committed_content.clone(),
+                after: normalized_committed.clone(),
             });
             evidence = "reconstructed";
         }
         let labels = derive::derive_lines(
             &Evidence {
-                parent: parent_content,
+                parent: normalized_parent,
                 steps,
             },
-            &committed_content,
+            &normalized_committed,
         );
         let counts = derive::count(&labels);
         output_files.push(FileOutput {
@@ -579,13 +582,13 @@ fn index_events(events: &[EventRecord]) -> HashMap<String, Vec<usize>> {
 }
 
 fn events_for_path<'a>(
+    store: &Path,
     events: &'a [EventRecord],
     event_index: &HashMap<String, Vec<usize>>,
     path: &str,
     parent_time: u128,
     parent_content: &[u8],
 ) -> Vec<&'a EventRecord> {
-    let parent_sha = crate::hash(parent_content);
     let mut matched: Vec<_> = event_index
         .get(path)
         .into_iter()
@@ -593,11 +596,21 @@ fn events_for_path<'a>(
         .map(|&index| &events[index])
         .filter(|event| event.timestamp > parent_time)
         .collect();
-    if let Some(latest_parent) = matched
-        .iter()
-        .rposition(|event| event.after_sha.as_deref() == Some(parent_sha.as_str()))
-    {
-        matched.drain(..=latest_parent);
+    let start = matched.len().saturating_sub(64);
+    for index in (start..matched.len()).rev() {
+        let Some(sha) = matched[index].after_sha.as_deref() else {
+            continue;
+        };
+        if !is_sha256(sha) {
+            continue;
+        }
+        let Some(bytes) = crate::read_blob(&store.join("blobs").join(sha), sha) else {
+            continue;
+        };
+        if normalize_eol(&bytes) == parent_content {
+            matched.drain(..=index);
+            break;
+        }
     }
     matched
 }
@@ -611,10 +624,18 @@ fn steps_for_events(
     if events.is_empty() {
         return (Vec::new(), "none");
     }
-    let committed_sha = crate::hash(committed);
     let exact_end = events
         .iter()
-        .rposition(|event| event.after_sha.as_deref() == Some(committed_sha.as_str()));
+        .enumerate()
+        .filter_map(|(index, event)| {
+            let sha = event.after_sha.as_deref()?;
+            if !is_sha256(sha) {
+                return None;
+            }
+            let bytes = crate::read_blob(&store.join("blobs").join(sha), sha)?;
+            (normalize_eol(&bytes) == committed).then_some(index)
+        })
+        .last();
     let (selected, evidence): (Vec<_>, &'static str) = if let Some(end) = exact_end {
         (events[..=end].to_vec(), "exact")
     } else {
@@ -642,7 +663,7 @@ fn steps_for_events(
             let Some(bytes) = crate::read_blob(&store.join("blobs").join(sha), sha) else {
                 return (Vec::new(), "missing_blob");
             };
-            bytes
+            normalize_eol(&bytes)
         };
         let kind = match event.event.as_str() {
             "ai_change" => StepKind::Ai {
@@ -663,6 +684,21 @@ fn steps_for_events(
         steps.push(Step { kind, after });
     }
     (steps, evidence)
+}
+
+fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            normalized.push(b'\n');
+            index += 2;
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+    }
+    normalized
 }
 
 fn is_sha256(value: &str) -> bool {

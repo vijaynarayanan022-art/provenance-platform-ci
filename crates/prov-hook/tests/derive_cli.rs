@@ -175,6 +175,20 @@ fn derive(fixture: &Fixture, commit: &str) -> Output {
     ])
 }
 
+fn ai_commit_with_eols(name: &str, autocrlf: &str, content: &[u8]) -> Value {
+    let fixture = Fixture::new(name);
+    git(&fixture.repo, &["config", "core.autocrlf", autocrlf]);
+    fixture.hook("PreToolUse", "ai-eol-tool");
+    fs::write(fixture.repo.join("tracked.txt"), content).unwrap();
+    fixture.hook("PostToolUse", "ai-eol-tool");
+    let commit = fixture.commit("AI edit with line endings");
+    let result = derive(&fixture, &commit);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    let value = fixture.derived_value(&commit);
+    fixture.drop_root();
+    value
+}
+
 fn file<'a>(value: &'a Value, path: &str) -> &'a Value {
     value["files"]
         .as_array()
@@ -230,6 +244,32 @@ fn ai_and_human_commits_are_classified_with_evidence() {
     assert_eq!(tracked["evidence"], "none");
     assert!(matches!(value["coverage"].as_str(), Some("none" | "low")));
     human.drop_root();
+}
+
+#[test]
+fn autocrlf_true_matches_crlf_snapshot_to_lf_commit() {
+    let value = ai_commit_with_eols("autocrlf-true", "true", b"one\r\nai line\r\n");
+    let tracked = file(&value, "tracked.txt");
+    assert_eq!(tracked["evidence"], "exact");
+    assert_eq!(tracked["ai_strong"], 1);
+    assert_eq!(tracked["e"], 1);
+}
+
+#[test]
+fn autocrlf_false_matches_crlf_snapshot_and_commit() {
+    let value = ai_commit_with_eols("autocrlf-false", "false", b"one\r\nai line\r\n");
+    let tracked = file(&value, "tracked.txt");
+    assert_eq!(tracked["evidence"], "exact");
+    assert_eq!(tracked["ai_strong"], 1);
+    assert_eq!(tracked["e"], 1);
+}
+
+#[test]
+fn mixed_line_endings_derive_consistent_counts() {
+    let value = ai_commit_with_eols("mixed-eols", "false", b"one\r\nai line\nthird\r\n");
+    let tracked = file(&value, "tracked.txt");
+    assert_eq!(tracked["evidence"], "exact");
+    assert_counts_consistent(&value);
 }
 
 #[test]
