@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/prov-core", "crates/prov-gitai", "crates/prov-cli"]
+members = ["crates/prov-core", "crates/prov-gitai", "crates/prov-cli", "crates/prov-capture", "crates/prov-hook"]
 
 [workspace.package]
 edition = "2021"
