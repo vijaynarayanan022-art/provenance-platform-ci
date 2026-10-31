@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const OPEN_MARKER: &str = "# >>> prov-hook >>>";
 const CLOSE_MARKER: &str = "# <<< prov-hook <<<";
+const FEATURE_INSERTED: &str = "# prov-hook-feature: inserted";
+const FEATURE_RESTORE_PREFIX: &str = "# prov-hook-feature: restore:";
 const HOOK_EVENTS: [(&str, &str); 3] = [
     ("PreToolUse", "pre_tool_use"),
     ("PostToolUse", "post_tool_use"),
@@ -21,26 +23,42 @@ pub fn install(
     codex_home: Option<&Path>,
     binary: Option<&Path>,
     dry_run: bool,
+    enable_hooks_feature: bool,
 ) -> Result<String, String> {
     let home = resolve_home(codex_home)?;
     let config = home.join("config.toml");
     let original = read_config(&config)?;
     let binary = binary_path(binary)?;
-    let block = managed_block(&binary);
-    let updated = install_block(&original, &block)?;
+    let existing_metadata = feature_metadata(&original);
+    let (feature_text, block_features, metadata) = if enable_hooks_feature {
+        enable_hooks(&original, existing_metadata)?
+    } else {
+        (
+            original.clone(),
+            block_has_features(&original),
+            existing_metadata,
+        )
+    };
+    let block = managed_block(&binary, block_features, metadata.as_deref());
+    let updated = install_block(&feature_text, &block)?;
+    let note = if enable_hooks_feature || feature_enabled(&updated) {
+        String::new()
+    } else {
+        "NOTE: Codex hooks are not enabled; rerun with --enable-hooks-feature.\n".into()
+    };
     if updated == original {
-        return Ok(if dry_run {
+        return Ok(note + &if dry_run {
             "No changes.\n".into()
         } else {
             format!("Already installed in {}\n", config.display())
         });
     }
     if dry_run {
-        return Ok(unified_diff(&config, &original, &updated));
+        return Ok(unified_diff(&config, &original, &updated) + &note);
     }
     backup_config(&config, &original)?;
     write_config(&config, &updated)?;
-    Ok(format!(
+    Ok(note + &format!(
         "Installed prov-hook hooks in {}\n",
         config.display()
     ))
@@ -50,7 +68,7 @@ pub fn uninstall(codex_home: Option<&Path>, dry_run: bool) -> Result<String, Str
     let home = resolve_home(codex_home)?;
     let config = home.join("config.toml");
     let original = read_config(&config)?;
-    let updated = remove_block(&original)?;
+    let updated = uninstall_block(&original)?;
     if updated == original {
         return Ok(if dry_run {
             "No changes.\n".into()
@@ -128,10 +146,23 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
         "config.toml",
         &config.display().to_string(),
     );
+    check(
+        &mut lines,
+        &mut failed,
+        feature_enabled(&contents),
+        "hooks feature",
+        "config.toml must have [features] with hooks = true; install with --enable-hooks-feature",
+    );
 
     let expected_block = configured_binary
         .as_ref()
-        .map(|binary| managed_block(binary))
+        .map(|binary| {
+            managed_block(
+                binary,
+                block_has_features(&contents),
+                feature_metadata(&contents).as_deref(),
+            )
+        })
         .unwrap_or_default();
     let block_matches = locate_block(&contents)
         .ok()
@@ -239,18 +270,183 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-fn managed_block(binary: &Path) -> String {
+fn managed_block(binary: &Path, features: bool, metadata: Option<&str>) -> String {
     let command = format!("\"{}\" codex", binary.to_string_lossy());
     let command = toml_basic_string(&command);
     let mut block = String::from(OPEN_MARKER);
+    if features {
+        block.push_str("\n\n[features]\nhooks = true # prov-hook");
+    }
     for event in ["PreToolUse", "PostToolUse", "Stop"] {
         block.push_str(&format!(
             "\n\n[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {command}"
         ));
     }
+    if let Some(metadata) = metadata {
+        block.push_str("\n");
+        block.push_str(metadata);
+    }
     block.push('\n');
     block.push_str(CLOSE_MARKER);
     block
+}
+
+fn block_has_features(contents: &str) -> bool {
+    locate_block(contents)
+        .ok()
+        .flatten()
+        .is_some_and(|(start, end)| contents[start..end].lines().any(|line| line.trim() == "[features]"))
+}
+
+fn feature_metadata(contents: &str) -> Option<String> {
+    let (start, end) = locate_block(contents).ok()??;
+    contents[start..end]
+        .lines()
+        .find(|line| line.trim() == FEATURE_INSERTED || line.trim().starts_with(FEATURE_RESTORE_PREFIX))
+        .map(|line| line.trim().to_owned())
+}
+
+fn feature_enabled(contents: &str) -> bool {
+    let mut in_features = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_features = trimmed == "[features]";
+        } else if in_features && trimmed.split_once('=').is_some_and(|(key, value)| {
+            key.trim() == "hooks" && value.trim().starts_with("true")
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn enable_hooks(original: &str, old_metadata: Option<String>) -> Result<(String, bool, Option<String>), String> {
+    if let Some(metadata) = old_metadata {
+        return Ok((original.to_owned(), block_has_features(original), Some(metadata)));
+    }
+    let mut features_header = None;
+    for (start, line) in line_offsets(original) {
+        if line.trim() == "[features]" {
+            if features_header.is_some() {
+                return Err("config.toml has multiple [features] tables".into());
+            }
+            features_header = Some((start, line));
+        }
+    }
+    let Some((header_start, header_line)) = features_header else {
+        return Ok((original.to_owned(), true, None));
+    };
+    let header_end = header_start + header_line.len();
+    let section_end = line_offsets(&original[header_end..])
+        .into_iter()
+        .find_map(|(offset, line)| line.trim_start().starts_with('[').then_some(header_end + offset))
+        .unwrap_or(original.len());
+    let section = &original[header_end..section_end];
+    let hooks_line = line_offsets(section)
+        .into_iter()
+        .find(|(_, line)| line.trim_start().starts_with("hooks") && line.trim_start()[5..].trim_start().starts_with('='));
+    let (updated, metadata) = if let Some((offset, line)) = hooks_line {
+        let current = line.trim();
+        let Some((_, value)) = current.split_once('=') else {
+            return Err("malformed hooks feature setting".into());
+        };
+        if value.trim().starts_with("true") {
+            return Ok((original.to_owned(), false, None));
+        }
+        if !value.trim().starts_with("false") {
+            return Err("[features].hooks must be true or false".into());
+        }
+        let newline = line_ending(line);
+        let replacement = format!("hooks = true # prov-hook (was false){newline}");
+        let absolute = header_end + offset;
+        let updated = format!("{}{}{}", &original[..absolute], replacement, &original[absolute + line.len()..]);
+        let metadata = format!("{FEATURE_RESTORE_PREFIX}{}", hex_encode(line.as_bytes()));
+        (updated, Some(metadata))
+    } else {
+        let newline = line_ending(header_line);
+        let insert = format!("hooks = true # prov-hook{newline}");
+        let updated = format!("{}{}{}", &original[..header_end], insert, &original[header_end..]);
+        (updated, Some(FEATURE_INSERTED.to_owned()))
+    };
+    Ok((updated, false, metadata))
+}
+
+fn uninstall_block(original: &str) -> Result<String, String> {
+    let metadata = feature_metadata(original);
+    let mut updated = remove_block(original)?;
+    match metadata.as_deref() {
+        Some(FEATURE_INSERTED) => {
+            updated = remove_feature_line(&updated, "hooks = true # prov-hook");
+        }
+        Some(metadata) if metadata.starts_with(FEATURE_RESTORE_PREFIX) => {
+            if let Some(original_line) = hex_decode(&metadata[FEATURE_RESTORE_PREFIX.len()..]) {
+                updated = replace_feature_line(
+                    &updated,
+                    "hooks = true # prov-hook (was false)",
+                    &original_line,
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(updated)
+}
+
+fn line_offsets(text: &str) -> Vec<(usize, &str)> {
+    let mut offset = 0;
+    text.split_inclusive('\n')
+        .map(|line| {
+            let current = (offset, line);
+            offset += line.len();
+            current
+        })
+        .collect()
+}
+
+fn line_ending(line: &str) -> &'static str {
+    if line.ends_with("\r\n") { "\r\n" } else { "\n" }
+}
+
+fn remove_feature_line(contents: &str, target: &str) -> String {
+    replace_feature_line(contents, target, "")
+}
+
+fn replace_feature_line(contents: &str, target: &str, replacement: &str) -> String {
+    let mut in_features = false;
+    let mut result = String::with_capacity(contents.len());
+    for line in line_offsets(contents) {
+        let text = line.1;
+        let trimmed = text.trim_end_matches(['\r', '\n']).trim();
+        if trimmed.starts_with('[') {
+            in_features = trimmed == "[features]";
+        }
+        if in_features && trimmed == target {
+            if !replacement.is_empty() {
+                let newline = line_ending(text);
+                result.push_str(replacement.trim_end_matches(['\r', '\n']));
+                result.push_str(newline);
+            }
+        } else {
+            result.push_str(text);
+        }
+    }
+    result
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_decode(value: &str) -> Option<String> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
 }
 
 fn managed_command(contents: &str) -> Option<String> {
@@ -685,7 +881,7 @@ mod tests {
     #[test]
     fn block_insertion_and_removal_preserve_existing_text() {
         let original = "model = \"kept\"\n[other]\nkey = true\n";
-        let block = managed_block(Path::new("C:\\Program Files\\prov-hook.exe"));
+        let block = managed_block(Path::new("C:\\Program Files\\prov-hook.exe"), false, None);
         let installed = install_block(original, &block).unwrap();
         assert!(installed.starts_with(original));
         assert_eq!(remove_block(&installed).unwrap(), original);

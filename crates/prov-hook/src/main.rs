@@ -134,6 +134,7 @@ fn install_command(args: impl Iterator<Item = String>) -> Result<String, String>
     let mut codex_home = None;
     let mut binary = None;
     let mut dry_run = false;
+    let mut enable_hooks_feature = false;
     let mut args = args;
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -144,10 +145,16 @@ fn install_command(args: impl Iterator<Item = String>) -> Result<String, String>
             }
             "--binary" => binary = Some(PathBuf::from(args.next().ok_or("--binary needs a path")?)),
             "--dry-run" => dry_run = true,
+            "--enable-hooks-feature" => enable_hooks_feature = true,
             _ => return Err(format!("unknown install argument: {argument}")),
         }
     }
-    setup::install(codex_home.as_deref(), binary.as_deref(), dry_run)
+    setup::install(
+        codex_home.as_deref(),
+        binary.as_deref(),
+        dry_run,
+        enable_hooks_feature,
+    )
 }
 
 fn uninstall_command(args: impl Iterator<Item = String>) -> Result<String, String> {

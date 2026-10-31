@@ -197,6 +197,71 @@ fn uninstall_removes_only_the_marked_block_and_backs_up_first() {
 }
 
 #[test]
+fn feature_opt_in_creates_inside_block_or_reversibly_edits_existing_table() {
+    let no_table = Fixture::new("feature-create");
+    let without_flag = no_table.cli(&["install", "--codex-home", no_table.home_arg()]);
+    assert!(without_flag.status.success());
+    assert!(String::from_utf8_lossy(&without_flag.stdout).contains("NOTE:"));
+    assert!(!String::from_utf8_lossy(&fs::read(no_table.config()).unwrap()).contains("[features]"));
+    assert!(!no_table
+        .cli(&["doctor", "--codex-home", no_table.home_arg()])
+        .status
+        .success());
+    no_table.drop_root();
+
+    let missing_key = Fixture::new("feature-insert");
+    fs::create_dir_all(&missing_key.codex_home).unwrap();
+    let original = "model = \"preserve\"\n[features]\nother = true\n";
+    fs::write(missing_key.config(), original).unwrap();
+    let install = missing_key.cli(&[
+        "install",
+        "--codex-home",
+        missing_key.home_arg(),
+        "--enable-hooks-feature",
+    ]);
+    assert!(install.status.success());
+    let contents = fs::read_to_string(missing_key.config()).unwrap();
+    assert!(contents.contains("[features]\nhooks = true # prov-hook\nother = true"));
+    assert!(missing_key
+        .cli(&["doctor", "--codex-home", missing_key.home_arg()])
+        .status
+        .success());
+    assert!(missing_key
+        .cli(&["doctor", "--codex-home", missing_key.home_arg()])
+        .status
+        .success());
+    assert!(missing_key
+        .cli(&["uninstall", "--codex-home", missing_key.home_arg()])
+        .status
+        .success());
+    assert_eq!(fs::read(missing_key.config()).unwrap(), original.as_bytes());
+    missing_key.drop_root();
+}
+
+#[test]
+fn feature_false_is_marked_and_uninstall_restores_exact_original_line() {
+    let fixture = Fixture::new("feature-false");
+    fs::create_dir_all(&fixture.codex_home).unwrap();
+    let original = "[features]\nhooks = false # retain this comment\n\n[other]\nkey = true\n";
+    fs::write(fixture.config(), original).unwrap();
+    let install = fixture.cli(&[
+        "install",
+        "--codex-home",
+        fixture.home_arg(),
+        "--enable-hooks-feature",
+    ]);
+    assert!(install.status.success());
+    let contents = fs::read_to_string(fixture.config()).unwrap();
+    assert!(contents.contains("hooks = true # prov-hook (was false)"));
+    assert!(fixture
+        .cli(&["uninstall", "--codex-home", fixture.home_arg()])
+        .status
+        .success());
+    assert_eq!(fs::read(fixture.config()).unwrap(), original.as_bytes());
+    fixture.drop_root();
+}
+
+#[test]
 fn doctor_reports_install_and_empty_config_without_writing() {
     let fixture = Fixture::new("doctor");
     fs::create_dir_all(&fixture.codex_home).unwrap();
