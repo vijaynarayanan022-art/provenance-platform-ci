@@ -29,11 +29,17 @@ impl Fixture {
     }
 
     fn cli(&self, args: &[&str]) -> Output {
+        let local_app_data = self.local_app_data();
         Command::new(env!("CARGO_BIN_EXE_prov-hook"))
             .args(args)
             .env("PROV_HOME", &self.store)
+            .env("LOCALAPPDATA", local_app_data)
             .output()
             .unwrap()
+    }
+
+    fn local_app_data(&self) -> PathBuf {
+        self.root.join("Local AppData")
     }
 
     fn home_arg(&self) -> &str {
@@ -118,7 +124,12 @@ fn install_creates_missing_config_and_is_idempotent() {
     assert!(!fixture.config().exists());
     assert!(backups(&fixture.config()).is_empty());
 
-    let installed = fixture.cli(&["install", "--codex-home", fixture.home_arg()]);
+    let installed = fixture.cli(&[
+        "install",
+        "--codex-home",
+        fixture.home_arg(),
+        "--enable-hooks-feature",
+    ]);
     assert!(
         installed.status.success(),
         "{}",
@@ -154,6 +165,7 @@ fn install_preserves_unrelated_config_and_quotes_spaced_windows_binary() {
         fixture.home_arg(),
         "--binary",
         binary.to_str().unwrap(),
+        "--enable-hooks-feature",
     ]);
     assert!(result.status.success());
     assert!(String::from_utf8_lossy(&result.stdout)
@@ -189,7 +201,12 @@ fn uninstall_removes_only_the_marked_block_and_backs_up_first() {
     let original = "model = \"preserve me\"\n\n[projects]\ntrust = \"trusted\"\n";
     fs::write(fixture.config(), original).unwrap();
     assert!(fixture
-        .cli(&["install", "--codex-home", fixture.home_arg()])
+        .cli(&[
+            "install",
+            "--codex-home",
+            fixture.home_arg(),
+            "--enable-hooks-feature",
+        ])
         .status
         .success());
     let installed = fs::read(&fixture.config()).unwrap();
@@ -254,10 +271,6 @@ fn feature_opt_in_creates_inside_block_or_reversibly_edits_existing_table() {
         .status
         .success());
     assert!(missing_key
-        .cli(&["doctor", "--codex-home", missing_key.home_arg()])
-        .status
-        .success());
-    assert!(missing_key
         .cli(&["uninstall", "--codex-home", missing_key.home_arg()])
         .status
         .success());
@@ -299,7 +312,12 @@ fn doctor_reports_install_and_empty_config_without_writing() {
     assert!(String::from_utf8_lossy(&empty.stdout).contains("FAIL managed block"));
     assert_eq!(snapshot(&fixture.root), before_empty);
 
-    let installed = fixture.cli(&["install", "--codex-home", fixture.home_arg()]);
+    let installed = fixture.cli(&[
+        "install",
+        "--codex-home",
+        fixture.home_arg(),
+        "--enable-hooks-feature",
+    ]);
     assert!(installed.status.success());
     let before_doctor = snapshot(&fixture.root);
     let doctor = fixture.cli(&["doctor", "--codex-home", fixture.home_arg()]);
@@ -329,6 +347,7 @@ fn doctor_checks_the_managed_executable_and_warns_when_it_differs() {
         fixture.home_arg(),
         "--binary",
         binary.to_str().unwrap(),
+        "--enable-hooks-feature",
     ]);
     assert!(installed.status.success());
 
@@ -350,7 +369,12 @@ fn doctor_resolves_trust_state_by_event_group_and_accepts_default_enabled() {
     )
     .unwrap();
     assert!(fixture
-        .cli(&["install", "--codex-home", fixture.home_arg()])
+        .cli(&[
+            "install",
+            "--codex-home",
+            fixture.home_arg(),
+            "--enable-hooks-feature",
+        ])
         .status
         .success());
 
@@ -382,7 +406,12 @@ fn doctor_warns_when_a_hook_state_entry_is_explicitly_disabled() {
     let fixture = Fixture::new("doctor-trust-disabled");
     fs::create_dir_all(&fixture.codex_home).unwrap();
     assert!(fixture
-        .cli(&["install", "--codex-home", fixture.home_arg()])
+        .cli(&[
+            "install",
+            "--codex-home",
+            fixture.home_arg(),
+            "--enable-hooks-feature",
+        ])
         .status
         .success());
     let state = format!(
@@ -422,6 +451,7 @@ fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
         .arg("codex")
         .env("PROV_HOME", &fixture.store)
+        .env("LOCALAPPDATA", fixture.local_app_data())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -439,7 +469,12 @@ fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
 
     fs::create_dir_all(&fixture.codex_home).unwrap();
     assert!(fixture
-        .cli(&["install", "--codex-home", fixture.home_arg()])
+        .cli(&[
+            "install",
+            "--codex-home",
+            fixture.home_arg(),
+            "--enable-hooks-feature",
+        ])
         .status
         .success());
     let before = snapshot(&fixture.root);
@@ -455,6 +490,67 @@ fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
     assert!(output.contains("PASS repo identity:"));
     assert!(output.contains("PASS repo events: 1 event log(s) found"));
     assert!(output.contains("PASS last event time:"));
+    assert_eq!(snapshot(&fixture.root), before);
+    fixture.drop_root();
+}
+
+#[test]
+fn doctor_warns_when_repo_events_are_only_in_default_store() {
+    let fixture = Fixture::new("doctor-default-store");
+    let repo = fixture.root.join("default-store repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init"]);
+    fs::write(repo.join("tracked.txt"), b"content\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+
+    let payload = serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": "doctor-default-session",
+        "cwd": repo,
+        "tool_use_id": "doctor-default-tool",
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+        .arg("codex")
+        .env_remove("PROV_HOME")
+        .env("LOCALAPPDATA", fixture.local_app_data())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+
+    fs::create_dir_all(&fixture.codex_home).unwrap();
+    assert!(fixture
+        .cli(&[
+            "install",
+            "--codex-home",
+            fixture.home_arg(),
+            "--enable-hooks-feature",
+        ])
+        .status
+        .success());
+    let before = snapshot(&fixture.root);
+    let doctor = fixture.cli(&[
+        "doctor",
+        "--codex-home",
+        fixture.home_arg(),
+        "--repo",
+        repo.to_str().unwrap(),
+    ]);
+    assert!(doctor.status.success());
+    let output = String::from_utf8_lossy(&doctor.stdout);
+    assert!(output.contains("PASS repo identity:"));
+    assert!(output.contains("WARN repo events: none found in resolved store"));
+    assert!(output.contains("WARN repo events: 1 event log(s) found in default store"));
+    assert!(output.contains("WARN PROV_HOME differs from default store"));
     assert_eq!(snapshot(&fixture.root), before);
     fixture.drop_root();
 }

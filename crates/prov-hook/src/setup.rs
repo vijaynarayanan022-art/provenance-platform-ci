@@ -228,6 +228,7 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
     });
 
     let store = store_home();
+    let default_store = default_store_home();
     let (store_ok, store_detail) = store_writable(&store);
     check(
         &mut lines,
@@ -242,14 +243,19 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
     check(&mut lines, &mut failed, git_available, "git", "available");
 
     if let Some(repo) = repo {
-        match repo_diagnostics(repo, &store) {
-            Ok((repo_id, event_count, last_event)) => {
+        match repo_diagnostics(repo, &store, &default_store) {
+            Ok((repo_id, resolved_event_count, other_event_count, last_event)) => {
                 lines.push(format!("PASS repo identity: {repo_id}"));
-                lines.push(if event_count == 0 {
-                    "WARN repo events: none found".into()
+                lines.push(if resolved_event_count == 0 {
+                    "WARN repo events: none found in resolved store".into()
                 } else {
-                    format!("PASS repo events: {event_count} event log(s) found")
+                    format!("PASS repo events: {resolved_event_count} event log(s) found")
                 });
+                if other_event_count > 0 {
+                    lines.push(format!(
+                        "WARN repo events: {other_event_count} event log(s) found in default store, not resolved store"
+                    ));
+                }
                 lines.push(format!(
                     "PASS last event time: {}",
                     last_event
@@ -259,6 +265,13 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
             }
             Err(error) => check(&mut lines, &mut failed, false, "repo identity", &error),
         }
+    }
+    if std::env::var_os("PROV_HOME").is_some() && !same_directory(&store, &default_store) {
+        lines.push(format!(
+            "WARN PROV_HOME differs from default store: resolved {}, default {}",
+            store.display(),
+            default_store.display()
+        ));
     }
 
     Ok(DoctorReport { lines, failed })
@@ -774,6 +787,10 @@ fn store_home() -> PathBuf {
     if let Some(path) = std::env::var_os("PROV_HOME") {
         return PathBuf::from(path);
     }
+    default_store_home()
+}
+
+fn default_store_home() -> PathBuf {
     #[cfg(windows)]
     {
         return std::env::var_os("LOCALAPPDATA")
@@ -836,7 +853,11 @@ fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, String> {
         .map_err(|error| error.to_string())
 }
 
-fn repo_diagnostics(repo: &Path, store: &Path) -> Result<(String, usize, Option<u128>), String> {
+fn repo_diagnostics(
+    repo: &Path,
+    resolved_store: &Path,
+    default_store: &Path,
+) -> Result<(String, usize, usize, Option<u128>), String> {
     let root = git(repo, &["rev-parse", "--show-toplevel"])?;
     if !root.status.success() {
         return Err("not a Git repository".into());
@@ -858,21 +879,37 @@ fn repo_diagnostics(repo: &Path, store: &Path) -> Result<(String, usize, Option<
         return Err("repository has no root commits".into());
     }
     let root_check = root_ids.join("\n");
-    let cache_dir = store.join("repo-cache");
-    let entries =
-        fs::read_dir(&cache_dir).map_err(|_| "no cached repo identity; run a hook once")?;
-    let mut repo_id = None;
+    let repo_id = cached_repo_id(resolved_store, &root_check)
+        .or_else(|| cached_repo_id(default_store, &root_check))
+        .ok_or("no cached repo identity in resolved or default store; run a hook once")?;
+    let (resolved_event_count, resolved_last) = event_stats(resolved_store, &repo_id);
+    let (other_event_count, other_last) = if same_directory(resolved_store, default_store) {
+        (0, None)
+    } else {
+        event_stats(default_store, &repo_id)
+    };
+    let last_event = match (resolved_last, other_last) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+    Ok((repo_id, resolved_event_count, other_event_count, last_event))
+}
+
+fn cached_repo_id(store: &Path, root_check: &str) -> Option<String> {
+    let entries = fs::read_dir(store.join("repo-cache")).ok()?;
     for entry in entries.flatten() {
         let Ok(contents) = fs::read_to_string(entry.path()) else {
             continue;
         };
-        if json_string_field(&contents, "root_check").as_deref() == Some(root_check.as_str()) {
-            repo_id = json_string_field(&contents, "repo_id");
-            break;
+        if json_string_field(&contents, "root_check").as_deref() == Some(root_check) {
+            return json_string_field(&contents, "repo_id");
         }
     }
-    let repo_id = repo_id.ok_or("no cached repo identity for this repository; run a hook once")?;
-    let event_dir = store.join("repos").join(&repo_id).join("events");
+    None
+}
+
+fn event_stats(store: &Path, repo_id: &str) -> (usize, Option<u128>) {
+    let event_dir = store.join("repos").join(repo_id).join("events");
     let mut event_files = 0;
     let mut last_event = None;
     if let Ok(entries) = fs::read_dir(event_dir) {
@@ -890,13 +927,19 @@ fn repo_diagnostics(repo: &Path, store: &Path) -> Result<(String, usize, Option<
             };
             for line in bytes.split(|byte| *byte == b'\n') {
                 if let Some(timestamp) = json_u128_field(line, "timestamp") {
-                    last_event =
-                        Some(last_event.map_or(timestamp, |last: u128| last.max(timestamp)));
+                    last_event = Some(last_event.map_or(timestamp, |last: u128| last.max(timestamp)));
                 }
             }
         }
     }
-    Ok((repo_id, event_files, last_event))
+    (event_files, last_event)
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn json_string_field(text: &str, field: &str) -> Option<String> {
