@@ -1,12 +1,19 @@
 use crate::derive::{self, Evidence, Step, StepKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime};
 
 const MAX_FILE: usize = 1024 * 1024;
+const MAX_PATCH_DIFF_SIZE: usize = 8 * 1024 * 1024;
 const NANOSECOND: u128 = 1_000_000_000;
+const MAX_PENDING_PER_RUN: usize = 50;
+const PENDING_BUDGET: Duration = Duration::from_secs(20);
+const ATTEMPT_MARKER_AGE: Duration = Duration::from_secs(60);
+const DERIVE_LOCK_AGE: Duration = Duration::from_secs(120);
 
 #[derive(Serialize)]
 struct CommitOutput {
@@ -17,6 +24,7 @@ struct CommitOutput {
     totals: Totals,
     coverage: &'static str,
     files: Vec<FileOutput>,
+    patch_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -24,6 +32,38 @@ struct MergeOutput {
     schema: &'static str,
     commit: String,
     skipped: &'static str,
+    patch_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LinesOutput {
+    schema: &'static str,
+    repo_id: String,
+    commit: String,
+    totals: LineTotals,
+    files: Vec<LineFileOutput>,
+}
+
+#[derive(Serialize)]
+struct LineTotals {
+    e: usize,
+    ai_strong: usize,
+    ai_probable: usize,
+    mixed: usize,
+    unknown: usize,
+}
+
+#[derive(Serialize)]
+struct LineFileOutput {
+    path: String,
+    lines: Vec<LineOutput>,
+}
+
+#[derive(Serialize)]
+struct LineOutput {
+    line: usize,
+    hash: String,
+    label: char,
 }
 
 #[derive(Clone, Copy, Default, Serialize)]
@@ -93,6 +133,184 @@ pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String
     derive_commit_with_events(&repo, &repo_id, &store, revision, &events, &event_index)
 }
 
+pub fn derive_pending(repo_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let (repo, repo_id, store) = repo_context(repo_path)?;
+    crate::ensure_private_dir(&store).map_err(|error| error.to_string())?;
+    let Some(_lock) = acquire_derive_lock(&store.join("derive.lock"))? else {
+        return Ok(Vec::new());
+    };
+
+    let started = Instant::now();
+    let events = read_events(&store.join("events"));
+    let event_index = index_events(&events);
+    let commits_dir = store.join("commits");
+    crate::ensure_private_dir(&commits_dir).map_err(|error| error.to_string())?;
+    let pending = pending_candidates(&commits_dir, &events);
+    let mut attempted = 0;
+    let mut derived = Vec::new();
+    for candidate in pending {
+        if attempted >= MAX_PENDING_PER_RUN || started.elapsed() >= PENDING_BUDGET {
+            break;
+        }
+        let commit = candidate.commit;
+        if !commit_exists(&repo.root, &commit) {
+            let gone = commits_dir.join(format!("{commit}.gone"));
+            let _ = OpenOptions::new().write(true).create_new(true).open(gone);
+            continue;
+        }
+        let marker = commits_dir.join(format!("{commit}.attempt"));
+        if !create_attempt_marker(&marker)? {
+            continue;
+        }
+        attempted += 1;
+        match derive_resolved_commit(&repo, &repo_id, &store, commit, &events, &event_index) {
+            Ok(path) => {
+                let _ = fs::remove_file(marker);
+                derived.push(path);
+            }
+            Err(_) => continue,
+        }
+    }
+    Ok(derived)
+}
+
+pub fn pending_status(repo_path: &Path) -> Result<(usize, Option<u128>), String> {
+    let (_repo, _, store) = repo_context(repo_path)?;
+    let events = read_events(&store.join("events"));
+    let commits_dir = store.join("commits");
+    let pending = pending_candidates(&commits_dir, &events);
+    let oldest = pending.iter().map(|item| item.event_timestamp).min();
+    Ok((pending.len(), oldest))
+}
+
+pub fn pending_status_at(
+    repo_path: &Path,
+    repo_store: &Path,
+) -> Result<(usize, Option<u128>), String> {
+    crate::find_git_dirs(repo_path).ok_or("not a supported Git repository")?;
+    let events = read_events(&repo_store.join("events"));
+    let commits_dir = repo_store.join("commits");
+    let pending = pending_candidates(&commits_dir, &events);
+    let oldest = pending.iter().map(|item| item.event_timestamp).min();
+    Ok((pending.len(), oldest))
+}
+
+struct PendingCommit {
+    commit: String,
+    event_timestamp: u128,
+}
+
+fn pending_candidates(commits_dir: &Path, events: &[EventRecord]) -> Vec<PendingCommit> {
+    let mut references = BTreeMap::new();
+    for event in events.iter().filter(|event| event.event == "head_move") {
+        let Some(revision) = event.new_head.as_deref() else {
+            continue;
+        };
+        references
+            .entry(revision.to_owned())
+            .and_modify(|timestamp: &mut u128| *timestamp = (*timestamp).min(event.timestamp))
+            .or_insert(event.timestamp);
+    }
+
+    let mut pending = Vec::new();
+    for (revision, event_timestamp) in references {
+        if !matches!(revision.len(), 40 | 64)
+            || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            continue;
+        }
+        if commits_dir.join(format!("{revision}.json")).exists() {
+            continue;
+        }
+        if commits_dir.join(format!("{revision}.gone")).exists() {
+            continue;
+        }
+        pending.push(PendingCommit {
+            commit: revision,
+            event_timestamp,
+        });
+    }
+    pending.sort_by(|left, right| {
+        (left.event_timestamp, &left.commit).cmp(&(right.event_timestamp, &right.commit))
+    });
+    pending
+}
+
+fn commit_exists(root: &Path, commit: &str) -> bool {
+    let revision = format!("{commit}^{{commit}}");
+    git_output(root, &["cat-file", "-e", &revision]).is_ok_and(|output| output.status.success())
+}
+
+struct DeriveLock(PathBuf);
+
+impl Drop for DeriveLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn acquire_derive_lock(path: &Path) -> Result<Option<DeriveLock>, String> {
+    for _ in 0..3 {
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                if writeln!(file, "{}", std::process::id()).is_err() {
+                    let _ = fs::remove_file(path);
+                    return Err("could not write derive lock".into());
+                }
+                return Ok(Some(DeriveLock(path.to_path_buf())));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if is_recent(path, DERIVE_LOCK_AGE) {
+                    return Ok(None);
+                }
+                match fs::remove_file(path) {
+                    Ok(()) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(None)
+}
+
+fn create_attempt_marker(path: &Path) -> Result<bool, String> {
+    if path.exists() {
+        if is_recent(path, ATTEMPT_MARKER_AGE) {
+            return Ok(false);
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            if writeln!(file, "{}", std::process::id()).is_err() {
+                let _ = fs::remove_file(path);
+                return Err("could not write derive attempt marker".into());
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn is_recent(path: &Path, max_age: Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .is_some_and(|modified| {
+            SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default()
+                < max_age
+        })
+}
+
 fn derive_commit_with_events(
     repo: &crate::RepoInfo,
     repo_id: &str,
@@ -102,6 +320,17 @@ fn derive_commit_with_events(
     event_index: &HashMap<String, Vec<usize>>,
 ) -> Result<PathBuf, String> {
     let commit = resolve_commit(&repo.root, revision)?;
+    derive_resolved_commit(repo, repo_id, store, commit, event_records, event_index)
+}
+
+fn derive_resolved_commit(
+    repo: &crate::RepoInfo,
+    repo_id: &str,
+    store: &Path,
+    commit: String,
+    event_records: &[EventRecord],
+    event_index: &HashMap<String, Vec<usize>>,
+) -> Result<PathBuf, String> {
     let parent_line = git_checked(&repo.root, &["rev-list", "--parents", "-n", "1", &commit])?;
     let commits: Vec<_> = parent_line.split_whitespace().collect();
     if commits.first() != Some(&commit.as_str()) {
@@ -111,10 +340,29 @@ fn derive_commit_with_events(
     let output_path = store.join("commits").join(format!("{commit}.json"));
 
     if parents.len() > 1 {
+        let lines_path = store.join("commits").join(format!("{commit}.lines.json"));
+        let lines_bytes = serde_json::to_vec(&LinesOutput {
+            schema: "prov.lines/0.1",
+            repo_id: repo_id.to_owned(),
+            commit: commit.clone(),
+            totals: LineTotals {
+                e: 0,
+                ai_strong: 0,
+                ai_probable: 0,
+                mixed: 0,
+                unknown: 0,
+            },
+            files: Vec::new(),
+        })
+        .map_err(|error| error.to_string())?;
+        crate::ensure_private_dir(lines_path.parent().ok_or("invalid lines path")?)
+            .map_err(|error| error.to_string())?;
+        crate::atomic_bytes(&lines_path, &lines_bytes, false).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec(&MergeOutput {
             schema: "prov.commit/0.1",
             commit,
             skipped: "merge_commit",
+            patch_id: None,
         })
         .map_err(|error| error.to_string())?;
         crate::ensure_private_dir(output_path.parent().ok_or("invalid commit path")?)
@@ -124,13 +372,16 @@ fn derive_commit_with_events(
     }
 
     let parent = parents.first().map(|value| (*value).to_owned());
+    let (files, has_changes) = commit_files(&repo.root, parent.as_deref(), &commit)?;
+    if !has_changes {
+        return write_empty_commit(store, repo_id, commit, parent);
+    }
     let parent_time = parent
         .as_deref()
         .map(|value| committer_time_ns(&repo.root, value))
         .transpose()?
         .unwrap_or(0);
     let commit_time = committer_time_ns(&repo.root, &commit)?;
-    let files = commit_files(&repo.root, parent.as_deref(), &commit)?;
     let mut blob_ids = BTreeSet::new();
     for file in &files {
         blob_ids.insert(file.new_blob.clone());
@@ -160,6 +411,7 @@ fn derive_commit_with_events(
         .collect();
 
     let mut output_files = Vec::with_capacity(files.len());
+    let mut line_files = BTreeMap::new();
     let mut unreadable_files = 0;
     for file in files {
         let old_size = file
@@ -272,6 +524,26 @@ fn derive_commit_with_events(
             &normalized_committed,
         );
         let counts = derive::count(&labels);
+        let committed_lines = split_normalized_lines(&normalized_committed);
+        let lines = labels
+            .iter()
+            .filter(|line| line.added && !line.blank)
+            .filter_map(|line| {
+                let text = committed_lines.get(line.line.checked_sub(1)?)?;
+                let digest = crate::hash(text);
+                Some(LineOutput {
+                    line: line.line,
+                    hash: digest[..16].to_owned(),
+                    label: match line.label {
+                        derive::Label::AiStrong => 's',
+                        derive::Label::AiProbable => 'p',
+                        derive::Label::Mixed => 'm',
+                        derive::Label::Unknown => 'u',
+                    },
+                })
+            })
+            .collect();
+        line_files.insert(file.path.clone(), lines);
         output_files.push(FileOutput {
             path: file.path,
             e: counts.e,
@@ -305,6 +577,38 @@ fn derive_commit_with_events(
         totals.e,
     );
     let coverage = coverage_band(covered, totals.e);
+    let patch_id = if has_changes {
+        parent
+            .as_deref()
+            .and_then(|parent| stable_patch_id(&repo.root, parent, &commit))
+    } else {
+        None
+    };
+    let sidecar_files = output_files
+        .iter()
+        .map(|file| LineFileOutput {
+            path: file.path.clone(),
+            lines: line_files.remove(&file.path).unwrap_or_default(),
+        })
+        .collect();
+    let lines_bytes = serde_json::to_vec(&LinesOutput {
+        schema: "prov.lines/0.1",
+        repo_id: repo_id.to_owned(),
+        commit: commit.clone(),
+        totals: LineTotals {
+            e: totals.e,
+            ai_strong: totals.ai_strong,
+            ai_probable: totals.ai_probable,
+            mixed: totals.mixed,
+            unknown: totals.unknown,
+        },
+        files: sidecar_files,
+    })
+    .map_err(|error| error.to_string())?;
+    let lines_path = store.join("commits").join(format!("{commit}.lines.json"));
+    crate::ensure_private_dir(lines_path.parent().ok_or("invalid lines path")?)
+        .map_err(|error| error.to_string())?;
+    crate::atomic_bytes(&lines_path, &lines_bytes, false).map_err(|error| error.to_string())?;
     let bytes = serde_json::to_vec(&CommitOutput {
         schema: "prov.commit/0.1",
         repo_id: repo_id.to_owned(),
@@ -313,12 +617,92 @@ fn derive_commit_with_events(
         totals,
         coverage,
         files: output_files,
+        patch_id,
     })
     .map_err(|error| error.to_string())?;
     crate::ensure_private_dir(output_path.parent().ok_or("invalid commit path")?)
         .map_err(|error| error.to_string())?;
     crate::atomic_bytes(&output_path, &bytes, false).map_err(|error| error.to_string())?;
     Ok(output_path)
+}
+
+fn write_empty_commit(
+    store: &Path,
+    repo_id: &str,
+    commit: String,
+    parent: Option<String>,
+) -> Result<PathBuf, String> {
+    let commits_dir = store.join("commits");
+    let output_path = commits_dir.join(format!("{commit}.json"));
+    let lines_path = commits_dir.join(format!("{commit}.lines.json"));
+    let lines_bytes = serde_json::to_vec(&LinesOutput {
+        schema: "prov.lines/0.1",
+        repo_id: repo_id.to_owned(),
+        commit: commit.clone(),
+        totals: LineTotals {
+            e: 0,
+            ai_strong: 0,
+            ai_probable: 0,
+            mixed: 0,
+            unknown: 0,
+        },
+        files: Vec::new(),
+    })
+    .map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(&CommitOutput {
+        schema: "prov.commit/0.1",
+        repo_id: repo_id.to_owned(),
+        commit,
+        parent,
+        totals: Totals::default(),
+        coverage: "none",
+        files: Vec::new(),
+        patch_id: None,
+    })
+    .map_err(|error| error.to_string())?;
+    crate::ensure_private_dir(&commits_dir).map_err(|error| error.to_string())?;
+    crate::atomic_bytes(&lines_path, &lines_bytes, false).map_err(|error| error.to_string())?;
+    crate::atomic_bytes(&output_path, &bytes, false).map_err(|error| error.to_string())?;
+    Ok(output_path)
+}
+
+fn split_normalized_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines: Vec<_> = bytes.split(|byte| *byte == b'\n').collect();
+    if bytes.last() == Some(&b'\n') {
+        lines.pop();
+    }
+    lines
+}
+
+fn stable_patch_id(root: &Path, parent: &str, commit: &str) -> Option<String> {
+    let diff = git_output(root, &["diff-tree", "-p", "--no-renames", parent, commit]).ok()?;
+    if !diff.status.success() || !patch_diff_size_allowed(diff.stdout.len()) {
+        return None;
+    }
+    let mut child = Command::new("git")
+        .args(["patch-id", "--stable"])
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(&diff.stdout).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let patch_id = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()?
+        .to_owned();
+    (patch_id.len() == 40 && patch_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(patch_id)
+}
+
+fn patch_diff_size_allowed(size: usize) -> bool {
+    size <= MAX_PATCH_DIFF_SIZE
 }
 
 pub fn derive_range(repo_path: &Path, range: &str) -> Result<Vec<PathBuf>, String> {
@@ -407,8 +791,7 @@ fn commit_files(
     root: &Path,
     parent: Option<&str>,
     commit: &str,
-) -> Result<Vec<CommitFile>, String> {
-    let additions = numstat_additions(root, parent, commit)?;
+) -> Result<(Vec<CommitFile>, bool), String> {
     let output = if let Some(parent) = parent {
         git_output(
             root,
@@ -441,6 +824,11 @@ fn commit_files(
     if !output.status.success() {
         return Err("git diff-tree failed".into());
     }
+    let has_changes = !output.stdout.is_empty();
+    if !has_changes {
+        return Ok((Vec::new(), false));
+    }
+    let additions = numstat_additions(root, parent, commit)?;
     let mut records = output
         .stdout
         .split(|byte| *byte == 0)
@@ -474,7 +862,7 @@ fn commit_files(
                 .unwrap_or_default(),
         });
     }
-    Ok(files)
+    Ok((files, has_changes))
 }
 
 fn numstat_additions(
@@ -805,7 +1193,7 @@ fn git_checked(root: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{readable_blob_ids, MAX_FILE};
+    use super::{patch_diff_size_allowed, readable_blob_ids, MAX_FILE, MAX_PATCH_DIFF_SIZE};
     use std::collections::BTreeMap;
 
     #[test]
@@ -820,5 +1208,11 @@ mod tests {
             "missing".to_owned(),
         ];
         assert_eq!(readable_blob_ids(&sizes, &ids), vec!["at-limit"]);
+    }
+
+    #[test]
+    fn patch_id_diff_size_limit_includes_eight_mib_and_rejects_larger() {
+        assert!(patch_diff_size_allowed(MAX_PATCH_DIFF_SIZE));
+        assert!(!patch_diff_size_allowed(MAX_PATCH_DIFF_SIZE + 1));
     }
 }

@@ -3,7 +3,19 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut command = Command::new(program);
+    command
+        .env("GIT_CONFIG_GLOBAL", null)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", null);
+    command
+}
 
 struct Fixture {
     root: PathBuf,
@@ -30,7 +42,7 @@ impl Fixture {
 
     fn cli(&self, args: &[&str]) -> Output {
         let local_app_data = self.local_app_data();
-        Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+        isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
             .args(args)
             .env("PROV_HOME", &self.store)
             .env("LOCALAPPDATA", local_app_data)
@@ -100,7 +112,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = isolated_command("git")
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -113,6 +125,21 @@ fn git(repo: &Path, args: &[&str]) {
         .status()
         .unwrap();
     assert!(output.success(), "git {args:?} failed");
+}
+
+#[test]
+fn isolated_git_does_not_create_notes_after_commit() {
+    let fixture = Fixture::new("no-global-git-ai");
+    let repo = fixture.root.join("isolated repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init"]);
+    fs::write(repo.join("tracked.txt"), b"content\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!repo.join(".git/refs/notes").exists());
+    fixture.drop_root();
 }
 
 #[test]
@@ -473,9 +500,10 @@ fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
         "cwd": repo,
         "tool_use_id": "doctor-repo-tool",
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+    let mut child = isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
         .arg("codex")
         .env("PROV_HOME", &fixture.store)
+        .env("PROV_NO_AUTODERIVE", "1")
         .env("LOCALAPPDATA", fixture.local_app_data())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -515,7 +543,52 @@ fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
     assert!(output.contains("PASS repo identity:"));
     assert!(output.contains("PASS repo events: 1 event log(s) found"));
     assert!(output.contains("PASS last event time:"));
+    assert!(output.contains("PASS pending commits: 0 not yet derived"));
     assert_eq!(snapshot(&fixture.root), before);
+
+    let repo_id = fs::read_dir(fixture.store.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .into_owned();
+    let head = isolated_command("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+    let old_timestamp = now().saturating_sub(6 * 60 * 1_000_000_000);
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(
+                fixture
+                    .store
+                    .join("repos")
+                    .join(repo_id)
+                    .join("events")
+                    .join("doctor-repo-session.jsonl"),
+            )
+            .unwrap(),
+        "{}",
+        serde_json::json!({"event":"head_move", "timestamp":old_timestamp, "new_head":head})
+    )
+    .unwrap();
+    let before_pending_doctor = snapshot(&fixture.root);
+    let pending_doctor = fixture.cli(&[
+        "doctor",
+        "--codex-home",
+        fixture.home_arg(),
+        "--repo",
+        repo.to_str().unwrap(),
+    ]);
+    assert!(pending_doctor.status.success());
+    assert!(String::from_utf8_lossy(&pending_doctor.stdout)
+        .contains("WARN pending commits: 1 not yet derived"));
+    assert_eq!(snapshot(&fixture.root), before_pending_doctor);
     fixture.drop_root();
 }
 
@@ -535,7 +608,7 @@ fn doctor_warns_when_repo_events_are_only_in_default_store() {
         "cwd": repo,
         "tool_use_id": "doctor-default-tool",
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+    let mut child = isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
         .arg("codex")
         .env_remove("PROV_HOME")
         .env("LOCALAPPDATA", fixture.local_app_data())

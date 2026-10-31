@@ -1,9 +1,22 @@
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut command = Command::new(program);
+    command
+        .env("GIT_CONFIG_GLOBAL", null)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", null);
+    command
+}
 
 struct Fixture {
     root: PathBuf,
@@ -29,6 +42,10 @@ impl Fixture {
     }
 
     fn hook(&self, event: &str, tool: &str) {
+        let _ = self.hook_with_autoderive(event, tool, false);
+    }
+
+    fn hook_with_autoderive(&self, event: &str, tool: &str, auto_derive: bool) -> Duration {
         let payload = json!({
             "hook_event_name": event,
             "session_id": "derive-test-session",
@@ -38,9 +55,15 @@ impl Fixture {
             "tool_name": "PowerShell",
             "tool_input": {"command": "test command"},
         });
-        let mut child = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
-            .arg("codex")
-            .env("PROV_HOME", &self.home)
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_prov-hook"));
+        command.arg("codex").env("PROV_HOME", &self.home);
+        if auto_derive {
+            command.env_remove("PROV_NO_AUTODERIVE");
+        } else {
+            command.env("PROV_NO_AUTODERIVE", "1");
+        }
+        let started = Instant::now();
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -52,14 +75,30 @@ impl Fixture {
             .unwrap()
             .write_all(payload.to_string().as_bytes())
             .unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert_eq!(output.status.code(), Some(0));
-        assert!(output.stdout.is_empty());
-        assert!(output.stderr.is_empty());
+        let status = child.wait().unwrap();
+        let elapsed = started.elapsed();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_end(&mut stderr)
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+        elapsed
     }
 
     fn cli(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+        isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
             .args(args)
             .env("PROV_HOME", &self.home)
             .output()
@@ -91,8 +130,81 @@ impl Fixture {
             .join(format!("{commit}.json"))
     }
 
+    fn lines_path(&self, commit: &str) -> PathBuf {
+        self.derived_path(commit)
+            .with_file_name(format!("{commit}.lines.json"))
+    }
+
     fn derived_value(&self, commit: &str) -> Value {
         serde_json::from_slice(&fs::read(self.derived_path(commit)).unwrap()).unwrap()
+    }
+
+    fn pending(&self) -> Output {
+        self.cli(&["derive", "--pending", "--repo", self.repo.to_str().unwrap()])
+    }
+
+    fn doctor(&self) -> Output {
+        let codex_home = self.root.join("Codex Home");
+        fs::create_dir_all(&codex_home).unwrap();
+        let codex_home = codex_home.to_str().unwrap();
+        let install = self.cli(&[
+            "install",
+            "--codex-home",
+            codex_home,
+            "--enable-hooks-feature",
+        ]);
+        assert!(install.status.success());
+        self.cli(&[
+            "doctor",
+            "--codex-home",
+            codex_home,
+            "--repo",
+            self.repo.to_str().unwrap(),
+        ])
+    }
+
+    fn queue_head_moves(&self, commits: &[String]) {
+        let event_dir = self.home.join("repos").join(self.repo_id()).join("events");
+        fs::create_dir_all(&event_dir).unwrap();
+        let path = event_dir.join("derive-test-session.jsonl");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for commit in commits {
+            writeln!(
+                file,
+                "{}",
+                json!({"event":"head_move", "timestamp":now(), "new_head":commit})
+            )
+            .unwrap();
+        }
+    }
+
+    fn commits(&self, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| {
+                fs::write(
+                    self.repo.join("tracked.txt"),
+                    format!("base\ncommit line {index}\n"),
+                )
+                .unwrap();
+                self.commit(&format!("pending {index}"))
+            })
+            .collect()
+    }
+
+    fn empty_commits(&self, count: usize) -> Vec<String> {
+        for index in 0..count {
+            let message = format!("empty pending {index}");
+            git(&self.repo, &["commit", "--allow-empty", "-m", &message]);
+        }
+        let range = format!("HEAD~{count}..HEAD");
+        git_text(&self.repo, &["rev-list", "--reverse", &range])
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn drop_root(&self) {
@@ -107,8 +219,39 @@ fn now() -> u128 {
         .as_nanos()
 }
 
+fn set_age(path: &Path, age: Duration) {
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(SystemTime::now() - age))
+        .unwrap();
+}
+
+fn patch_id(repo: &Path, parent: &str, commit: &str) -> String {
+    let diff = isolated_command("git")
+        .args(["diff-tree", "-p", "--no-renames", parent, commit])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(diff.status.success());
+    let mut child = isolated_command("git")
+        .args(["patch-id", "--stable"])
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&diff.stdout).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
 fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = isolated_command("git")
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -124,7 +267,7 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn git_text(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = isolated_command("git")
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -135,7 +278,7 @@ fn git_text(repo: &Path, args: &[&str]) -> String {
 }
 
 fn git_blob(repo: &Path, bytes: &[u8]) -> String {
-    let mut child = Command::new("git")
+    let mut child = isolated_command("git")
         .args(["hash-object", "-w", "--stdin"])
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -573,11 +716,16 @@ fn derive_show_range_and_worktree_are_deterministic() {
     let derived_once = derive(&fixture, &second);
     assert!(derived_once.status.success());
     let first_bytes = fs::read(fixture.derived_path(&second)).unwrap();
+    let first_lines_bytes = fs::read(fixture.lines_path(&second)).unwrap();
     let derived_twice = derive(&fixture, &second);
     assert!(derived_twice.status.success());
     assert_eq!(
         first_bytes,
         fs::read(fixture.derived_path(&second)).unwrap()
+    );
+    assert_eq!(
+        first_lines_bytes,
+        fs::read(fixture.lines_path(&second)).unwrap()
     );
 
     let value = fixture.derived_value(&second);
@@ -640,7 +788,7 @@ fn show_missing_commit_fails_on_stderr() {
 #[test]
 fn unknown_and_missing_subcommands_keep_silent_hook_behavior() {
     for args in [Vec::<&str>::new(), vec!["unknownarg"]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+        let output = isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
             .args(args)
             .stdin(Stdio::null())
             .output()
@@ -652,7 +800,7 @@ fn unknown_and_missing_subcommands_keep_silent_hook_behavior() {
 }
 
 #[test]
-fn merge_commits_write_only_the_skip_record() {
+fn merge_commits_write_skip_record_and_empty_sidecar() {
     let fixture = Fixture::new("merge-commit");
     let base_branch = git_text(&fixture.repo, &["branch", "--show-current"]);
     git(&fixture.repo, &["checkout", "-b", "side"]);
@@ -670,6 +818,255 @@ fn merge_commits_write_only_the_skip_record() {
     assert!(derive(&fixture, &merge).status.success());
     let value = fixture.derived_value(&merge);
     assert_eq!(value["skipped"], "merge_commit");
-    assert_eq!(value.as_object().unwrap().len(), 3);
+    assert_eq!(value["patch_id"], Value::Null);
+    assert_eq!(value.as_object().unwrap().len(), 4);
+    let lines_path = fixture
+        .derived_path(&merge)
+        .with_file_name(format!("{merge}.lines.json"));
+    let lines: Value = serde_json::from_slice(&fs::read(lines_path).unwrap()).unwrap();
+    assert_eq!(lines["schema"], "prov.lines/0.1");
+    assert_eq!(lines["files"].as_array().unwrap().len(), 0);
+    assert_eq!(lines["totals"]["e"], 0);
+    fixture.drop_root();
+}
+
+#[test]
+fn sidecar_hashes_added_nonblank_lines_and_matches_summary_counts() {
+    let fixture = Fixture::new("line-sidecar");
+    let secret = "API_KEY=sk-live-never-store-this-line";
+    fixture.hook("PreToolUse", "sidecar-ai");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        format!("one\n{secret}\n\n"),
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "sidecar-ai");
+    let commit = fixture.commit("sidecar test");
+    assert!(derive(&fixture, &commit).status.success());
+
+    let summary = fixture.derived_value(&commit);
+    let sidecar_bytes = fs::read(fixture.lines_path(&commit)).unwrap();
+    assert!(!String::from_utf8_lossy(&sidecar_bytes).contains(secret));
+    let sidecar: Value = serde_json::from_slice(&sidecar_bytes).unwrap();
+    assert_eq!(sidecar["schema"], "prov.lines/0.1");
+    for key in ["e", "ai_strong", "ai_probable", "mixed", "unknown"] {
+        assert_eq!(sidecar["totals"][key], summary["totals"][key]);
+    }
+    let file_lines = sidecar["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "tracked.txt")
+        .unwrap()["lines"]
+        .as_array()
+        .unwrap();
+    assert_eq!(file_lines.len(), 1);
+    assert_eq!(file_lines[0]["line"], 2);
+    assert_eq!(file_lines[0]["label"], "s");
+    let expected_hash = format!("{:x}", Sha256::digest(secret.as_bytes()));
+    assert_eq!(file_lines[0]["hash"], &expected_hash[..16]);
+    fixture.drop_root();
+}
+
+#[test]
+fn patch_id_matches_git_and_identical_patches_match_each_other() {
+    let fixture = Fixture::new("patch-id");
+    let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    git(&fixture.repo, &["checkout", "-b", "patch-one"]);
+    fs::write(fixture.repo.join("same.txt"), b"same patch\n").unwrap();
+    let first = fixture.commit("first identical patch");
+    let expected = patch_id(&fixture.repo, &base, &first);
+    assert!(derive(&fixture, &first).status.success());
+    let first_id = fixture.derived_value(&first)["patch_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(first_id, expected);
+
+    git(&fixture.repo, &["checkout", &base]);
+    git(&fixture.repo, &["checkout", "-b", "patch-two"]);
+    fs::write(fixture.repo.join("same.txt"), b"same patch\n").unwrap();
+    let second = fixture.commit("second identical patch");
+    assert!(derive(&fixture, &second).status.success());
+    let second_value = fixture.derived_value(&second);
+    let second_id = second_value["patch_id"].as_str().unwrap();
+    assert_eq!(second_id, first_id);
+    fixture.drop_root();
+}
+
+#[test]
+fn head_move_spawns_silent_pending_derivation_under_watchdog() {
+    let fixture = Fixture::new("auto-derive");
+    fixture.hook("PreToolUse", "auto-derive");
+    fs::write(fixture.repo.join("tracked.txt"), b"one\nautomatic report\n").unwrap();
+    let commit = fixture.commit("commit during AI session");
+
+    let elapsed = fixture.hook_with_autoderive("PostToolUse", "auto-derive", true);
+    assert!(
+        elapsed < Duration::from_millis(1400),
+        "hook took {elapsed:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !fixture.derived_path(&commit).exists() {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(fixture.derived_path(&commit).exists());
+    assert!(fixture.lines_path(&commit).exists());
+    let summary = fixture.derived_value(&commit);
+    let tracked = summary["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "tracked.txt")
+        .unwrap();
+    assert!(
+        tracked["ai_strong"].as_u64().unwrap() > 0 || tracked["ai_probable"].as_u64().unwrap() > 0
+    );
+    let sidecar: Value =
+        serde_json::from_slice(&fs::read(fixture.lines_path(&commit)).unwrap()).unwrap();
+    for key in ["e", "ai_strong", "ai_probable", "mixed", "unknown"] {
+        assert_eq!(sidecar["totals"][key], summary["totals"][key]);
+    }
+    fixture.drop_root();
+}
+
+#[test]
+fn pending_lock_skips_fresh_lock_takes_over_stale_lock_and_cleans_up() {
+    let fixture = Fixture::new("pending-lock");
+    fixture.hook("Stop", "pending-init");
+    let commits = fixture.commits(1);
+    fixture.queue_head_moves(&commits);
+    let repo_store = fixture.home.join("repos").join(fixture.repo_id());
+    let lock = repo_store.join("derive.lock");
+    fs::write(&lock, "held").unwrap();
+
+    let fresh = fixture.pending();
+    assert_eq!(fresh.status.code(), Some(0));
+    assert!(fresh.stdout.is_empty() && fresh.stderr.is_empty());
+    assert!(!fixture.derived_path(&commits[0]).exists());
+
+    set_age(&lock, Duration::from_secs(121));
+    let stale = fixture.pending();
+    assert_eq!(stale.status.code(), Some(0));
+    assert!(stale.stdout.is_empty() && stale.stderr.is_empty());
+    assert!(fixture.derived_path(&commits[0]).exists());
+    assert!(!lock.exists());
+    fixture.drop_root();
+}
+
+#[test]
+fn pending_attempt_marker_skips_fresh_and_retries_stale_marker() {
+    let fixture = Fixture::new("pending-attempt");
+    fixture.hook("Stop", "pending-init");
+    let commits = fixture.commits(1);
+    fixture.queue_head_moves(&commits);
+    let commits_dir = fixture
+        .home
+        .join("repos")
+        .join(fixture.repo_id())
+        .join("commits");
+    fs::create_dir_all(&commits_dir).unwrap();
+    let marker = commits_dir.join(format!("{}.attempt", commits[0]));
+    fs::write(&marker, "attempting").unwrap();
+
+    let fresh = fixture.pending();
+    assert_eq!(fresh.status.code(), Some(0));
+    assert!(!fixture.derived_path(&commits[0]).exists());
+
+    set_age(&marker, Duration::from_secs(61));
+    let stale = fixture.pending();
+    assert_eq!(stale.status.code(), Some(0));
+    assert!(fixture.derived_path(&commits[0]).exists());
+    assert!(!marker.exists());
+    fixture.drop_root();
+}
+
+#[test]
+fn pending_run_removes_lock_after_derivation_error() {
+    let fixture = Fixture::new("pending-error-cleanup");
+    fixture.hook("Stop", "pending-init");
+    let commits = fixture.commits(2);
+    fixture.queue_head_moves(&commits);
+    let repo_store = fixture.home.join("repos").join(fixture.repo_id());
+    let commits_dir = repo_store.join("commits");
+    fs::create_dir_all(commits_dir.join(format!("{}.lines.json", commits[0]))).unwrap();
+
+    let result = fixture.pending();
+    assert_eq!(result.status.code(), Some(0));
+    assert!(result.stdout.is_empty() && result.stderr.is_empty());
+    assert!(!repo_store.join("derive.lock").exists());
+    assert!(!fixture.derived_path(&commits[0]).exists());
+    assert!(commits_dir.join(format!("{}.attempt", commits[0])).exists());
+    assert!(fixture.derived_path(&commits[1]).exists());
+    fixture.drop_root();
+}
+
+#[test]
+fn pending_skips_dead_commit_and_continues_then_doctor_reports_zero() {
+    let fixture = Fixture::new("pending-dead-commit");
+    fixture.hook("Stop", "pending-init");
+    let real_commits = fixture.commits(2);
+    let dead_commit = "f".repeat(40);
+    let mut queued = vec![dead_commit.clone()];
+    queued.extend(real_commits.clone());
+    fixture.queue_head_moves(&queued);
+
+    let first = fixture.pending();
+    assert_eq!(first.status.code(), Some(0));
+    assert!(first.stdout.is_empty() && first.stderr.is_empty());
+    assert!(fixture
+        .home
+        .join("repos")
+        .join(fixture.repo_id())
+        .join("commits")
+        .join(format!("{dead_commit}.gone"))
+        .is_file());
+    for commit in &real_commits {
+        assert!(fixture.derived_path(commit).is_file());
+    }
+
+    let second = fixture.pending();
+    assert_eq!(second.status.code(), Some(0));
+    assert!(second.stdout.is_empty() && second.stderr.is_empty());
+    let doctor = fixture.doctor();
+    assert!(doctor.status.success());
+    assert!(
+        String::from_utf8_lossy(&doctor.stdout).contains("PASS pending commits: 0 not yet derived")
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn pending_derivation_caps_at_fifty_and_continues_next_run() {
+    let fixture = Fixture::new("pending-cap");
+    fixture.hook("Stop", "pending-init");
+    let commits = fixture.empty_commits(60);
+    fixture.queue_head_moves(&commits);
+    let first = fixture.pending();
+    assert_eq!(first.status.code(), Some(0));
+    assert!(first.stdout.is_empty() && first.stderr.is_empty());
+    let commits_dir = fixture
+        .home
+        .join("repos")
+        .join(fixture.repo_id())
+        .join("commits");
+    let count_derived = || {
+        fs::read_dir(&commits_dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                    && !entry.file_name().to_string_lossy().ends_with(".lines.json")
+            })
+            .count()
+    };
+    assert_eq!(count_derived(), 50);
+
+    let second = fixture.pending();
+    assert_eq!(second.status.code(), Some(0));
+    assert_eq!(count_derived(), 60);
     fixture.drop_root();
 }
