@@ -22,7 +22,7 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => cli_error(error),
         },
-        _ => cli_error("usage: prov-hook <codex|derive|show>".into()),
+        _ => run_codex(),
     }
 }
 

@@ -492,6 +492,20 @@ fn show_missing_commit_fails_on_stderr() {
 }
 
 #[test]
+fn unknown_and_missing_subcommands_keep_silent_hook_behavior() {
+    for args in [Vec::<&str>::new(), vec!["unknownarg"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn merge_commits_write_only_the_skip_record() {
     let fixture = Fixture::new("merge-commit");
     let base_branch = git_text(&fixture.repo, &["branch", "--show-current"]);
