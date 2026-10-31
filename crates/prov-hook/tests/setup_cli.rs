@@ -153,6 +153,27 @@ fn install_creates_missing_config_and_is_idempotent() {
 }
 
 #[test]
+fn dry_run_uses_unified_diff_with_local_context() {
+    let fixture = Fixture::new("unified-diff");
+    fs::create_dir_all(&fixture.codex_home).unwrap();
+    let mut original = String::from("model = \"unchanged\"\n");
+    for index in 0..20 {
+        original.push_str(&format!("unchanged-{index:02} = true\n"));
+    }
+    fs::write(fixture.config(), &original).unwrap();
+
+    let result = fixture.cli(&["install", "--codex-home", fixture.home_arg(), "--dry-run"]);
+    assert!(result.status.success());
+    let diff = String::from_utf8_lossy(&result.stdout);
+    assert!(diff.contains("@@"));
+    assert!(diff.contains(" unchanged-17 = true"));
+    assert!(!diff.contains("-unchanged-00 = true"));
+    assert_eq!(fs::read(fixture.config()).unwrap(), original.as_bytes());
+    assert!(backups(&fixture.config()).is_empty());
+    fixture.drop_root();
+}
+
+#[test]
 fn install_preserves_unrelated_config_and_quotes_spaced_windows_binary() {
     let fixture = Fixture::new("existing");
     fs::create_dir_all(&fixture.codex_home).unwrap();
@@ -168,8 +189,9 @@ fn install_preserves_unrelated_config_and_quotes_spaced_windows_binary() {
         "--enable-hooks-feature",
     ]);
     assert!(result.status.success());
-    assert!(String::from_utf8_lossy(&result.stdout)
-        .contains("WARNING: executable path contains spaces; verify with doctor and a real Codex session."));
+    assert!(String::from_utf8_lossy(&result.stdout).contains(
+        "WARNING: executable path contains spaces; verify with doctor and a real Codex session."
+    ));
     let installed = fs::read_to_string(fixture.config()).unwrap();
     assert!(installed.starts_with(original));
     assert!(installed.contains(r#"Program Files\\prov hook.exe\" codex"#));
@@ -182,14 +204,17 @@ fn install_preserves_unrelated_config_and_quotes_spaced_windows_binary() {
     assert!(!fs::read_dir(&fixture.codex_home)
         .unwrap()
         .flatten()
-        .any(|entry| entry.file_name().to_string_lossy().starts_with(".config.toml.prov-")));
+        .any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".config.toml.prov-")));
 
-    let before_dry_run = fs::read(&fixture.config()).unwrap();
+    let before_dry_run = fs::read(fixture.config()).unwrap();
     let backup_count = backups(&fixture.config()).len();
     let dry_run = fixture.cli(&["uninstall", "--codex-home", fixture.home_arg(), "--dry-run"]);
     assert!(dry_run.status.success());
     assert!(String::from_utf8_lossy(&dry_run.stdout).contains("---"));
-    assert_eq!(fs::read(&fixture.config()).unwrap(), before_dry_run);
+    assert_eq!(fs::read(fixture.config()).unwrap(), before_dry_run);
     assert_eq!(backups(&fixture.config()).len(), backup_count);
     fixture.drop_root();
 }
@@ -209,11 +234,11 @@ fn uninstall_removes_only_the_marked_block_and_backs_up_first() {
         ])
         .status
         .success());
-    let installed = fs::read(&fixture.config()).unwrap();
+    let installed = fs::read(fixture.config()).unwrap();
 
     let removed = fixture.cli(&["uninstall", "--codex-home", fixture.home_arg()]);
     assert!(removed.status.success());
-    assert_eq!(fs::read(&fixture.config()).unwrap(), original.as_bytes());
+    assert_eq!(fs::read(fixture.config()).unwrap(), original.as_bytes());
     assert_eq!(backups(&fixture.config()).len(), 2);
     assert!(backups(&fixture.config())
         .iter()

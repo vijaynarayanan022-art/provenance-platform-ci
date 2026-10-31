@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 prov-capture = { path = "../prov-capture" }
+similar = "2"
 
 [dev-dependencies]
 serde_json.workspace = true

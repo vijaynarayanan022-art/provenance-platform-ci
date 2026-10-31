@@ -162,6 +162,7 @@ dependencies = [
  "prov-capture",
  "serde_json",
  "sha2",
+ "similar",
 ]
 
 [[package]]
