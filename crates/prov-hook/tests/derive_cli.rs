@@ -131,6 +131,26 @@ impl Fixture {
         self.cli(&["derive", "--pending", "--repo", self.repo.to_str().unwrap()])
     }
 
+    fn doctor(&self) -> Output {
+        let codex_home = self.root.join("Codex Home");
+        fs::create_dir_all(&codex_home).unwrap();
+        let codex_home = codex_home.to_str().unwrap();
+        let install = self.cli(&[
+            "install",
+            "--codex-home",
+            codex_home,
+            "--enable-hooks-feature",
+        ]);
+        assert!(install.status.success());
+        self.cli(&[
+            "doctor",
+            "--codex-home",
+            codex_home,
+            "--repo",
+            self.repo.to_str().unwrap(),
+        ])
+    }
+
     fn queue_head_moves(&self, commits: &[String]) {
         let event_dir = self.home.join("repos").join(self.repo_id()).join("events");
         fs::create_dir_all(&event_dir).unwrap();
@@ -164,12 +184,14 @@ impl Fixture {
     }
 
     fn empty_commits(&self, count: usize) -> Vec<String> {
-        (0..count)
-            .map(|index| {
-                let message = format!("empty pending {index}");
-                git(&self.repo, &["commit", "--allow-empty", "-m", &message]);
-                git_text(&self.repo, &["rev-parse", "HEAD"])
-            })
+        for index in 0..count {
+            let message = format!("empty pending {index}");
+            git(&self.repo, &["commit", "--allow-empty", "-m", &message]);
+        }
+        let range = format!("HEAD~{count}..HEAD");
+        git_text(&self.repo, &["rev-list", "--reverse", &range])
+            .lines()
+            .map(str::to_owned)
             .collect()
     }
 
@@ -878,6 +900,21 @@ fn head_move_spawns_silent_pending_derivation_under_watchdog() {
     }
     assert!(fixture.derived_path(&commit).exists());
     assert!(fixture.lines_path(&commit).exists());
+    let summary = fixture.derived_value(&commit);
+    let tracked = summary["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "tracked.txt")
+        .unwrap();
+    assert!(
+        tracked["ai_strong"].as_u64().unwrap() > 0 || tracked["ai_probable"].as_u64().unwrap() > 0
+    );
+    let sidecar: Value =
+        serde_json::from_slice(&fs::read(fixture.lines_path(&commit)).unwrap()).unwrap();
+    for key in ["e", "ai_strong", "ai_probable", "mixed", "unknown"] {
+        assert_eq!(sidecar["totals"][key], summary["totals"][key]);
+    }
     fixture.drop_root();
 }
 
@@ -936,7 +973,7 @@ fn pending_attempt_marker_skips_fresh_and_retries_stale_marker() {
 fn pending_run_removes_lock_after_derivation_error() {
     let fixture = Fixture::new("pending-error-cleanup");
     fixture.hook("Stop", "pending-init");
-    let commits = fixture.commits(1);
+    let commits = fixture.commits(2);
     fixture.queue_head_moves(&commits);
     let repo_store = fixture.home.join("repos").join(fixture.repo_id());
     let commits_dir = repo_store.join("commits");
@@ -946,6 +983,44 @@ fn pending_run_removes_lock_after_derivation_error() {
     assert_eq!(result.status.code(), Some(0));
     assert!(result.stdout.is_empty() && result.stderr.is_empty());
     assert!(!repo_store.join("derive.lock").exists());
+    assert!(!fixture.derived_path(&commits[0]).exists());
+    assert!(commits_dir.join(format!("{}.attempt", commits[0])).exists());
+    assert!(fixture.derived_path(&commits[1]).exists());
+    fixture.drop_root();
+}
+
+#[test]
+fn pending_skips_dead_commit_and_continues_then_doctor_reports_zero() {
+    let fixture = Fixture::new("pending-dead-commit");
+    fixture.hook("Stop", "pending-init");
+    let real_commits = fixture.commits(2);
+    let dead_commit = "f".repeat(40);
+    let mut queued = vec![dead_commit.clone()];
+    queued.extend(real_commits.clone());
+    fixture.queue_head_moves(&queued);
+
+    let first = fixture.pending();
+    assert_eq!(first.status.code(), Some(0));
+    assert!(first.stdout.is_empty() && first.stderr.is_empty());
+    assert!(fixture
+        .home
+        .join("repos")
+        .join(fixture.repo_id())
+        .join("commits")
+        .join(format!("{dead_commit}.gone"))
+        .is_file());
+    for commit in &real_commits {
+        assert!(fixture.derived_path(commit).is_file());
+    }
+
+    let second = fixture.pending();
+    assert_eq!(second.status.code(), Some(0));
+    assert!(second.stdout.is_empty() && second.stderr.is_empty());
+    let doctor = fixture.doctor();
+    assert!(doctor.status.success());
+    assert!(
+        String::from_utf8_lossy(&doctor.stdout).contains("PASS pending commits: 0 not yet derived")
+    );
     fixture.drop_root();
 }
 

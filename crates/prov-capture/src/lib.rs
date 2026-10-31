@@ -412,6 +412,7 @@ pub fn process_json(input: &[u8]) {
     let mut shadow: Shadow = read_json(&shadow_path).unwrap_or_default();
     let head = repo.head.clone();
     let branch = repo.branch.clone();
+    let mut derive_after_hook = false;
     match event_name {
         "PreToolUse" => {
             let scan = timed_scan(&repo.root, &store.join("blobs"), &mut shadow, SCAN_BUDGET);
@@ -643,9 +644,7 @@ pub fn process_json(input: &[u8]) {
                 e.commit_in_window = Some(summary.commit_in_window);
                 e.head_moved = Some(true);
                 e.degraded = Some(true);
-                if append_line(&event_path, &e) {
-                    trigger_auto_derive(&repo.root);
-                }
+                derive_after_hook = append_line(&event_path, &e);
             }
             let mut e = Event::new(
                 "window_close",
@@ -683,6 +682,9 @@ pub fn process_json(input: &[u8]) {
     cap_state(&mut state);
     let _ = atomic_json(&state_path, &state, true);
     let _ = atomic_json(&shadow_path, &shadow, true);
+    if derive_after_hook {
+        trigger_auto_derive(&repo.root);
+    }
 }
 
 fn repo_info(cwd: &Path, home: &Path) -> Option<RepoInfo> {

@@ -8,6 +8,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 const MAX_FILE: usize = 1024 * 1024;
+const MAX_PATCH_DIFF_SIZE: usize = 8 * 1024 * 1024;
 const NANOSECOND: u128 = 1_000_000_000;
 const MAX_PENDING_PER_RUN: usize = 50;
 const PENDING_BUDGET: Duration = Duration::from_secs(20);
@@ -152,14 +153,23 @@ pub fn derive_pending(repo_path: &Path) -> Result<Vec<PathBuf>, String> {
             break;
         }
         let commit = candidate.commit;
+        if !commit_exists(&repo.root, &commit) {
+            let gone = commits_dir.join(format!("{commit}.gone"));
+            let _ = OpenOptions::new().write(true).create_new(true).open(gone);
+            continue;
+        }
         let marker = commits_dir.join(format!("{commit}.attempt"));
         if !create_attempt_marker(&marker)? {
             continue;
         }
         attempted += 1;
-        let path = derive_resolved_commit(&repo, &repo_id, &store, commit, &events, &event_index)?;
-        let _ = fs::remove_file(marker);
-        derived.push(path);
+        match derive_resolved_commit(&repo, &repo_id, &store, commit, &events, &event_index) {
+            Ok(path) => {
+                let _ = fs::remove_file(marker);
+                derived.push(path);
+            }
+            Err(_) => continue,
+        }
     }
     Ok(derived)
 }
@@ -212,6 +222,9 @@ fn pending_candidates(commits_dir: &Path, events: &[EventRecord]) -> Vec<Pending
         if commits_dir.join(format!("{revision}.json")).exists() {
             continue;
         }
+        if commits_dir.join(format!("{revision}.gone")).exists() {
+            continue;
+        }
         pending.push(PendingCommit {
             commit: revision,
             event_timestamp,
@@ -221,6 +234,11 @@ fn pending_candidates(commits_dir: &Path, events: &[EventRecord]) -> Vec<Pending
         (left.event_timestamp, &left.commit).cmp(&(right.event_timestamp, &right.commit))
     });
     pending
+}
+
+fn commit_exists(root: &Path, commit: &str) -> bool {
+    let revision = format!("{commit}^{{commit}}");
+    git_output(root, &["cat-file", "-e", &revision]).is_ok_and(|output| output.status.success())
 }
 
 struct DeriveLock(PathBuf);
@@ -354,13 +372,16 @@ fn derive_resolved_commit(
     }
 
     let parent = parents.first().map(|value| (*value).to_owned());
+    let (files, has_changes) = commit_files(&repo.root, parent.as_deref(), &commit)?;
+    if !has_changes {
+        return write_empty_commit(store, repo_id, commit, parent);
+    }
     let parent_time = parent
         .as_deref()
         .map(|value| committer_time_ns(&repo.root, value))
         .transpose()?
         .unwrap_or(0);
     let commit_time = committer_time_ns(&repo.root, &commit)?;
-    let (files, has_changes) = commit_files(&repo.root, parent.as_deref(), &commit)?;
     let mut blob_ids = BTreeSet::new();
     for file in &files {
         blob_ids.insert(file.new_blob.clone());
@@ -605,6 +626,46 @@ fn derive_resolved_commit(
     Ok(output_path)
 }
 
+fn write_empty_commit(
+    store: &Path,
+    repo_id: &str,
+    commit: String,
+    parent: Option<String>,
+) -> Result<PathBuf, String> {
+    let commits_dir = store.join("commits");
+    let output_path = commits_dir.join(format!("{commit}.json"));
+    let lines_path = commits_dir.join(format!("{commit}.lines.json"));
+    let lines_bytes = serde_json::to_vec(&LinesOutput {
+        schema: "prov.lines/0.1",
+        repo_id: repo_id.to_owned(),
+        commit: commit.clone(),
+        totals: LineTotals {
+            e: 0,
+            ai_strong: 0,
+            ai_probable: 0,
+            mixed: 0,
+            unknown: 0,
+        },
+        files: Vec::new(),
+    })
+    .map_err(|error| error.to_string())?;
+    let bytes = serde_json::to_vec(&CommitOutput {
+        schema: "prov.commit/0.1",
+        repo_id: repo_id.to_owned(),
+        commit,
+        parent,
+        totals: Totals::default(),
+        coverage: "none",
+        files: Vec::new(),
+        patch_id: None,
+    })
+    .map_err(|error| error.to_string())?;
+    crate::ensure_private_dir(&commits_dir).map_err(|error| error.to_string())?;
+    crate::atomic_bytes(&lines_path, &lines_bytes, false).map_err(|error| error.to_string())?;
+    crate::atomic_bytes(&output_path, &bytes, false).map_err(|error| error.to_string())?;
+    Ok(output_path)
+}
+
 fn split_normalized_lines(bytes: &[u8]) -> Vec<&[u8]> {
     let mut lines: Vec<_> = bytes.split(|byte| *byte == b'\n').collect();
     if bytes.last() == Some(&b'\n') {
@@ -615,7 +676,7 @@ fn split_normalized_lines(bytes: &[u8]) -> Vec<&[u8]> {
 
 fn stable_patch_id(root: &Path, parent: &str, commit: &str) -> Option<String> {
     let diff = git_output(root, &["diff-tree", "-p", "--no-renames", parent, commit]).ok()?;
-    if !diff.status.success() {
+    if !diff.status.success() || !patch_diff_size_allowed(diff.stdout.len()) {
         return None;
     }
     let mut child = Command::new("git")
@@ -638,6 +699,10 @@ fn stable_patch_id(root: &Path, parent: &str, commit: &str) -> Option<String> {
         .to_owned();
     (patch_id.len() == 40 && patch_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .then_some(patch_id)
+}
+
+fn patch_diff_size_allowed(size: usize) -> bool {
+    size <= MAX_PATCH_DIFF_SIZE
 }
 
 pub fn derive_range(repo_path: &Path, range: &str) -> Result<Vec<PathBuf>, String> {
@@ -1128,7 +1193,7 @@ fn git_checked(root: &Path, args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{readable_blob_ids, MAX_FILE};
+    use super::{patch_diff_size_allowed, readable_blob_ids, MAX_FILE, MAX_PATCH_DIFF_SIZE};
     use std::collections::BTreeMap;
 
     #[test]
@@ -1143,5 +1208,11 @@ mod tests {
             "missing".to_owned(),
         ];
         assert_eq!(readable_blob_ids(&sizes, &ids), vec!["at-limit"]);
+    }
+
+    #[test]
+    fn patch_id_diff_size_limit_includes_eight_mib_and_rejects_larger() {
+        assert!(patch_diff_size_allowed(MAX_PATCH_DIFF_SIZE));
+        assert!(!patch_diff_size_allowed(MAX_PATCH_DIFF_SIZE + 1));
     }
 }
