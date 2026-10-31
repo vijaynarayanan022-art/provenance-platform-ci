@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod setup;
+
 fn main() -> ExitCode {
     panic::set_hook(Box::new(|_| {}));
     let mut args = std::env::args().skip(1);
@@ -20,6 +22,30 @@ fn main() -> ExitCode {
         },
         Some("show") => match show_command(args) {
             Ok(()) => ExitCode::SUCCESS,
+            Err(error) => cli_error(error),
+        },
+        Some("install") => match install_command(args) {
+            Ok(output) => {
+                print!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => cli_error(error),
+        },
+        Some("uninstall") => match uninstall_command(args) {
+            Ok(output) => {
+                print!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => cli_error(error),
+        },
+        Some("doctor") => match doctor_command(args) {
+            Ok(failed) => {
+                if failed {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
             Err(error) => cli_error(error),
         },
         _ => run_codex(),
@@ -102,4 +128,64 @@ fn show_command(args: impl Iterator<Item = String>) -> Result<(), String> {
 fn cli_error(error: String) -> ExitCode {
     eprintln!("{error}");
     ExitCode::FAILURE
+}
+
+fn install_command(args: impl Iterator<Item = String>) -> Result<String, String> {
+    let mut codex_home = None;
+    let mut binary = None;
+    let mut dry_run = false;
+    let mut args = args;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--codex-home" => {
+                codex_home = Some(PathBuf::from(
+                    args.next().ok_or("--codex-home needs a path")?,
+                ))
+            }
+            "--binary" => binary = Some(PathBuf::from(args.next().ok_or("--binary needs a path")?)),
+            "--dry-run" => dry_run = true,
+            _ => return Err(format!("unknown install argument: {argument}")),
+        }
+    }
+    setup::install(codex_home.as_deref(), binary.as_deref(), dry_run)
+}
+
+fn uninstall_command(args: impl Iterator<Item = String>) -> Result<String, String> {
+    let mut codex_home = None;
+    let mut dry_run = false;
+    let mut args = args;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--codex-home" => {
+                codex_home = Some(PathBuf::from(
+                    args.next().ok_or("--codex-home needs a path")?,
+                ))
+            }
+            "--dry-run" => dry_run = true,
+            _ => return Err(format!("unknown uninstall argument: {argument}")),
+        }
+    }
+    setup::uninstall(codex_home.as_deref(), dry_run)
+}
+
+fn doctor_command(args: impl Iterator<Item = String>) -> Result<bool, String> {
+    let mut codex_home = None;
+    let mut repo = None;
+    let mut args = args;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--codex-home" => {
+                codex_home = Some(PathBuf::from(
+                    args.next().ok_or("--codex-home needs a path")?,
+                ))
+            }
+            "--repo" => repo = Some(PathBuf::from(args.next().ok_or("--repo needs a path")?)),
+            _ => return Err(format!("unknown doctor argument: {argument}")),
+        }
+    }
+    let report = setup::doctor(codex_home.as_deref(), repo.as_deref())?;
+    for line in report.lines {
+        println!("{line}");
+    }
+    Ok(report.failed)
 }
