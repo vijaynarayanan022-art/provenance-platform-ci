@@ -220,6 +220,66 @@ fn human_edit_after_ai_snapshot_is_mixed() {
 }
 
 #[test]
+fn edits_after_last_hook_use_time_cut_and_degrade_ai() {
+    let fixture = Fixture::new("time-cut");
+    fixture.hook("PreToolUse", "ai-tool");
+    fs::write(fixture.repo.join("tracked.txt"), b"one\nai line\n").unwrap();
+    fixture.hook("PostToolUse", "ai-tool");
+    fs::write(fixture.repo.join("tracked.txt"), b"one\nai line\nlate line\n").unwrap();
+    let commit = fixture.commit("edit after last hook");
+
+    assert!(derive(&fixture, &commit).status.success());
+    let value = fixture.derived_value(&commit);
+    let tracked = file(&value, "tracked.txt");
+    assert_eq!(tracked["evidence"], "time_cut");
+    assert!(tracked["ai_probable"].as_u64().unwrap() >= 1);
+    assert_eq!(tracked["ai_strong"], 0);
+    fixture.drop_root();
+}
+
+#[test]
+fn overlap_or_degraded_ai_events_are_probable() {
+    for (name, field) in [("overlap", "overlap"), ("degraded", "degraded")] {
+        let fixture = Fixture::new(name);
+        fixture.hook("PreToolUse", "ai-tool");
+        fs::write(fixture.repo.join("tracked.txt"), b"one\nai line\n").unwrap();
+        fixture.hook("PostToolUse", "ai-tool");
+        let event_path = fs::read_dir(
+            fixture
+                .home
+                .join("repos")
+                .join(fixture.repo_id())
+                .join("events"),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+        let mut output = Vec::new();
+        for line in fs::read(&event_path).unwrap().split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut value: Value = serde_json::from_slice(line).unwrap();
+            if value["event"] == "ai_change" && value["path"] == "tracked.txt" {
+                value[field] = true.into();
+            }
+            serde_json::to_writer(&mut output, &value).unwrap();
+            output.push(b'\n');
+        }
+        fs::write(event_path, output).unwrap();
+        let commit = fixture.commit("degraded AI event");
+        assert!(derive(&fixture, &commit).status.success());
+        let result = fixture.derived_value(&commit);
+        let tracked = file(&result, "tracked.txt");
+        assert_eq!(tracked["ai_probable"], 1, "case {name}");
+        assert_eq!(tracked["ai_strong"], 0, "case {name}");
+        fixture.drop_root();
+    }
+}
+
+#[test]
 fn range_derivation_does_not_carry_stale_parent_events() {
     let fixture = Fixture::new("stale-events");
     let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);

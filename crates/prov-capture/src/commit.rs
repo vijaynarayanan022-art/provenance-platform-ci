@@ -636,7 +636,9 @@ fn steps_for_events(
         };
         let kind = match event.event.as_str() {
             "ai_change" => StepKind::Ai {
-                degraded: event.degraded.unwrap_or(false) || event.overlap.unwrap_or(false),
+                degraded: evidence == "time_cut"
+                    || event.degraded.unwrap_or(false)
+                    || event.overlap.unwrap_or(false),
             },
             "external_change"
                 if event.degraded.unwrap_or(false)
