@@ -1,3 +1,4 @@
+use similar::TextDiff;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -53,21 +54,24 @@ pub fn install(
         "NOTE: Codex hooks are not enabled; rerun with --enable-hooks-feature.\n".into()
     };
     if updated == original {
-        return Ok(warning.to_owned() + &note + &if dry_run {
-            "No changes.\n".into()
-        } else {
-            format!("Already installed in {}\n", config.display())
-        });
+        return Ok(warning.to_owned()
+            + &note
+            + &if dry_run {
+                "No changes.\n".into()
+            } else {
+                format!("Already installed in {}\n", config.display())
+            });
     }
     if dry_run {
         return Ok(warning.to_owned() + &unified_diff(&config, &original, &updated) + &note);
     }
     backup_config(&config, &original)?;
     write_config(&config, &updated)?;
-    Ok(warning.to_owned() + &note + &format!(
-        "Installed prov-hook hooks in {}\n",
-        config.display()
-    ))
+    Ok(
+        warning.to_owned()
+            + &note
+            + &format!("Installed prov-hook hooks in {}\n", config.display()),
+    )
 }
 
 fn refuse_conflicting_hooks(contents: &str) -> Result<(), String> {
@@ -123,7 +127,7 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
     let mut lines = Vec::new();
     let mut failed = false;
 
-    let configured_binary = managed_command(&contents).map(|command| PathBuf::from(command));
+    let configured_binary = managed_command(&contents).map(PathBuf::from);
     let binary_runs = configured_binary.as_ref().is_some_and(|binary| {
         binary.is_file()
             && Command::new(binary)
@@ -133,9 +137,7 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
                 .stderr(Stdio::piped())
                 .output()
                 .is_ok_and(|output| {
-                    output.status.success()
-                        && output.stdout.is_empty()
-                        && output.stderr.is_empty()
+                    output.status.success() && output.stdout.is_empty() && output.stderr.is_empty()
                 })
     });
     if let Some(binary) = configured_binary.as_ref() {
@@ -214,7 +216,10 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
         );
     }
 
-    let marker_start = locate_block(&contents).ok().flatten().map(|(start, _)| start);
+    let marker_start = locate_block(&contents)
+        .ok()
+        .flatten()
+        .map(|(start, _)| start);
     let trusted = marker_start.is_some_and(|start| {
         HOOK_EVENTS.iter().all(|(event, snake)| {
             let group_index = hook_group_index(&contents[..start], event);
@@ -327,7 +332,7 @@ fn managed_block(binary: &Path, features: bool, metadata: Option<&str>) -> Strin
         ));
     }
     if let Some(metadata) = metadata {
-        block.push_str("\n");
+        block.push('\n');
         block.push_str(metadata);
     }
     block.push('\n');
@@ -339,14 +344,20 @@ fn block_has_features(contents: &str) -> bool {
     locate_block(contents)
         .ok()
         .flatten()
-        .is_some_and(|(start, end)| contents[start..end].lines().any(|line| line.trim() == "[features]"))
+        .is_some_and(|(start, end)| {
+            contents[start..end]
+                .lines()
+                .any(|line| line.trim() == "[features]")
+        })
 }
 
 fn feature_metadata(contents: &str) -> Option<String> {
     let (start, end) = locate_block(contents).ok()??;
     contents[start..end]
         .lines()
-        .find(|line| line.trim() == FEATURE_INSERTED || line.trim().starts_with(FEATURE_RESTORE_PREFIX))
+        .find(|line| {
+            line.trim() == FEATURE_INSERTED || line.trim().starts_with(FEATURE_RESTORE_PREFIX)
+        })
         .map(|line| line.trim().to_owned())
 }
 
@@ -356,18 +367,27 @@ fn feature_enabled(contents: &str) -> bool {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             in_features = trimmed == "[features]";
-        } else if in_features && trimmed.split_once('=').is_some_and(|(key, value)| {
-            key.trim() == "hooks" && value.trim().starts_with("true")
-        }) {
+        } else if in_features
+            && trimmed.split_once('=').is_some_and(|(key, value)| {
+                key.trim() == "hooks" && value.trim().starts_with("true")
+            })
+        {
             return true;
         }
     }
     false
 }
 
-fn enable_hooks(original: &str, old_metadata: Option<String>) -> Result<(String, bool, Option<String>), String> {
+fn enable_hooks(
+    original: &str,
+    old_metadata: Option<String>,
+) -> Result<(String, bool, Option<String>), String> {
     if let Some(metadata) = old_metadata {
-        return Ok((original.to_owned(), block_has_features(original), Some(metadata)));
+        return Ok((
+            original.to_owned(),
+            block_has_features(original),
+            Some(metadata),
+        ));
     }
     let mut features_header = None;
     for (start, line) in line_offsets(original) {
@@ -384,12 +404,17 @@ fn enable_hooks(original: &str, old_metadata: Option<String>) -> Result<(String,
     let header_end = header_start + header_line.len();
     let section_end = line_offsets(&original[header_end..])
         .into_iter()
-        .find_map(|(offset, line)| line.trim_start().starts_with('[').then_some(header_end + offset))
+        .find_map(|(offset, line)| {
+            line.trim_start()
+                .starts_with('[')
+                .then_some(header_end + offset)
+        })
         .unwrap_or(original.len());
     let section = &original[header_end..section_end];
-    let hooks_line = line_offsets(section)
-        .into_iter()
-        .find(|(_, line)| line.trim_start().starts_with("hooks") && line.trim_start()[5..].trim_start().starts_with('='));
+    let hooks_line = line_offsets(section).into_iter().find(|(_, line)| {
+        line.trim_start().starts_with("hooks")
+            && line.trim_start()[5..].trim_start().starts_with('=')
+    });
     let (updated, metadata) = if let Some((offset, line)) = hooks_line {
         let current = line.trim();
         let Some((_, value)) = current.split_once('=') else {
@@ -404,13 +429,23 @@ fn enable_hooks(original: &str, old_metadata: Option<String>) -> Result<(String,
         let newline = line_ending(line);
         let replacement = format!("hooks = true # prov-hook (was false){newline}");
         let absolute = header_end + offset;
-        let updated = format!("{}{}{}", &original[..absolute], replacement, &original[absolute + line.len()..]);
+        let updated = format!(
+            "{}{}{}",
+            &original[..absolute],
+            replacement,
+            &original[absolute + line.len()..]
+        );
         let metadata = format!("{FEATURE_RESTORE_PREFIX}{}", hex_encode(line.as_bytes()));
         (updated, Some(metadata))
     } else {
         let newline = line_ending(header_line);
         let insert = format!("hooks = true # prov-hook{newline}");
-        let updated = format!("{}{}{}", &original[..header_end], insert, &original[header_end..]);
+        let updated = format!(
+            "{}{}{}",
+            &original[..header_end],
+            insert,
+            &original[header_end..]
+        );
         (updated, Some(FEATURE_INSERTED.to_owned()))
     };
     Ok((updated, false, metadata))
@@ -449,7 +484,11 @@ fn line_offsets(text: &str) -> Vec<(usize, &str)> {
 }
 
 fn line_ending(line: &str) -> &'static str {
-    if line.ends_with("\r\n") { "\r\n" } else { "\n" }
+    if line.ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 fn remove_feature_line(contents: &str, target: &str) -> String {
@@ -483,7 +522,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(value: &str) -> Option<String> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let bytes = (0..value.len())
@@ -694,7 +733,10 @@ fn write_config(path: &Path, contents: &str) -> Result<(), String> {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("could not create config temp file: {error}")),
         };
-        if let Err(error) = file.write_all(contents.as_bytes()).and_then(|_| file.flush()) {
+        if let Err(error) = file
+            .write_all(contents.as_bytes())
+            .and_then(|_| file.flush())
+        {
             let _ = fs::remove_file(&temporary);
             return Err(format!("could not write config temp file: {error}"));
         }
@@ -712,30 +754,14 @@ fn unified_diff(path: &Path, before: &str, after: &str) -> String {
     if before == after {
         return "No changes.\n".into();
     }
-    let before_lines: Vec<_> = before.split_inclusive('\n').collect();
-    let after_lines: Vec<_> = after.split_inclusive('\n').collect();
-    let mut diff = format!(
-        "--- {}\n+++ {}\n@@ -1,{} +1,{} @@\n",
-        path.display(),
-        path.display(),
-        before_lines.len(),
-        after_lines.len()
-    );
-    for line in before_lines {
-        diff.push('-');
-        diff.push_str(line);
-        if !line.ends_with('\n') {
-            diff.push('\n');
-        }
-    }
-    for line in after_lines {
-        diff.push('+');
-        diff.push_str(line);
-        if !line.ends_with('\n') {
-            diff.push('\n');
-        }
-    }
-    diff
+    TextDiff::from_lines(before, after)
+        .unified_diff()
+        .context_radius(3)
+        .header(
+            &format!("a/{}", path.display()),
+            &format!("b/{}", path.display()),
+        )
+        .to_string()
 }
 
 fn check(lines: &mut Vec<String>, failed: &mut bool, passed: bool, name: &str, detail: &str) {
@@ -752,15 +778,19 @@ fn hook_group_index(before_block: &str, event: &str) -> usize {
         .count()
 }
 
-fn trusted_state_entry(contents: &str, config_path: &Path, snake_event: &str, group: usize) -> bool {
+fn trusted_state_entry(
+    contents: &str,
+    config_path: &Path,
+    snake_event: &str,
+    group: usize,
+) -> bool {
     let key = format!("{}:{snake_event}:{group}:0", config_path.display());
     let literal_header = format!("[hooks.state.'{key}']");
     let basic_header = format!("[hooks.state.{}]", toml_basic_string(&key));
     let lines: Vec<_> = contents.lines().collect();
-    let Some(start) = lines
-        .iter()
-        .position(|line| matches!(line.trim(), value if value == literal_header || value == basic_header))
-    else {
+    let Some(start) = lines.iter().position(
+        |line| matches!(line.trim(), value if value == literal_header || value == basic_header),
+    ) else {
         return false;
     };
     let body = lines[start + 1..]
@@ -927,7 +957,8 @@ fn event_stats(store: &Path, repo_id: &str) -> (usize, Option<u128>) {
             };
             for line in bytes.split(|byte| *byte == b'\n') {
                 if let Some(timestamp) = json_u128_field(line, "timestamp") {
-                    last_event = Some(last_event.map_or(timestamp, |last: u128| last.max(timestamp)));
+                    last_event =
+                        Some(last_event.map_or(timestamp, |last: u128| last.max(timestamp)));
                 }
             }
         }
