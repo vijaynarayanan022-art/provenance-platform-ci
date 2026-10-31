@@ -227,6 +227,28 @@ fn doctor_reports_install_and_empty_config_without_writing() {
 }
 
 #[test]
+fn doctor_checks_the_managed_executable_and_warns_when_it_differs() {
+    let fixture = Fixture::new("doctor-binary");
+    let binary = fixture.root.join("alternate prov hook.exe");
+    fs::copy(env!("CARGO_BIN_EXE_prov-hook"), &binary).unwrap();
+    let installed = fixture.cli(&[
+        "install",
+        "--codex-home",
+        fixture.home_arg(),
+        "--binary",
+        binary.to_str().unwrap(),
+    ]);
+    assert!(installed.status.success());
+
+    let doctor = fixture.cli(&["doctor", "--codex-home", fixture.home_arg()]);
+    assert!(doctor.status.success());
+    let output = String::from_utf8_lossy(&doctor.stdout);
+    assert!(output.contains("WARN binary: configured executable differs from running binary"));
+    assert!(output.contains("PASS managed block"));
+    fixture.drop_root();
+}
+
+#[test]
 fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
     let fixture = Fixture::new("doctor-repo");
     let repo = fixture.root.join("work repository");

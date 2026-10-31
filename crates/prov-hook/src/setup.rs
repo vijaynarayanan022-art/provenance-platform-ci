@@ -70,27 +70,53 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
     let config = home.join("config.toml");
     let config_exists = config.is_file();
     let contents = read_config(&config)?;
-    let binary = std::env::current_exe().map_err(|error| error.to_string())?;
+    let current_binary = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut lines = Vec::new();
     let mut failed = false;
 
-    let binary_runs = binary.is_file()
-        && Command::new(&binary)
-            .arg("codex")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .is_ok_and(|output| {
-                output.status.success() && output.stdout.is_empty() && output.stderr.is_empty()
-            });
-    check(
-        &mut lines,
-        &mut failed,
-        binary_runs,
-        "binary",
-        "executable exists and silent hook path runs",
-    );
+    let configured_binary = managed_command(&contents).map(|command| PathBuf::from(command));
+    let binary_runs = configured_binary.as_ref().is_some_and(|binary| {
+        binary.is_file()
+            && Command::new(binary)
+                .arg("codex")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && output.stdout.is_empty()
+                        && output.stderr.is_empty()
+                })
+    });
+    if let Some(binary) = configured_binary.as_ref() {
+        if binary_runs {
+            if same_file(binary, &current_binary) {
+                lines.push("PASS binary: configured executable runs silently".into());
+            } else {
+                lines.push(format!(
+                    "WARN binary: configured executable differs from running binary ({})",
+                    binary.display()
+                ));
+            }
+        } else {
+            check(
+                &mut lines,
+                &mut failed,
+                false,
+                "binary",
+                &format!("{} is missing or did not run silently", binary.display()),
+            );
+        }
+    } else {
+        check(
+            &mut lines,
+            &mut failed,
+            false,
+            "binary",
+            "managed block has no command executable",
+        );
+    }
     check(
         &mut lines,
         &mut failed,
@@ -99,7 +125,10 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
         &config.display().to_string(),
     );
 
-    let expected_block = managed_block(&binary);
+    let expected_block = configured_binary
+        .as_ref()
+        .map(|binary| managed_block(binary))
+        .unwrap_or_default();
     let block_matches = locate_block(&contents)
         .ok()
         .flatten()
@@ -214,6 +243,53 @@ fn managed_block(binary: &Path) -> String {
     block.push('\n');
     block.push_str(CLOSE_MARKER);
     block
+}
+
+fn managed_command(contents: &str) -> Option<String> {
+    let (start, end) = locate_block(contents).ok()??;
+    let block = &contents[start..end];
+    let command = block
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("command ="))?
+        .trim();
+    let value = parse_toml_string(command)?;
+    if let Some(quoted) = value.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        Some(quoted[..end].to_owned())
+    } else {
+        value.split_whitespace().next().map(str::to_owned)
+    }
+}
+
+fn parse_toml_string(value: &str) -> Option<String> {
+    if let Some(literal) = value.strip_prefix('\'') {
+        return Some(literal.strip_suffix('\'')?.to_owned());
+    }
+    let basic = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut output = String::new();
+    let mut chars = basic.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            output.push(character);
+            continue;
+        }
+        output.push(match chars.next()? {
+            '\\' => '\\',
+            '"' => '"',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            _ => return None,
+        });
+    }
+    Some(output)
+}
+
+fn same_file(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn toml_basic_string(value: &str) -> String {
