@@ -7,6 +7,18 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut command = Command::new(program);
+    command
+        .env("GIT_CONFIG_GLOBAL", null)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", null);
+    command
+}
+
 static TEST_GATE: Mutex<()> = Mutex::new(());
 
 fn test_guard() -> MutexGuard<'static, ()> {
@@ -73,7 +85,7 @@ impl Fixture {
         let payload = json!({ "hook_event_name": event, "session_id": session, "turn_id": "turn-1", "cwd": cwd,
             "model": "test-model", "tool_name": "PowerShell", "tool_use_id": tool_id,
             "tool_input": { "command": command }, "transcript_path": "IGNORE_ME", "last_assistant_message": "IGNORE_ME" });
-        let mut command = Command::new(env!("CARGO_BIN_EXE_prov-hook"));
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_prov-hook"));
         command
             .arg("codex")
             .env("PROV_HOME", home)
@@ -110,7 +122,7 @@ fn now() -> u128 {
         .as_nanos()
 }
 fn git(cwd: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = isolated_command("git")
         .args(args)
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -121,7 +133,7 @@ fn git(cwd: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 fn git_text(cwd: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = isolated_command("git")
         .args(args)
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -188,7 +200,7 @@ fn malformed_stdin_is_silent_and_successful() {
         vec![b' '; 2 * 1024 * 1024],
         br#"{"cwd":[]}"#.to_vec(),
     ] {
-        let mut child = Command::new(exe)
+        let mut child = isolated_command(exe)
             .arg("codex")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -605,7 +617,7 @@ fn unmerged_paths_are_degraded_without_using_blob_ids() {
     git(&f.repo, &["checkout", "-"]);
     fs::write(f.repo.join("tracked.txt"), "main change\n").unwrap();
     git(&f.repo, &["commit", "-am", "main"]);
-    let merge = Command::new("git")
+    let merge = isolated_command("git")
         .args(["merge", "conflict-side"])
         .current_dir(&f.repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -1063,7 +1075,7 @@ fn a_slow_scan_hits_the_process_time_cap_and_records_degraded() {
     let payload = json!({"hook_event_name":"PreToolUse", "session_id":"slow", "turn_id":"t", "cwd":f.repo,
         "tool_use_id":"slow-tool", "tool_input":{"command":"slow"}});
     let start = Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+    let mut child = isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
         .arg("codex")
         .env("PATH", path)
         .env("PROV_HOME", &f.home)

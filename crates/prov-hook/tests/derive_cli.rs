@@ -6,6 +6,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut command = Command::new(program);
+    command
+        .env("GIT_CONFIG_GLOBAL", null)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", null);
+    command
+}
+
 struct Fixture {
     root: PathBuf,
     repo: PathBuf,
@@ -43,7 +55,7 @@ impl Fixture {
             "tool_name": "PowerShell",
             "tool_input": {"command": "test command"},
         });
-        let mut command = Command::new(env!("CARGO_BIN_EXE_prov-hook"));
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_prov-hook"));
         command.arg("codex").env("PROV_HOME", &self.home);
         if auto_derive {
             command.env_remove("PROV_NO_AUTODERIVE");
@@ -86,7 +98,7 @@ impl Fixture {
     }
 
     fn cli(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+        isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
             .args(args)
             .env("PROV_HOME", &self.home)
             .output()
@@ -214,13 +226,13 @@ fn set_age(path: &Path, age: Duration) {
 }
 
 fn patch_id(repo: &Path, parent: &str, commit: &str) -> String {
-    let diff = Command::new("git")
+    let diff = isolated_command("git")
         .args(["diff-tree", "-p", "--no-renames", parent, commit])
         .current_dir(repo)
         .output()
         .unwrap();
     assert!(diff.status.success());
-    let mut child = Command::new("git")
+    let mut child = isolated_command("git")
         .args(["patch-id", "--stable"])
         .current_dir(repo)
         .stdin(Stdio::piped())
@@ -239,7 +251,7 @@ fn patch_id(repo: &Path, parent: &str, commit: &str) -> String {
 }
 
 fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = isolated_command("git")
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -255,7 +267,7 @@ fn git(repo: &Path, args: &[&str]) {
 }
 
 fn git_text(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = isolated_command("git")
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -266,7 +278,7 @@ fn git_text(repo: &Path, args: &[&str]) -> String {
 }
 
 fn git_blob(repo: &Path, bytes: &[u8]) -> String {
-    let mut child = Command::new("git")
+    let mut child = isolated_command("git")
         .args(["hash-object", "-w", "--stdin"])
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -776,7 +788,7 @@ fn show_missing_commit_fails_on_stderr() {
 #[test]
 fn unknown_and_missing_subcommands_keep_silent_hook_behavior() {
     for args in [Vec::<&str>::new(), vec!["unknownarg"]] {
-        let output = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+        let output = isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
             .args(args)
             .stdin(Stdio::null())
             .output()

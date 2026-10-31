@@ -3,7 +3,19 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut command = Command::new(program);
+    command
+        .env("GIT_CONFIG_GLOBAL", null)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", null);
+    command
+}
 
 struct Fixture {
     root: PathBuf,
@@ -30,7 +42,7 @@ impl Fixture {
 
     fn cli(&self, args: &[&str]) -> Output {
         let local_app_data = self.local_app_data();
-        Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+        isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
             .args(args)
             .env("PROV_HOME", &self.store)
             .env("LOCALAPPDATA", local_app_data)
@@ -100,7 +112,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 fn git(repo: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = isolated_command("git")
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -113,6 +125,21 @@ fn git(repo: &Path, args: &[&str]) {
         .status()
         .unwrap();
     assert!(output.success(), "git {args:?} failed");
+}
+
+#[test]
+fn isolated_git_does_not_create_notes_after_commit() {
+    let fixture = Fixture::new("no-global-git-ai");
+    let repo = fixture.root.join("isolated repository");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init"]);
+    fs::write(repo.join("tracked.txt"), b"content\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "initial"]);
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!repo.join(".git/refs/notes").exists());
+    fixture.drop_root();
 }
 
 #[test]
@@ -473,7 +500,7 @@ fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
         "cwd": repo,
         "tool_use_id": "doctor-repo-tool",
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+    let mut child = isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
         .arg("codex")
         .env("PROV_HOME", &fixture.store)
         .env("PROV_NO_AUTODERIVE", "1")
@@ -527,7 +554,7 @@ fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
         .file_name()
         .to_string_lossy()
         .into_owned();
-    let head = Command::new("git")
+    let head = isolated_command("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&repo)
         .output()
@@ -581,7 +608,7 @@ fn doctor_warns_when_repo_events_are_only_in_default_store() {
         "cwd": repo,
         "tool_use_id": "doctor-default-tool",
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
+    let mut child = isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
         .arg("codex")
         .env_remove("PROV_HOME")
         .env("LOCALAPPDATA", fixture.local_app_data())
