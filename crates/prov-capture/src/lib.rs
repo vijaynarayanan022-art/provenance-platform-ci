@@ -1,5 +1,6 @@
 pub mod commit;
 pub mod derive;
+pub mod rewrite;
 
 use fd_lock::RwLock;
 use serde::{Deserialize, Serialize};
