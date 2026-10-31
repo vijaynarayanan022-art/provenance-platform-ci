@@ -249,6 +249,69 @@ fn doctor_checks_the_managed_executable_and_warns_when_it_differs() {
 }
 
 #[test]
+fn doctor_resolves_trust_state_by_event_group_and_accepts_default_enabled() {
+    let fixture = Fixture::new("doctor-trust-groups");
+    fs::create_dir_all(&fixture.codex_home).unwrap();
+    fs::write(
+        fixture.config(),
+        "[[hooks.PreToolUse]]\n[[hooks.Stop]]\nmodel = \"unrelated\"\n",
+    )
+    .unwrap();
+    assert!(fixture
+        .cli(&["install", "--codex-home", fixture.home_arg()])
+        .status
+        .success());
+
+    let config_key = fixture.config().display().to_string();
+    let pre_key = format!("{config_key}:pre_tool_use:1:0");
+    let post_key = format!("{config_key}:post_tool_use:0:0");
+    let stop_key = format!("{config_key}:stop:1:0");
+    let state = format!(
+        "\n[hooks.state.'{pre_key}']\ntrusted_hash = \"sha256:fixture\"\n\n[hooks.state.\"{}\"]\ntrusted_hash = \"sha256:fixture\"\n\n[hooks.state.'{stop_key}']\ntrusted_hash = \"sha256:fixture\"\n",
+        post_key.replace('\\', "\\\\")
+    );
+    use std::fs::OpenOptions;
+    OpenOptions::new()
+        .append(true)
+        .open(fixture.config())
+        .unwrap()
+        .write_all(state.as_bytes())
+        .unwrap();
+
+    let doctor = fixture.cli(&["doctor", "--codex-home", fixture.home_arg()]);
+    assert!(doctor.status.success());
+    assert!(String::from_utf8_lossy(&doctor.stdout)
+        .contains("PASS hook state/trust: all three entries are trusted and not disabled"));
+    fixture.drop_root();
+}
+
+#[test]
+fn doctor_warns_when_a_hook_state_entry_is_explicitly_disabled() {
+    let fixture = Fixture::new("doctor-trust-disabled");
+    fs::create_dir_all(&fixture.codex_home).unwrap();
+    assert!(fixture
+        .cli(&["install", "--codex-home", fixture.home_arg()])
+        .status
+        .success());
+    let state = format!(
+        "\n[hooks.state.'{}:pre_tool_use:0:0']\ntrusted_hash = \"sha256:fixture\"\nenabled = false\n",
+        fixture.config().display()
+    );
+    use std::fs::OpenOptions;
+    OpenOptions::new()
+        .append(true)
+        .open(fixture.config())
+        .unwrap()
+        .write_all(state.as_bytes())
+        .unwrap();
+    let doctor = fixture.cli(&["doctor", "--codex-home", fixture.home_arg()]);
+    assert!(doctor.status.success());
+    assert!(String::from_utf8_lossy(&doctor.stdout)
+        .contains("WARN hook state/trust: open Codex and approve hooks"));
+    fixture.drop_root();
+}
+
+#[test]
 fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
     let fixture = Fixture::new("doctor-repo");
     let repo = fixture.root.join("work repository");

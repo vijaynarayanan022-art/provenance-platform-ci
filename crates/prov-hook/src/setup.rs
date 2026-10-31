@@ -6,7 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const OPEN_MARKER: &str = "# >>> prov-hook >>>";
 const CLOSE_MARKER: &str = "# <<< prov-hook <<<";
-const HOOK_SUFFIXES: [&str; 3] = ["pre_tool_use:0:0", "post_tool_use:0:0", "stop:0:0"];
+const HOOK_EVENTS: [(&str, &str); 3] = [
+    ("PreToolUse", "pre_tool_use"),
+    ("PostToolUse", "post_tool_use"),
+    ("Stop", "stop"),
+];
 
 pub struct DoctorReport {
     pub lines: Vec<String>,
@@ -152,11 +156,15 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
         );
     }
 
-    let trusted = HOOK_SUFFIXES
-        .iter()
-        .all(|suffix| trusted_state_entry(&contents, &config, suffix));
+    let marker_start = locate_block(&contents).ok().flatten().map(|(start, _)| start);
+    let trusted = marker_start.is_some_and(|start| {
+        HOOK_EVENTS.iter().all(|(event, snake)| {
+            let group_index = hook_group_index(&contents[..start], event);
+            trusted_state_entry(&contents, &config, snake, group_index)
+        })
+    });
     lines.push(if trusted {
-        "PASS hook state/trust: all three entries are enabled".into()
+        "PASS hook state/trust: all three entries are trusted and not disabled".into()
     } else {
         "WARN hook state/trust: open Codex and approve hooks".into()
     });
@@ -468,33 +476,43 @@ fn check(lines: &mut Vec<String>, failed: &mut bool, passed: bool, name: &str, d
     lines.push(format!("{status} {name}: {detail}"));
 }
 
-fn trusted_state_entry(contents: &str, config_path: &Path, suffix: &str) -> bool {
-    let expected = format!("{}:{suffix}", config_path.display());
-    let mut in_section = false;
+fn hook_group_index(before_block: &str, event: &str) -> usize {
+    let table = format!("[[hooks.{event}]]");
+    before_block
+        .lines()
+        .filter(|line| line.trim() == table)
+        .count()
+}
+
+fn trusted_state_entry(contents: &str, config_path: &Path, snake_event: &str, group: usize) -> bool {
+    let key = format!("{}:{snake_event}:{group}:0", config_path.display());
+    let literal_header = format!("[hooks.state.'{key}']");
+    let basic_header = format!("[hooks.state.{}]", toml_basic_string(&key));
+    let lines: Vec<_> = contents.lines().collect();
+    let Some(start) = lines
+        .iter()
+        .position(|line| matches!(line.trim(), value if value == literal_header || value == basic_header))
+    else {
+        return false;
+    };
+    let body = lines[start + 1..]
+        .iter()
+        .take_while(|line| !line.trim_start().starts_with('['));
     let mut has_hash = false;
-    let mut enabled = false;
-    for line in contents.lines() {
+    let mut disabled = false;
+    for line in body {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            if in_section {
-                break;
-            }
-            in_section = trimmed.starts_with("[hooks.state.") && trimmed.contains(&expected);
-            continue;
-        }
-        if in_section {
-            if let Some(value) = trimmed
-                .strip_prefix("trusted_hash")
-                .and_then(|v| v.trim().strip_prefix('='))
-            {
-                let value = value.trim().trim_matches('"');
-                has_hash = value.starts_with("sha256:") && value.len() > "sha256:".len();
-            } else if trimmed == "enabled = true" {
-                enabled = true;
-            }
+        if let Some(value) = trimmed
+            .strip_prefix("trusted_hash")
+            .and_then(|value| value.trim().strip_prefix('='))
+        {
+            let value = value.trim().trim_matches('"');
+            has_hash = !value.is_empty();
+        } else if trimmed == "enabled = false" {
+            disabled = true;
         }
     }
-    has_hash && enabled
+    has_hash && !disabled
 }
 
 fn store_home() -> PathBuf {
