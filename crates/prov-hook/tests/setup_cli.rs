@@ -127,6 +127,8 @@ fn install_creates_missing_config_and_is_idempotent() {
     let first = fs::read(fixture.config()).unwrap();
     assert_eq!(backups(&fixture.config()).len(), 1);
     assert!(fs::read(&backups(&fixture.config())[0]).unwrap().is_empty());
+    let text = String::from_utf8(first.clone()).unwrap();
+    assert!(text.contains("command = '") && text.contains(" codex'"));
 
     let repeated = fixture.cli(&["install", "--codex-home", fixture.home_arg()]);
     assert!(repeated.status.success());
@@ -154,6 +156,8 @@ fn install_preserves_unrelated_config_and_quotes_spaced_windows_binary() {
         binary.to_str().unwrap(),
     ]);
     assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout)
+        .contains("WARNING: executable path contains spaces; verify with doctor and a real Codex session."));
     let installed = fs::read_to_string(fixture.config()).unwrap();
     assert!(installed.starts_with(original));
     assert!(installed.contains(r#"Program Files\\prov hook.exe\" codex"#));

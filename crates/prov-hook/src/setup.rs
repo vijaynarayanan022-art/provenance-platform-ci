@@ -41,24 +41,29 @@ pub fn install(
     };
     let block = managed_block(&binary, block_features, metadata.as_deref());
     let updated = install_block(&feature_text, &block)?;
+    let warning = if binary.to_string_lossy().chars().any(char::is_whitespace) {
+        "WARNING: executable path contains spaces; verify with doctor and a real Codex session.\n"
+    } else {
+        ""
+    };
     let note = if enable_hooks_feature || feature_enabled(&updated) {
         String::new()
     } else {
         "NOTE: Codex hooks are not enabled; rerun with --enable-hooks-feature.\n".into()
     };
     if updated == original {
-        return Ok(note + &if dry_run {
+        return Ok(warning.to_owned() + &note + &if dry_run {
             "No changes.\n".into()
         } else {
             format!("Already installed in {}\n", config.display())
         });
     }
     if dry_run {
-        return Ok(unified_diff(&config, &original, &updated) + &note);
+        return Ok(warning.to_owned() + &unified_diff(&config, &original, &updated) + &note);
     }
     backup_config(&config, &original)?;
     write_config(&config, &updated)?;
-    Ok(note + &format!(
+    Ok(warning.to_owned() + &note + &format!(
         "Installed prov-hook hooks in {}\n",
         config.display()
     ))
@@ -271,8 +276,12 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn managed_block(binary: &Path, features: bool, metadata: Option<&str>) -> String {
-    let command = format!("\"{}\" codex", binary.to_string_lossy());
-    let command = toml_basic_string(&command);
+    let path = binary.to_string_lossy();
+    let command = if !path.chars().any(char::is_whitespace) && !path.contains('\'') {
+        format!("'{path} codex'")
+    } else {
+        toml_basic_string(&format!("\"{path}\" codex"))
+    };
     let mut block = String::from(OPEN_MARKER);
     if features {
         block.push_str("\n\n[features]\nhooks = true # prov-hook");
