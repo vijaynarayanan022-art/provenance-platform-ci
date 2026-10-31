@@ -220,6 +220,39 @@ fn human_edit_after_ai_snapshot_is_mixed() {
 }
 
 #[test]
+fn range_derivation_does_not_carry_stale_parent_events() {
+    let fixture = Fixture::new("stale-events");
+    let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+
+    fixture.hook("PreToolUse", "first-ai");
+    fs::write(fixture.repo.join("tracked.txt"), b"one\nfirst AI\n").unwrap();
+    fixture.hook("PostToolUse", "first-ai");
+    let first = fixture.commit("first AI edit");
+
+    fixture.hook("PreToolUse", "second-ai");
+    fs::write(fixture.repo.join("tracked.txt"), b"one\nfirst AI\nsecond AI\n").unwrap();
+    fixture.hook("PostToolUse", "second-ai");
+    let second = fixture.commit("second AI edit");
+
+    let range = format!("{base}..{second}");
+    let result = fixture.cli(&[
+        "derive",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--range",
+        &range,
+    ]);
+    assert!(result.status.success());
+    let value = fixture.derived_value(&second);
+    let tracked = file(&value, "tracked.txt");
+    assert_eq!(tracked["e"], 1);
+    assert_eq!(tracked["ai_strong"], 1);
+    assert_eq!(tracked["evidence"], "exact");
+    assert!(fixture.derived_path(&first).exists());
+    fixture.drop_root();
+}
+
+#[test]
 fn commit_inside_ai_window_is_reconstructed_as_probable() {
     let fixture = Fixture::new("reconstructed");
     fixture.hook("PreToolUse", "commit-tool");

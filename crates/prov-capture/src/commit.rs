@@ -1,6 +1,6 @@
 use crate::derive::{self, Evidence, Step, StepKind};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -87,6 +87,26 @@ struct EventRecord {
 
 pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String> {
     let (repo, repo_id, store) = repo_context(repo_path)?;
+    let events = read_events(&store.join("events"));
+    let event_index = index_events(&events);
+    derive_commit_with_events(
+        &repo,
+        &repo_id,
+        &store,
+        revision,
+        &events,
+        &event_index,
+    )
+}
+
+fn derive_commit_with_events(
+    repo: &crate::RepoInfo,
+    repo_id: &str,
+    store: &Path,
+    revision: &str,
+    event_records: &[EventRecord],
+    event_index: &HashMap<String, Vec<usize>>,
+) -> Result<PathBuf, String> {
     let commit = resolve_commit(&repo.root, revision)?;
     let parent_line = git_checked(&repo.root, &["rev-list", "--parents", "-n", "1", &commit])?;
     let commits: Vec<_> = parent_line.split_whitespace().collect();
@@ -136,7 +156,6 @@ pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String
         })
         .unwrap_or_default();
     let contents = crate::cat_blobs(&repo.root, &available_ids);
-    let event_records = read_events(&store.join("events"));
     let head_moves = event_records
         .iter()
         .filter(|event| {
@@ -225,8 +244,13 @@ pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String
             continue;
         }
 
-        let selected_events =
-            events_for_path(&event_records, &file.path, parent_time, &parent_content);
+        let selected_events = events_for_path(
+            event_records,
+            event_index,
+            &file.path,
+            parent_time,
+            &parent_content,
+        );
         let (mut steps, mut evidence) =
             steps_for_events(&store, &selected_events, &committed_content, commit_time);
         if evidence == "missing_blob" {
@@ -285,7 +309,7 @@ pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String
     let coverage = coverage_band(covered, totals.e);
     let bytes = serde_json::to_vec(&CommitOutput {
         schema: "prov.commit/0.1",
-        repo_id,
+        repo_id: repo_id.to_owned(),
         commit: commit.clone(),
         parent,
         totals,
@@ -303,14 +327,23 @@ pub fn derive_range(repo_path: &Path, range: &str) -> Result<Vec<PathBuf>, Strin
     if !range.contains("..") {
         return Err("range must use A..B syntax".into());
     }
-    let (repo, _, _) = repo_context(repo_path)?;
+    let (repo, repo_id, store) = repo_context(repo_path)?;
+    let events = read_events(&store.join("events"));
+    let event_index = index_events(&events);
     let commits = git_checked(
         &repo.root,
         &["rev-list", "--reverse", "--end-of-options", range],
     )?;
     let mut paths = Vec::new();
     for commit in commits.lines().filter(|line| !line.is_empty()) {
-        paths.push(derive_commit(&repo.root, commit)?);
+        paths.push(derive_commit_with_events(
+            &repo,
+            &repo_id,
+            &store,
+            commit,
+            &events,
+            &event_index,
+        )?);
     }
     if paths.is_empty() {
         return Err("range contains no commits".into());
@@ -523,23 +556,35 @@ fn read_events(events_dir: &Path) -> Vec<EventRecord> {
     events
 }
 
+fn index_events(events: &[EventRecord]) -> HashMap<String, Vec<usize>> {
+    let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (event_index, event) in events.iter().enumerate() {
+        if matches!(
+            event.event.as_str(),
+            "ai_change" | "external_change" | "deletion"
+        ) {
+            if let Some(path) = &event.path {
+                index.entry(path.clone()).or_default().push(event_index);
+            }
+        }
+    }
+    index
+}
+
 fn events_for_path<'a>(
     events: &'a [EventRecord],
+    event_index: &HashMap<String, Vec<usize>>,
     path: &str,
     parent_time: u128,
     parent_content: &[u8],
 ) -> Vec<&'a EventRecord> {
     let parent_sha = crate::hash(parent_content);
-    let mut matched: Vec<_> = events
-        .iter()
-        .filter(|event| {
-            event.path.as_deref() == Some(path)
-                && matches!(
-                    event.event.as_str(),
-                    "ai_change" | "external_change" | "deletion"
-                )
-                && event.timestamp > parent_time
-        })
+    let mut matched: Vec<_> = event_index
+        .get(path)
+        .into_iter()
+        .flatten()
+        .map(|&index| &events[index])
+        .filter(|event| event.timestamp > parent_time)
         .collect();
     if let Some(latest_parent) = matched
         .iter()
