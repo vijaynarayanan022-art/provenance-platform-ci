@@ -56,6 +56,7 @@ struct CommitFile {
     path: String,
     old_blob: Option<String>,
     new_blob: String,
+    added_lines: usize,
 }
 
 #[derive(Clone, Deserialize)]
@@ -129,7 +130,7 @@ pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String
         .as_ref()
         .map(|sizes| {
             ids.iter()
-                .filter(|id| sizes.contains_key(*id))
+                .filter(|id| sizes.get(*id).is_some_and(|size| *size <= MAX_FILE))
                 .cloned()
                 .collect()
         })
@@ -161,6 +162,16 @@ pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String
             .as_ref()
             .and_then(|map| map.get(&file.new_blob))
             .copied();
+        if old_size.is_some_and(|size| size > MAX_FILE)
+            || new_size.is_some_and(|size| size > MAX_FILE)
+        {
+            output_files.push(skipped_file_added(
+                file.path,
+                file.added_lines,
+                "skipped_large",
+            ));
+            continue;
+        }
         let parent_content = if file.old_blob.is_none() {
             Some(Vec::new())
         } else {
@@ -177,18 +188,7 @@ pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String
             continue;
         };
         let Some(committed_content) = committed_content else {
-            let evidence = if new_size.is_some_and(|size| size > MAX_FILE)
-                || old_size.is_some_and(|size| size > MAX_FILE)
-            {
-                "skipped_large"
-            } else {
-                "missing_blob"
-            };
-            if evidence == "missing_blob" {
-                output_files.push(unknown_file(file.path, evidence, 0));
-            } else {
-                output_files.push(skipped_file(file.path, &parent_content, &[], evidence));
-            }
+            output_files.push(unknown_file(file.path, "missing_blob", 0));
             continue;
         };
 
@@ -377,6 +377,7 @@ fn commit_files(
     parent: Option<&str>,
     commit: &str,
 ) -> Result<Vec<CommitFile>, String> {
+    let additions = numstat_additions(root, parent, commit)?;
     let output = if let Some(parent) = parent {
         git_output(
             root,
@@ -432,9 +433,59 @@ fn commit_files(
             path: String::from_utf8_lossy(path).replace('\\', "/"),
             old_blob,
             new_blob: new_id,
+            added_lines: additions
+                .get(&String::from_utf8_lossy(path).replace('\\', "/"))
+                .copied()
+                .unwrap_or_default(),
         });
     }
     Ok(files)
+}
+
+fn numstat_additions(
+    root: &Path,
+    parent: Option<&str>,
+    commit: &str,
+) -> Result<std::collections::HashMap<String, usize>, String> {
+    let args = if let Some(parent) = parent {
+        vec![
+            "diff-tree",
+            "-r",
+            "--no-renames",
+            "-z",
+            "--numstat",
+            "--no-commit-id",
+            parent,
+            commit,
+        ]
+    } else {
+        vec![
+            "diff-tree",
+            "--root",
+            "-r",
+            "--no-renames",
+            "-z",
+            "--numstat",
+            "--no-commit-id",
+            commit,
+        ]
+    };
+    let output = git_output(root, &args)?;
+    if !output.status.success() {
+        return Err("git diff-tree --numstat failed".into());
+    }
+    let mut additions = std::collections::HashMap::new();
+    for record in output.stdout.split(|byte| *byte == 0).filter(|item| !item.is_empty()) {
+        let fields: Vec<_> = record.splitn(3, |byte| *byte == b'\t').collect();
+        if fields.len() != 3 || fields[0] == b"-" {
+            continue;
+        }
+        let Ok(count) = std::str::from_utf8(fields[0]).unwrap_or_default().parse() else {
+            continue;
+        };
+        additions.insert(String::from_utf8_lossy(fields[2]).replace('\\', "/"), count);
+    }
+    Ok(additions)
 }
 
 fn read_events(events_dir: &Path) -> Vec<EventRecord> {
@@ -582,6 +633,19 @@ fn skipped_file(
         mixed: 0,
         unknown: 0,
         excluded: added_nonblank(parent, committed),
+        evidence,
+    }
+}
+
+fn skipped_file_added(path: String, added_lines: usize, evidence: &'static str) -> FileOutput {
+    FileOutput {
+        path,
+        e: 0,
+        ai_strong: 0,
+        ai_probable: 0,
+        mixed: 0,
+        unknown: 0,
+        excluded: added_lines,
         evidence,
     }
 }
