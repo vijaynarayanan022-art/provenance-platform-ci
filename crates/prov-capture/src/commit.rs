@@ -35,6 +35,7 @@ struct Totals {
     mixed: usize,
     unknown: usize,
     excluded: usize,
+    unreadable_files: usize,
     ai_deterministic_pct: Option<f64>,
     ai_linked_pct: Option<f64>,
 }
@@ -171,6 +172,7 @@ fn derive_commit_with_events(
         .collect();
 
     let mut output_files = Vec::with_capacity(files.len());
+    let mut unreadable_files = 0;
     for file in files {
         let old_size = file
             .old_blob
@@ -203,10 +205,12 @@ fn derive_commit_with_events(
             .and_then(|map| map.get(&file.new_blob).cloned());
 
         let Some(parent_content) = parent_content else {
+            unreadable_files += 1;
             output_files.push(unknown_file(file.path, "missing_blob", 0));
             continue;
         };
         let Some(committed_content) = committed_content else {
+            unreadable_files += 1;
             output_files.push(unknown_file(file.path, "missing_blob", 0));
             continue;
         };
@@ -254,6 +258,7 @@ fn derive_commit_with_events(
         let (mut steps, mut evidence) =
             steps_for_events(&store, &selected_events, &committed_content, commit_time);
         if evidence == "missing_blob" {
+            unreadable_files += 1;
             output_files.push(unknown_file(file.path, evidence, added_count));
             continue;
         }
@@ -301,6 +306,7 @@ fn derive_commit_with_events(
             covered += file.e;
         }
     }
+    totals.unreadable_files = unreadable_files;
     totals.ai_deterministic_pct = percentage_tenths(totals.ai_direct + totals.ai_strong, totals.e);
     totals.ai_linked_pct = percentage_tenths(
         totals.ai_direct + totals.ai_strong + totals.ai_probable + totals.mixed,
@@ -456,6 +462,12 @@ fn commit_files(
         if fields.len() < 5 || fields[4].first() == Some(&b'D') {
             continue;
         }
+        let old_mode = fields[0].strip_prefix(b":").unwrap_or(fields[0]);
+        if matches!(old_mode, b"120000" | b"160000")
+            || matches!(fields[1], b"120000" | b"160000")
+        {
+            continue;
+        }
         let old_id = String::from_utf8_lossy(fields[2]).into_owned();
         let new_id = String::from_utf8_lossy(fields[3]).into_owned();
         let old_blob = (!old_id.bytes().all(|byte| byte == b'0')).then_some(old_id);
@@ -505,7 +517,7 @@ fn numstat_additions(
     };
     let output = git_output(root, &args)?;
     if !output.status.success() {
-        return Err("git diff-tree --numstat failed".into());
+        return Ok(std::collections::HashMap::new());
     }
     let mut additions = std::collections::HashMap::new();
     for record in output.stdout.split(|byte| *byte == 0).filter(|item| !item.is_empty()) {
@@ -629,6 +641,9 @@ fn steps_for_events(
             Vec::new()
         } else {
             let sha = event.after_sha.as_deref().unwrap_or_default();
+            if !is_sha256(sha) {
+                return (Vec::new(), "missing_blob");
+            }
             let Some(bytes) = crate::read_blob(&store.join("blobs").join(sha), sha) else {
                 return (Vec::new(), "missing_blob");
             };
@@ -653,6 +668,10 @@ fn steps_for_events(
         steps.push(Step { kind, after });
     }
     (steps, evidence)
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn added_nonblank(parent: &[u8], committed: &[u8]) -> usize {

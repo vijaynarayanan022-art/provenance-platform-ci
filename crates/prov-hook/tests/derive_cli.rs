@@ -134,6 +134,22 @@ fn git_text(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+fn git_blob(repo: &Path, bytes: &[u8]) -> String {
+    let mut child = Command::new("git")
+        .args(["hash-object", "-w", "--stdin"])
+        .current_dir(repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 fn derive(fixture: &Fixture, commit: &str) -> Output {
     fixture.cli(&[
         "derive",
@@ -382,6 +398,67 @@ fn missing_events_and_missing_snapshot_blobs_are_unknown() {
 }
 
 #[test]
+fn unreadable_parent_and_invalid_event_hashes_are_counted_safely() {
+    let parent_missing = Fixture::new("missing-parent-blob");
+    let parent_blob = git_text(&parent_missing.repo, &["rev-parse", "HEAD:tracked.txt"]);
+    fs::write(
+        parent_missing.repo.join("tracked.txt"),
+        b"one\nchanged\n",
+    )
+    .unwrap();
+    let commit = parent_missing.commit("parent blob unavailable");
+    let object = parent_missing
+        .repo
+        .join(".git/objects")
+        .join(&parent_blob[..2])
+        .join(&parent_blob[2..]);
+    fs::remove_file(object).unwrap();
+    assert!(derive(&parent_missing, &commit).status.success());
+    let value = parent_missing.derived_value(&commit);
+    assert_eq!(file(&value, "tracked.txt")["evidence"], "missing_blob");
+    assert_eq!(file(&value, "tracked.txt")["e"], 0);
+    assert_eq!(value["totals"]["unreadable_files"], 1);
+    parent_missing.drop_root();
+
+    let malformed = Fixture::new("invalid-event-hash");
+    malformed.hook("PreToolUse", "ai-tool");
+    fs::write(malformed.repo.join("tracked.txt"), b"one\nai line\n").unwrap();
+    malformed.hook("PostToolUse", "ai-tool");
+    let event_path = fs::read_dir(
+        malformed
+            .home
+            .join("repos")
+            .join(malformed.repo_id())
+            .join("events"),
+    )
+    .unwrap()
+    .next()
+    .unwrap()
+    .unwrap()
+    .path();
+    let mut output = Vec::new();
+    for line in fs::read(&event_path).unwrap().split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut value: Value = serde_json::from_slice(line).unwrap();
+        if value["event"] == "ai_change" && value["path"] == "tracked.txt" {
+            value["after_sha"] = "../../outside".into();
+        }
+        serde_json::to_writer(&mut output, &value).unwrap();
+        output.push(b'\n');
+    }
+    fs::write(event_path, output).unwrap();
+    let commit = malformed.commit("bad event hash");
+    assert!(derive(&malformed, &commit).status.success());
+    let value = malformed.derived_value(&commit);
+    assert_eq!(file(&value, "tracked.txt")["evidence"], "missing_blob");
+    assert_eq!(file(&value, "tracked.txt")["unknown"], 1);
+    assert_eq!(value["totals"]["unreadable_files"], 1);
+    malformed.drop_root();
+}
+
+#[test]
 fn skipped_binary_secret_deleted_and_renamed_paths_are_safe() {
     let fixture = Fixture::new("skipped-paths");
     fs::write(fixture.repo.join("credentials.txt"), b"new secret\n").unwrap();
@@ -411,6 +488,24 @@ fn skipped_binary_secret_deleted_and_renamed_paths_are_safe() {
         .iter()
         .all(|entry| entry["path"] != "to-delete.txt"));
     assert_eq!(file(&value, "renamed.txt")["unknown"], 2);
+    fixture.drop_root();
+}
+
+#[test]
+fn symlinks_are_not_counted_as_added_text() {
+    let fixture = Fixture::new("symlink");
+    let target = git_blob(&fixture.repo, b"tracked.txt");
+    let cacheinfo = format!("120000,{target},link.txt");
+    git(&fixture.repo, &["update-index", "--add", "--cacheinfo", &cacheinfo]);
+    git(&fixture.repo, &["commit", "-m", "add symlink"]);
+    let commit = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    assert!(derive(&fixture, &commit).status.success());
+    let value = fixture.derived_value(&commit);
+    assert!(value["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["path"] != "link.txt"));
     fixture.drop_root();
 }
 
