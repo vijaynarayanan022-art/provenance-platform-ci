@@ -267,6 +267,25 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
                         .map(|timestamp| format!("{timestamp} Unix ns"))
                         .unwrap_or_else(|| "none".into())
                 ));
+                match prov_capture::commit::pending_status_at(
+                    repo,
+                    &store.join("repos").join(&repo_id),
+                ) {
+                    Ok((pending, oldest)) => {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|duration| duration.as_nanos())
+                            .unwrap_or_default();
+                        let stale = oldest.is_some_and(|timestamp| {
+                            now.saturating_sub(timestamp) > 300 * 1_000_000_000
+                        });
+                        let status = if pending > 0 && stale { "WARN" } else { "PASS" };
+                        lines.push(format!(
+                            "{status} pending commits: {pending} not yet derived"
+                        ));
+                    }
+                    Err(_) => lines.push("WARN pending commits: unable to inspect".into()),
+                }
             }
             Err(error) => check(&mut lines, &mut failed, false, "repo identity", &error),
         }

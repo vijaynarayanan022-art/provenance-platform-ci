@@ -476,6 +476,7 @@ fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_prov-hook"))
         .arg("codex")
         .env("PROV_HOME", &fixture.store)
+        .env("PROV_NO_AUTODERIVE", "1")
         .env("LOCALAPPDATA", fixture.local_app_data())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -515,7 +516,52 @@ fn doctor_reports_repo_identity_events_and_last_event_without_writing() {
     assert!(output.contains("PASS repo identity:"));
     assert!(output.contains("PASS repo events: 1 event log(s) found"));
     assert!(output.contains("PASS last event time:"));
+    assert!(output.contains("PASS pending commits: 0 not yet derived"));
     assert_eq!(snapshot(&fixture.root), before);
+
+    let repo_id = fs::read_dir(fixture.store.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .into_owned();
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+    let old_timestamp = now().saturating_sub(6 * 60 * 1_000_000_000);
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(
+                fixture
+                    .store
+                    .join("repos")
+                    .join(repo_id)
+                    .join("events")
+                    .join("doctor-repo-session.jsonl"),
+            )
+            .unwrap(),
+        "{}",
+        serde_json::json!({"event":"head_move", "timestamp":old_timestamp, "new_head":head})
+    )
+    .unwrap();
+    let before_pending_doctor = snapshot(&fixture.root);
+    let pending_doctor = fixture.cli(&[
+        "doctor",
+        "--codex-home",
+        fixture.home_arg(),
+        "--repo",
+        repo.to_str().unwrap(),
+    ]);
+    assert!(pending_doctor.status.success());
+    assert!(String::from_utf8_lossy(&pending_doctor.stdout)
+        .contains("WARN pending commits: 1 not yet derived"));
+    assert_eq!(snapshot(&fixture.root), before_pending_doctor);
     fixture.drop_root();
 }
 

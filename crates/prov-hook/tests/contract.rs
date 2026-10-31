@@ -74,7 +74,10 @@ impl Fixture {
             "model": "test-model", "tool_name": "PowerShell", "tool_use_id": tool_id,
             "tool_input": { "command": command }, "transcript_path": "IGNORE_ME", "last_assistant_message": "IGNORE_ME" });
         let mut command = Command::new(env!("CARGO_BIN_EXE_prov-hook"));
-        command.arg("codex").env("PROV_HOME", home);
+        command
+            .arg("codex")
+            .env("PROV_HOME", home)
+            .env("PROV_NO_AUTODERIVE", "1");
         if let Some(path) = path {
             command.env("PATH", path);
         }
@@ -166,6 +169,7 @@ fn hook_in_process(
     tool_id: &str,
 ) -> prov_capture::TimingSnapshot {
     std::env::set_var("PROV_HOME", &f.home);
+    std::env::set_var("PROV_NO_AUTODERIVE", "1");
     let payload = json!({"hook_event_name":event,"session_id":session,"turn_id":"turn-1","cwd":f.repo,
         "model":"test-model","tool_name":"PowerShell","tool_use_id":tool_id,"tool_input":{"command":"test command"}});
     prov_capture::process_json_timed(payload.to_string().as_bytes())

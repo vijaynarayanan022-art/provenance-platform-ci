@@ -11,15 +11,23 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("codex") => run_codex(),
-        Some("derive") => match derive_command(args) {
-            Ok(commits) => {
-                for commit in commits {
-                    println!("derived {commit}");
-                }
+        Some("derive") => {
+            let args: Vec<_> = args.collect();
+            if args.iter().any(|argument| argument == "--pending") {
+                let _ = panic::catch_unwind(|| derive_pending_command(&args));
                 ExitCode::SUCCESS
+            } else {
+                match derive_command(args.into_iter()) {
+                    Ok(commits) => {
+                        for commit in commits {
+                            println!("derived {commit}");
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => cli_error(error),
+                }
             }
-            Err(error) => cli_error(error),
-        },
+        }
         Some("show") => match show_command(args) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => cli_error(error),
@@ -98,6 +106,24 @@ fn derive_command(args: impl Iterator<Item = String>) -> Result<Vec<String>, Str
                 .map(str::to_owned)
         })
         .collect())
+}
+
+fn derive_pending_command(args: &[String]) {
+    let mut repo = std::env::current_dir().unwrap_or_default();
+    let mut args = args.iter();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--pending" => {}
+            "--repo" => {
+                let Some(path) = args.next() else {
+                    return;
+                };
+                repo = PathBuf::from(path);
+            }
+            _ => return,
+        }
+    }
+    let _ = prov_capture::commit::derive_pending(&repo);
 }
 
 fn show_command(args: impl Iterator<Item = String>) -> Result<(), String> {

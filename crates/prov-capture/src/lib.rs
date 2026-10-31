@@ -643,7 +643,9 @@ pub fn process_json(input: &[u8]) {
                 e.commit_in_window = Some(summary.commit_in_window);
                 e.head_moved = Some(true);
                 e.degraded = Some(true);
-                append_line(&event_path, &e);
+                if append_line(&event_path, &e) {
+                    trigger_auto_derive(&repo.root);
+                }
             }
             let mut e = Event::new(
                 "window_close",
@@ -1751,10 +1753,10 @@ fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
         Err(e) => Err(e),
     }
 }
-fn append_line(path: &Path, event: &Event) {
-    append_events(path, std::slice::from_ref(event));
+fn append_line(path: &Path, event: &Event) -> bool {
+    append_events(path, std::slice::from_ref(event))
 }
-fn append_events(path: &Path, events: &[Event]) {
+fn append_events(path: &Path, events: &[Event]) -> bool {
     let start = Instant::now();
     let mut bytes = Vec::new();
     for event in events {
@@ -1766,11 +1768,11 @@ fn append_events(path: &Path, events: &[Event]) {
     }
     if bytes.is_empty() {
         add_ns(&TIMINGS.log_work_ns, start.elapsed());
-        return;
+        return false;
     }
     if let Some(parent) = path.parent() {
         if ensure_private_dir(parent).is_err() {
-            return;
+            return false;
         }
     }
     let Ok(mut f) = OpenOptions::new()
@@ -1779,7 +1781,7 @@ fn append_events(path: &Path, events: &[Event]) {
         .append(true)
         .open(path)
     else {
-        return;
+        return false;
     };
     let mut last = [0];
     let torn = f
@@ -1788,11 +1790,44 @@ fn append_events(path: &Path, events: &[Event]) {
         .and_then(|_| f.read_exact(&mut last).ok())
         .is_some()
         && last[0] != b'\n';
-    if torn {
-        let _ = f.write_all(b"\n");
+    if torn && f.write_all(b"\n").is_err() {
+        add_ns(&TIMINGS.log_work_ns, start.elapsed());
+        return false;
     }
-    let _ = f.write_all(&bytes);
+    let written = f.write_all(&bytes).is_ok();
     add_ns(&TIMINGS.log_work_ns, start.elapsed());
+    written
+}
+
+fn trigger_auto_derive(repo_root: &Path) {
+    if std::env::var_os("PROV_NO_AUTODERIVE").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    spawn_pending_derive(&executable, repo_root);
+}
+
+fn spawn_pending_derive(executable: &Path, repo_root: &Path) {
+    let mut command = Command::new(executable);
+    command
+        .args(["derive", "--pending", "--repo"])
+        .arg(repo_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0000_0008 | 0x0800_0000);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let _ = command.spawn();
 }
 #[cfg(test)]
 fn complete_line_count(data: &[u8]) -> usize {
@@ -2053,6 +2088,16 @@ mod tests {
         assert!(pending_external_flag(&mut state, false));
         assert!(!state.scan_incomplete_pending);
         assert!(!pending_external_flag(&mut state, false));
+    }
+
+    #[test]
+    fn missing_auto_derive_target_is_ignored_within_watchdog_budget() {
+        let started = Instant::now();
+        let missing = std::env::temp_dir()
+            .join(format!("prov-missing-derive-{}", std::process::id()))
+            .join("prov-hook");
+        spawn_pending_derive(&missing, Path::new("."));
+        assert!(started.elapsed() < Duration::from_millis(1400));
     }
 
     #[cfg(windows)]
