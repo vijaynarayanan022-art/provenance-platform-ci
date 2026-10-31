@@ -205,6 +205,25 @@ fn uninstall_removes_only_the_marked_block_and_backs_up_first() {
 }
 
 #[test]
+fn install_refuses_conflicting_hook_syntax_without_changes() {
+    for (name, conflict) in [
+        ("event-assignment", "[hooks]\nPreToolUse = []\n"),
+        ("inline-table", "[other]\nhooks = { Stop = [] }\n"),
+    ] {
+        let fixture = Fixture::new(name);
+        fs::create_dir_all(&fixture.codex_home).unwrap();
+        fs::write(fixture.config(), conflict).unwrap();
+        let result = fixture.cli(&["install", "--codex-home", fixture.home_arg()]);
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("refusing to install"));
+        assert_eq!(fs::read(fixture.config()).unwrap(), conflict.as_bytes());
+        assert!(backups(&fixture.config()).is_empty());
+        fixture.drop_root();
+    }
+}
+
+#[test]
 fn feature_opt_in_creates_inside_block_or_reversibly_edits_existing_table() {
     let no_table = Fixture::new("feature-create");
     let without_flag = no_table.cli(&["install", "--codex-home", no_table.home_arg()]);

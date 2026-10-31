@@ -28,6 +28,7 @@ pub fn install(
     let home = resolve_home(codex_home)?;
     let config = home.join("config.toml");
     let original = read_config(&config)?;
+    refuse_conflicting_hooks(&original)?;
     let binary = binary_path(binary)?;
     let existing_metadata = feature_metadata(&original);
     let (feature_text, block_features, metadata) = if enable_hooks_feature {
@@ -67,6 +68,27 @@ pub fn install(
         "Installed prov-hook hooks in {}\n",
         config.display()
     ))
+}
+
+fn refuse_conflicting_hooks(contents: &str) -> Result<(), String> {
+    for (line_number, line) in contents.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let event_assignment = ["PreToolUse", "PostToolUse", "Stop"].iter().any(|event| {
+            trimmed
+                .strip_prefix(event)
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        });
+        let inline_hooks = line.split_once('=').is_some_and(|(key, value)| {
+            key.trim() == "hooks" && value.trim_start().starts_with('{')
+        });
+        if event_assignment || inline_hooks {
+            return Err(format!(
+                "refusing to install: conflicting hook syntax on config.toml line {}",
+                line_number + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn uninstall(codex_home: Option<&Path>, dry_run: bool) -> Result<String, String> {
