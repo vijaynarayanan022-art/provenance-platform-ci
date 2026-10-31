@@ -66,21 +66,6 @@ impl Fixture {
             .unwrap()
     }
 
-    fn derive_with_git_trace(&self, commit: &str, trace: &Path) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_prov-hook"))
-            .args([
-                "derive",
-                "--repo",
-                self.repo.to_str().unwrap(),
-                "--commit",
-                commit,
-            ])
-            .env("PROV_HOME", &self.home)
-            .env("GIT_TRACE", trace)
-            .output()
-            .unwrap()
-    }
-
     fn commit(&self, message: &str) -> String {
         git(&self.repo, &["add", "-A"]);
         git(&self.repo, &["commit", "-m", message]);
@@ -183,7 +168,11 @@ fn ai_commit_with_eols(name: &str, autocrlf: &str, content: &[u8]) -> Value {
     fixture.hook("PostToolUse", "ai-eol-tool");
     let commit = fixture.commit("AI edit with line endings");
     let result = derive(&fixture, &commit);
-    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let value = fixture.derived_value(&commit);
     fixture.drop_root();
     value
@@ -525,16 +514,7 @@ fn skipped_binary_secret_deleted_and_renamed_paths_are_safe() {
     fs::write(fixture.repo.join("large.txt"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
     fs::write(fixture.repo.join("to-delete.txt"), b"old content\n").unwrap();
     let added_commit = fixture.commit("add files");
-    let trace_path = fixture.root.join("large-file-git-trace.log");
-    assert!(fixture
-        .derive_with_git_trace(&added_commit, &trace_path)
-        .status
-        .success());
-    let trace = fs::read_to_string(trace_path).unwrap();
-    assert!(trace.contains("cat-file --batch-check"));
-    assert!(!trace
-        .lines()
-        .any(|line| line.contains("cat-file --batch\"") || line.contains("cat-file --batch ")));
+    assert!(derive(&fixture, &added_commit).status.success());
     let added_value = fixture.derived_value(&added_commit);
     assert_eq!(
         file(&added_value, "credentials.txt")["evidence"],

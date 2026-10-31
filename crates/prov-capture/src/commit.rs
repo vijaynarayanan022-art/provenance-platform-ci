@@ -1,6 +1,6 @@
 use crate::derive::{self, Evidence, Step, StepKind};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -140,14 +140,9 @@ fn derive_commit_with_events(
     }
     let ids: Vec<_> = blob_ids.into_iter().collect();
     let sizes = crate::check_blob_sizes(&repo.root, &ids);
-    let available_ids: Vec<_> = sizes
+    let available_ids = sizes
         .as_ref()
-        .map(|sizes| {
-            ids.iter()
-                .filter(|id| sizes.get(*id).is_some_and(|size| *size <= MAX_FILE))
-                .cloned()
-                .collect()
-        })
+        .map(|sizes| readable_blob_ids(sizes, &ids))
         .unwrap_or_default();
     let contents = crate::cat_blobs(&repo.root, &available_ids);
     let head_moves = event_records
@@ -260,7 +255,8 @@ fn derive_commit_with_events(
         }
 
         if (reconstruct_all || reconstruct_paths.contains(file.path.as_str()))
-            && steps.last().map(|step| step.after.as_slice()) != Some(normalized_committed.as_slice())
+            && steps.last().map(|step| step.after.as_slice())
+                != Some(normalized_committed.as_slice())
         {
             steps.push(Step {
                 kind: StepKind::Ai { degraded: true },
@@ -635,7 +631,7 @@ fn steps_for_events(
             let bytes = crate::read_blob(&store.join("blobs").join(sha), sha)?;
             (normalize_eol(&bytes) == committed).then_some(index)
         })
-        .last();
+        .next_back();
     let (selected, evidence): (Vec<_>, &'static str) = if let Some(end) = exact_end {
         (events[..=end].to_vec(), "exact")
     } else {
@@ -703,6 +699,13 @@ fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn readable_blob_ids(sizes: &BTreeMap<String, usize>, ids: &[String]) -> Vec<String> {
+    ids.iter()
+        .filter(|id| sizes.get(*id).is_some_and(|size| *size <= MAX_FILE))
+        .cloned()
+        .collect()
 }
 
 fn added_nonblank(parent: &[u8], committed: &[u8]) -> usize {
@@ -798,4 +801,24 @@ fn git_checked(root: &Path, args: &[&str]) -> Result<String, String> {
         return Err(format!("git {} failed", args.join(" ")));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{readable_blob_ids, MAX_FILE};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn readable_blob_ids_enforces_the_one_mib_limit_and_requires_known_sizes() {
+        let sizes = BTreeMap::from([
+            ("at-limit".to_owned(), MAX_FILE),
+            ("over-limit".to_owned(), MAX_FILE + 1),
+        ]);
+        let ids = vec![
+            "at-limit".to_owned(),
+            "over-limit".to_owned(),
+            "missing".to_owned(),
+        ];
+        assert_eq!(readable_blob_ids(&sizes, &ids), vec!["at-limit"]);
+    }
 }
