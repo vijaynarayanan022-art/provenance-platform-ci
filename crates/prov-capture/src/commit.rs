@@ -90,14 +90,7 @@ pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String
     let (repo, repo_id, store) = repo_context(repo_path)?;
     let events = read_events(&store.join("events"));
     let event_index = index_events(&events);
-    derive_commit_with_events(
-        &repo,
-        &repo_id,
-        &store,
-        revision,
-        &events,
-        &event_index,
-    )
+    derive_commit_with_events(&repo, &repo_id, &store, revision, &events, &event_index)
 }
 
 fn derive_commit_with_events(
@@ -256,7 +249,7 @@ fn derive_commit_with_events(
             &parent_content,
         );
         let (mut steps, mut evidence) =
-            steps_for_events(&store, &selected_events, &committed_content, commit_time);
+            steps_for_events(store, &selected_events, &committed_content, commit_time);
         if evidence == "missing_blob" {
             unreadable_files += 1;
             output_files.push(unknown_file(file.path, evidence, added_count));
@@ -463,9 +456,7 @@ fn commit_files(
             continue;
         }
         let old_mode = fields[0].strip_prefix(b":").unwrap_or(fields[0]);
-        if matches!(old_mode, b"120000" | b"160000")
-            || matches!(fields[1], b"120000" | b"160000")
-        {
+        if matches!(old_mode, b"120000" | b"160000") || matches!(fields[1], b"120000" | b"160000") {
             continue;
         }
         let old_id = String::from_utf8_lossy(fields[2]).into_owned();
@@ -520,7 +511,11 @@ fn numstat_additions(
         return Ok(std::collections::HashMap::new());
     }
     let mut additions = std::collections::HashMap::new();
-    for record in output.stdout.split(|byte| *byte == 0).filter(|item| !item.is_empty()) {
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|item| !item.is_empty())
+    {
         let fields: Vec<_> = record.splitn(3, |byte| *byte == b'\t').collect();
         if fields.len() != 3 || fields[0] == b"-" {
             continue;
