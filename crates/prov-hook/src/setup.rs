@@ -641,8 +641,36 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 fn write_config(path: &Path, contents: &str) -> Result<(), String> {
     let parent = path.parent().ok_or("config.toml has no parent directory")?;
     fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    fs::write(path, contents)
-        .map_err(|error| format!("could not write {}: {error}", path.display()))
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0..1000 {
+        let temporary = parent.join(format!(
+            ".config.toml.prov-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("could not create config temp file: {error}")),
+        };
+        if let Err(error) = file.write_all(contents.as_bytes()).and_then(|_| file.flush()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("could not write config temp file: {error}"));
+        }
+        drop(file);
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("could not replace {}: {error}", path.display()));
+        }
+        return Ok(());
+    }
+    Err("could not allocate config temp file".into())
 }
 
 fn unified_diff(path: &Path, before: &str, after: &str) -> String {

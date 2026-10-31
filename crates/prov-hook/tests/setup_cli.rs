@@ -167,6 +167,10 @@ fn install_preserves_unrelated_config_and_quotes_spaced_windows_binary() {
         fs::read(&backups(&fixture.config())[0]).unwrap(),
         original.as_bytes()
     );
+    assert!(!fs::read_dir(&fixture.codex_home)
+        .unwrap()
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(".config.toml.prov-")));
 
     let before_dry_run = fs::read(&fixture.config()).unwrap();
     let backup_count = backups(&fixture.config()).len();
