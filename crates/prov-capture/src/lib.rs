@@ -1749,11 +1749,10 @@ fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     }
     match fs::rename(&temp, path) {
         Ok(()) => Ok(()),
-        Err(_e) if path.exists() => {
+        Err(error) => {
             let _ = fs::remove_file(&temp);
-            Ok(())
+            Err(error)
         }
-        Err(e) => Err(e),
     }
 }
 fn append_line(path: &Path, event: &Event) -> bool {

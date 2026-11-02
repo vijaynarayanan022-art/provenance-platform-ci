@@ -50,5 +50,5 @@ jobs:
         shell: bash
 
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
         shell: bash

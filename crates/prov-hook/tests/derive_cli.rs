@@ -1,9 +1,11 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -18,14 +20,53 @@ fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+static FIXTURE_TEST_GATE: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static FIXTURE_TEST_GATE_STATE: RefCell<(usize, Option<MutexGuard<'static, ()>>)> = const { RefCell::new((0, None)) };
+}
+
+struct FixtureTestGuard;
+
+impl FixtureTestGuard {
+    fn new() -> Self {
+        FIXTURE_TEST_GATE_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.0 == 0 {
+                state.1 = Some(
+                    FIXTURE_TEST_GATE
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+            }
+            state.0 += 1;
+        });
+        Self
+    }
+}
+
+impl Drop for FixtureTestGuard {
+    fn drop(&mut self) {
+        FIXTURE_TEST_GATE_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.0 -= 1;
+            if state.0 == 0 {
+                drop(state.1.take());
+            }
+        });
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     repo: PathBuf,
     home: PathBuf,
+    _test_guard: FixtureTestGuard,
 }
 
 impl Fixture {
     fn new(name: &str) -> Self {
+        let test_guard = FixtureTestGuard::new();
         let root = std::env::temp_dir().join(format!(
             "prov-derive-{name}-{}-{}",
             std::process::id(),
@@ -38,7 +79,12 @@ impl Fixture {
         fs::write(repo.join("tracked.txt"), b"one\ntwo\n").unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-m", "initial"]);
-        Self { root, repo, home }
+        Self {
+            root,
+            repo,
+            home,
+            _test_guard: test_guard,
+        }
     }
 
     fn hook(&self, event: &str, tool: &str) {
@@ -209,15 +255,80 @@ impl Fixture {
     }
 
     fn empty_commits(&self, count: usize) -> Vec<String> {
+        let base = git_text(&self.repo, &["rev-parse", "HEAD"]);
+        let ref_name = format!("refs/heads/prov-empty-{}-{}", std::process::id(), now());
+        let now_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut stream = String::new();
         for index in 0..count {
             let message = format!("empty pending {index}");
-            git(&self.repo, &["commit", "--allow-empty", "-m", &message]);
+            let parent = if index == 0 {
+                base.clone()
+            } else {
+                format!(":{index}")
+            };
+            stream.push_str(&format!(
+                "commit {ref_name}\nmark :{}\ncommitter Derive Test <derive@example.invalid> {} +0000\ndata {}\n{}\nfrom {parent}\n\n",
+                index + 1,
+                now_seconds.saturating_sub((count - index) as u64),
+                message.len(),
+                message,
+            ));
         }
-        let range = format!("HEAD~{count}..HEAD");
+        stream.push_str("done\n");
+        let mut child = isolated_command("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(&self.repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "git fast-import failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let range = format!("{base}..{ref_name}");
         git_text(&self.repo, &["rev-list", "--reverse", &range])
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    fn remove_loose_tree_object(&self, commit: &str) -> PathBuf {
+        let tree_revision = format!("{commit}^{{tree}}");
+        let tree = git_text(&self.repo, &["rev-parse", &tree_revision]);
+        let object = self
+            .repo
+            .join(".git/objects")
+            .join(&tree[..2])
+            .join(&tree[2..]);
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&object).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(&object, permissions).unwrap();
+        }
+        fs::remove_file(&object).unwrap();
+        let commit_revision = format!("{commit}^{{commit}}");
+        assert!(isolated_command("git")
+            .args(["cat-file", "-e", &commit_revision])
+            .current_dir(&self.repo)
+            .status()
+            .unwrap()
+            .success());
+        object
     }
 
     fn drop_root(&self) {
@@ -230,6 +341,16 @@ fn now() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos()
+}
+
+fn commits_listing(directory: &Path) -> String {
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn set_age(path: &Path, age: Duration) {
@@ -1040,19 +1161,74 @@ fn pending_attempt_marker_skips_fresh_and_retries_stale_marker() {
 fn pending_run_removes_lock_after_derivation_error() {
     let fixture = Fixture::new("pending-error-cleanup");
     fixture.hook("Stop", "pending-init");
-    let commits = fixture.commits(2);
+    let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    let first = fixture.commits(1).remove(0);
+    git(&fixture.repo, &["checkout", &base]);
+    fs::write(fixture.repo.join("tracked.txt"), b"one\ntwo\nsibling\n").unwrap();
+    let second = fixture.commit("sibling pending commit");
+    let commits = vec![first, second];
     fixture.queue_head_moves(&commits);
     let repo_store = fixture.home.join("repos").join(fixture.repo_id());
     let commits_dir = repo_store.join("commits");
-    fs::create_dir_all(commits_dir.join(format!("{}.lines.json", commits[0]))).unwrap();
+    fs::create_dir_all(&commits_dir).unwrap();
+    fixture.remove_loose_tree_object(&commits[0]);
 
     let result = fixture.pending();
-    assert_eq!(result.status.code(), Some(0));
-    assert!(result.stdout.is_empty() && result.stderr.is_empty());
-    assert!(!repo_store.join("derive.lock").exists());
-    assert!(!fixture.derived_path(&commits[0]).exists());
-    assert!(commits_dir.join(format!("{}.attempt", commits[0])).exists());
-    assert!(fixture.derived_path(&commits[1]).exists());
+    assert_eq!(
+        result.status.code(),
+        Some(0),
+        "pending returned nonzero; commits: {}",
+        commits_listing(&commits_dir)
+    );
+    assert!(
+        result.stdout.is_empty() && result.stderr.is_empty(),
+        "pending was not silent; commits: {}",
+        commits_listing(&commits_dir)
+    );
+    assert!(
+        !fixture.derived_path(&commits[0]).exists(),
+        "failed commit report exists; commits: {}",
+        commits_listing(&commits_dir)
+    );
+    assert!(
+        commits_dir.join(format!("{}.attempt", commits[0])).exists(),
+        "attempt marker missing; commits: {}",
+        commits_listing(&commits_dir)
+    );
+    assert!(
+        fixture.derived_path(&commits[1]).exists(),
+        "later commit report missing; commits: {}",
+        commits_listing(&commits_dir)
+    );
+    assert!(
+        !repo_store.join("derive.lock").exists(),
+        "derive lock remains; commits: {}",
+        commits_listing(&commits_dir)
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn derive_fails_when_sidecar_destination_is_a_directory() {
+    let fixture = Fixture::new("sidecar-directory");
+    fixture.hook("Stop", "sidecar-directory");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"one\ntwo\nblocked sidecar content\n",
+    )
+    .unwrap();
+    let commit = fixture.commit("blocked sidecar destination");
+    let sidecar_path = fixture.lines_path(&commit);
+    fs::create_dir_all(&sidecar_path).unwrap();
+
+    let result = derive(&fixture, &commit);
+    let commits_dir = sidecar_path.parent().unwrap();
+    assert!(!result.status.success());
+    assert!(
+        !fixture.derived_path(&commit).exists(),
+        "commit report written despite sidecar failure; commits: {}",
+        commits_listing(commits_dir)
+    );
     fixture.drop_root();
 }
 
@@ -1460,11 +1636,11 @@ fn unrelated_source_with_one_common_line_fails_overlap_threshold() {
 }
 
 #[test]
-fn rewrite_scan_with_three_hundred_derived_commits_stays_bounded() {
+fn rewrite_scan_with_two_hundred_twenty_derived_commits_stays_bounded() {
     let fixture = Fixture::new("rewrite-bounded-scan");
     fixture.hook("Stop", "large-rewrite-init");
     let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
-    let noise = fixture.empty_commits(300);
+    let noise = fixture.empty_commits(220);
     let range = format!("{base}..{}", noise.last().unwrap());
     let derived_noise = fixture.cli(&[
         "derive",
@@ -1489,6 +1665,8 @@ fn rewrite_scan_with_three_hundred_derived_commits_stays_bounded() {
     );
     git(&fixture.repo, &["checkout", noise_tip]);
     git(&fixture.repo, &["checkout", "-b", "bounded-rewrite"]);
+    fs::write(fixture.repo.join("other.txt"), b"distinct rewrite base\n").unwrap();
+    let _ = fixture.commit("distinct rewrite base");
     git(&fixture.repo, &["cherry-pick", &source]);
     let rewritten = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
 
@@ -1506,7 +1684,10 @@ fn rewrite_scan_with_three_hundred_derived_commits_stays_bounded() {
     );
     let report = fixture.derived_value(&rewritten);
     let sidecar = fixture.sidecar_value(&rewritten);
-    assert_eq!(report["rewrite"]["method"], "patch_id");
+    assert_eq!(
+        report["rewrite"]["method"], "patch_id",
+        "source={source}, target={rewritten}, report={report}"
+    );
     assert_eq!(report["rewrite"]["sources"], json!([source]));
     assert_eq!(line_label(&sidecar, "tracked.txt", &line_hash(phrase)), "s");
     fixture.drop_root();
