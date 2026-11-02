@@ -395,7 +395,7 @@ fn doctor_reports_install_and_empty_config_without_writing() {
 }
 
 #[test]
-fn doctor_checks_the_managed_executable_and_warns_when_it_differs() {
+fn doctor_fails_when_the_managed_executable_differs() {
     let fixture = Fixture::new("doctor-binary");
     let binary = fixture.root.join("alternate prov hook.exe");
     fs::copy(env!("CARGO_BIN_EXE_prov-hook"), &binary).unwrap();
@@ -410,10 +410,172 @@ fn doctor_checks_the_managed_executable_and_warns_when_it_differs() {
     assert!(installed.status.success());
 
     let doctor = fixture.cli(&["doctor", "--codex-home", fixture.home_arg()]);
-    assert!(doctor.status.success());
+    assert!(!doctor.status.success());
     let output = String::from_utf8_lossy(&doctor.stdout);
-    assert!(output.contains("WARN binary: configured executable differs from running binary"));
-    assert!(output.contains("PASS managed block"));
+    assert!(output.contains("FAIL binary: handler executable differs from this binary"));
+    assert!(output.contains("FAIL managed block: exactly one matching command handler per event"));
+    fixture.drop_root();
+}
+
+fn shared_hook_config(binary: &Path) -> String {
+    let command = format!("'{} codex'", binary.display());
+    let sibling = r#"'C:\dev\git-ai-bin\git-ai.exe checkpoint codex --hook-input stdin'"#;
+    let mut config = String::from("[features]\nhooks = true\n\n");
+    for event in ["PreToolUse", "PostToolUse", "Stop"] {
+        config.push_str(&format!(
+            "[[hooks.{event}]]\n\n[[hooks.{event}.hooks]]\ncommand = {command}\ntype = \"command\"\n\n[[hooks.{event}.hooks]]\ncommand = {sibling}\ntype = \"command\"\n\n"
+        ));
+    }
+    config
+}
+
+#[test]
+fn doctor_and_install_coexist_with_sibling_handlers_and_state_tables() {
+    let fixture = Fixture::new("coexist-doctor-install");
+    fs::create_dir_all(&fixture.codex_home).unwrap();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_prov-hook"));
+    let mut original = shared_hook_config(&binary);
+    for (snake, index) in [("pre_tool_use", 0), ("post_tool_use", 0), ("stop", 0)] {
+        original.push_str(&format!(
+            "[hooks.state.'{}:{snake}:{index}:0']\ntrusted_hash = \"sha256:fixture\"\n\n",
+            fixture.config().display()
+        ));
+    }
+    fs::write(fixture.config(), &original).unwrap();
+
+    let doctor = fixture.cli(&["doctor", "--codex-home", fixture.home_arg()]);
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stdout)
+    );
+    let output = String::from_utf8_lossy(&doctor.stdout);
+    assert!(output.contains("PASS managed block: exactly one matching command handler per event"));
+    assert!(
+        output.contains("PASS hook state/trust: all three entries are trusted and not disabled")
+    );
+
+    let install = fixture.cli(&["install", "--codex-home", fixture.home_arg()]);
+    assert!(install.status.success());
+    assert_eq!(fs::read(fixture.config()).unwrap(), original.as_bytes());
+    fixture.drop_root();
+}
+
+#[test]
+fn doctor_fails_when_our_handler_is_missing_or_duplicated() {
+    let fixture = Fixture::new("doctor-handler-count");
+    fs::create_dir_all(&fixture.codex_home).unwrap();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_prov-hook"));
+    let original = shared_hook_config(&binary);
+    let stop_handler = format!(
+        "[[hooks.Stop.hooks]]\ncommand = '{} codex'\ntype = \"command\"\n\n",
+        binary.display()
+    );
+    fs::write(fixture.config(), original.replace(&stop_handler, "")).unwrap();
+    let missing = fixture.cli(&["doctor", "--codex-home", fixture.home_arg()]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stdout).contains("FAIL managed block"));
+
+    let duplicate = format!(
+        "{}\n[[hooks.PostToolUse]]\n[[hooks.PostToolUse.hooks]]\ncommand = '{} codex'\ntype = \"command\"\n",
+        original,
+        binary.display()
+    );
+    fs::write(fixture.config(), duplicate).unwrap();
+    let duplicated = fixture.cli(&["doctor", "--codex-home", fixture.home_arg()]);
+    assert!(!duplicated.status.success());
+    assert!(String::from_utf8_lossy(&duplicated.stdout).contains("FAIL managed block"));
+    fixture.drop_root();
+}
+
+#[test]
+fn install_adds_our_handler_without_rewriting_sibling_entries() {
+    let fixture = Fixture::new("coexist-install-sibling-only");
+    fs::create_dir_all(&fixture.codex_home).unwrap();
+    let sibling = r#"command = 'C:\dev\git-ai-bin\git-ai.exe checkpoint codex --hook-input stdin'"#;
+    let mut original = String::from("[features]\nhooks = true\n\n");
+    for event in ["PreToolUse", "PostToolUse", "Stop"] {
+        original.push_str(&format!(
+            "[[hooks.{event}]]\n[[hooks.{event}.hooks]]\n{sibling}\ntype = \"command\"\n\n"
+        ));
+    }
+    fs::write(fixture.config(), &original).unwrap();
+    let install = fixture.cli(&["install", "--codex-home", fixture.home_arg()]);
+    assert!(install.status.success());
+    let updated = fs::read_to_string(fixture.config()).unwrap();
+    assert!(updated.starts_with(&original));
+    assert_eq!(updated.matches(sibling).count(), 3);
+    assert_eq!(updated.matches(" codex'").count(), 3);
+    fixture.drop_root();
+}
+
+#[test]
+fn install_updates_only_our_command_when_binary_changes() {
+    let fixture = Fixture::new("coexist-update-binary");
+    fs::create_dir_all(&fixture.codex_home).unwrap();
+    let current = PathBuf::from(env!("CARGO_BIN_EXE_prov-hook"));
+    let original = shared_hook_config(&current);
+    fs::write(fixture.config(), &original).unwrap();
+    let alternate = fixture.root.join("alternate-prov-hook.exe");
+    let install = fixture.cli(&[
+        "install",
+        "--codex-home",
+        fixture.home_arg(),
+        "--binary",
+        alternate.to_str().unwrap(),
+    ]);
+    assert!(install.status.success());
+    let updated = fs::read_to_string(fixture.config()).unwrap();
+    let old_command = format!("command = '{} codex'", current.display());
+    let new_command = format!("command = '{} codex'", alternate.display());
+    assert_eq!(updated, original.replace(&old_command, &new_command));
+    assert_eq!(
+        updated
+            .matches("checkpoint codex --hook-input stdin")
+            .count(),
+        3
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn uninstall_removes_only_our_entries_and_preserves_siblings_and_state() {
+    let fixture = Fixture::new("coexist-uninstall");
+    fs::create_dir_all(&fixture.codex_home).unwrap();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_prov-hook"));
+    let mut original = shared_hook_config(&binary);
+    for (snake, index) in [("pre_tool_use", 0), ("post_tool_use", 0), ("stop", 0)] {
+        original.push_str(&format!(
+            "[hooks.state.'{}:{snake}:{index}:0']\ntrusted_hash = \"sha256:fixture\"\n\n",
+            fixture.config().display()
+        ));
+    }
+    fs::write(fixture.config(), &original).unwrap();
+    let mut expected = original.clone();
+    for event in ["PreToolUse", "PostToolUse", "Stop"] {
+        expected = expected.replace(
+            &format!(
+                "[[hooks.{event}.hooks]]\ncommand = '{} codex'\ntype = \"command\"\n",
+                binary.display()
+            ),
+            "",
+        );
+    }
+    let uninstall = fixture.cli(&["uninstall", "--codex-home", fixture.home_arg()]);
+    assert!(uninstall.status.success());
+    assert_eq!(fs::read(fixture.config()).unwrap(), expected.as_bytes());
+    assert_eq!(
+        expected
+            .matches("checkpoint codex --hook-input stdin")
+            .count(),
+        3
+    );
+    assert_eq!(
+        expected
+            .matches("trusted_hash = \"sha256:fixture\"")
+            .count(),
+        3
+    );
     fixture.drop_root();
 }
 
