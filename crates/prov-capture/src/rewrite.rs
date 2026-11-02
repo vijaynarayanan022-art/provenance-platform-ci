@@ -2,11 +2,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REWRITE_WINDOW_SECS: i64 = 14 * 24 * 60 * 60;
+const SIDECAR_MTIME_MARGIN_SECS: i64 = 24 * 60 * 60;
+const MAX_MTIME_CANDIDATES: usize = 200;
 const MAX_SOURCES: usize = 50;
 const MAX_HASH_ENTRIES: usize = 200_000;
 const REWRITE_BUDGET: Duration = Duration::from_secs(5);
@@ -129,6 +132,7 @@ struct Candidate {
     sha: String,
     time: i64,
     sidecar_path: PathBuf,
+    patch_id: Option<String>,
 }
 
 struct CarryResult {
@@ -160,7 +164,7 @@ pub(crate) fn apply(root: &Path, store: &Path, commit: &str) -> Result<(), Strin
         Ok(carry) => carry,
         Err(_) => return Ok(()),
     };
-    if carry.method == "none" {
+    if carry.method == "none" || carry.carried_lines == 0 {
         return Ok(());
     }
 
@@ -211,48 +215,82 @@ fn collect_and_carry(
     let target_time = commit_time(root, &report.commit)?;
     let target_patch_id = report.patch_id.clone();
     let ancestors = ancestor_set(root, &report.commit)?;
-    let lower_time = target_time.saturating_sub(REWRITE_WINDOW_SECS);
-    let mut sidecar_paths: Vec<PathBuf> = fs::read_dir(commits_dir)
-        .map_err(|error| error.to_string())?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".lines.json"))
-        })
-        .collect();
-    sidecar_paths.sort();
-
-    let mut candidates = Vec::new();
-    for sidecar_path in sidecar_paths {
+    let mtime_floor = target_time
+        .saturating_sub(REWRITE_WINDOW_SECS)
+        .saturating_sub(SIDECAR_MTIME_MARGIN_SECS);
+    let mtime_ceiling = target_time.saturating_add(SIDECAR_MTIME_MARGIN_SECS);
+    let mut mtime_candidates = Vec::new();
+    for entry in fs::read_dir(commits_dir).map_err(|error| error.to_string())? {
         check_budget(started)?;
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let sidecar_path = entry.path();
         let Some(sha) = sidecar_sha(&sidecar_path) else {
             continue;
         };
-        if sha == report.commit || ancestors.contains(&sha) || !valid_sha(&sha) {
+        if sha == report.commit || !valid_sha(&sha) {
             continue;
         }
-        if !git_succeeds(root, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).unwrap_or(false) {
-            continue;
-        }
-        let Ok(time) = commit_time(root, &sha) else {
+        let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        if time > target_time || time < lower_time {
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Some(mtime) = system_time_seconds(modified) else {
+            continue;
+        };
+        if !(mtime_floor..=mtime_ceiling).contains(&mtime) {
             continue;
         }
-        let sidecar_e = fs::read(&sidecar_path)
+        mtime_candidates.push((modified, mtime, sha, sidecar_path));
+    }
+    mtime_candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.2.cmp(&right.2)));
+    mtime_candidates.truncate(MAX_MTIME_CANDIDATES);
+
+    let candidate_shas: Vec<_> = mtime_candidates
+        .iter()
+        .map(|(_, _, sha, _)| sha.clone())
+        .collect();
+    let existing = existing_commits(root, &candidate_shas)?;
+    let existing_shas: Vec<_> = candidate_shas
+        .into_iter()
+        .filter(|sha| existing.contains(sha))
+        .collect();
+    let commit_times = batch_commit_times(root, &existing_shas)?;
+
+    let mut candidates = Vec::new();
+    for (_, _, sha, sidecar_path) in mtime_candidates {
+        check_budget(started)?;
+        if !existing.contains(&sha) || ancestors.contains(&sha) {
+            continue;
+        }
+        let Some(time) = commit_times.get(&sha).copied() else {
+            continue;
+        };
+        if time > target_time || target_time.saturating_sub(time) > REWRITE_WINDOW_SECS {
+            continue;
+        }
+        let report_value = fs::read(commits_dir.join(format!("{sha}.json")))
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<LinesSidecar>(&bytes).ok())
-            .map(|sidecar| sidecar.totals.e);
-        if !sidecar_e.is_some_and(|e| e > 0) {
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let Some(report_value) = report_value else {
+            continue;
+        };
+        if report_value.get("skipped").is_some()
+            || report_value["totals"]["e"].as_u64().unwrap_or_default() == 0
+        {
             continue;
         }
         candidates.push(Candidate {
             sha,
             time,
             sidecar_path,
+            patch_id: report_value
+                .get("patch_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         });
     }
     candidates.sort_by(|left, right| {
@@ -266,28 +304,23 @@ fn collect_and_carry(
     let mut sources = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         check_budget(started)?;
-        let mut source_sidecar: LinesSidecar = serde_json::from_slice(
-            &fs::read(&candidate.sidecar_path).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        let Ok(bytes) = fs::read(&candidate.sidecar_path) else {
+            continue;
+        };
+        let Ok(mut source_sidecar) = serde_json::from_slice::<LinesSidecar>(&bytes) else {
+            continue;
+        };
+        if source_sidecar.totals.e == 0 {
+            continue;
+        }
         hash_entries = hash_entries.saturating_add(sidecar_entry_count(&source_sidecar));
         if hash_entries > MAX_HASH_ENTRIES {
             return Err("rewrite hash entry limit exceeded".into());
         }
         sort_sidecar(&mut source_sidecar);
-        let commit_json = fs::read(commits_dir.join(format!("{}.json", candidate.sha)))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-        let Some(commit_json) = commit_json else {
-            continue;
-        };
-        let patch_id = commit_json
-            .get("patch_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         sources.push(Source {
             sha: candidate.sha,
-            patch_id,
+            patch_id: candidate.patch_id,
             sidecar: source_sidecar,
         });
     }
@@ -321,8 +354,40 @@ fn collect_and_carry(
             &context,
         )
     } else {
+        let sources = content_sources_for_target(sidecar, sources);
         carry_matching_lines(sidecar, report, &sources, "content", &[], &context)
     }
+}
+
+fn content_sources_for_target(target: &LinesSidecar, sources: Vec<Source>) -> Vec<Source> {
+    let target_counts = line_multiset(target);
+    sources
+        .into_iter()
+        .filter(|source| {
+            let source_counts = line_multiset(&source.sidecar);
+            let eligible = source_counts.values().sum::<usize>();
+            if eligible == 0 {
+                return false;
+            }
+            let overlap = source_counts
+                .iter()
+                .map(|(key, count)| count.min(target_counts.get(key).unwrap_or(&0)))
+                .sum::<usize>();
+            overlap.saturating_mul(2) >= eligible
+        })
+        .collect()
+}
+
+fn line_multiset(sidecar: &LinesSidecar) -> BTreeMap<(String, String), usize> {
+    let mut counts = BTreeMap::new();
+    for file in &sidecar.files {
+        for line in &file.lines {
+            *counts
+                .entry((file.path.clone(), line.hash.clone()))
+                .or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 fn carry_matching_lines(
@@ -470,7 +535,9 @@ fn recompute_totals(report: &mut CommitReport) {
         totals.mixed += file.mixed;
         totals.unknown += file.unknown;
         totals.excluded += file.excluded;
-        if file.evidence != "none" && file.evidence != "missing_blob" {
+        if (file.evidence != "none" && file.evidence != "missing_blob")
+            || file.carried.unwrap_or_default() > 0
+        {
             covered += file.e;
         }
     }
@@ -560,8 +627,75 @@ fn commit_time(root: &Path, commit: &str) -> Result<i64, String> {
         .map_err(|error: std::num::ParseIntError| error.to_string())
 }
 
-fn git_succeeds(root: &Path, args: &[&str]) -> Result<bool, String> {
-    git_output(root, args).map(|output| output.status.success())
+fn existing_commits(root: &Path, commits: &[String]) -> Result<BTreeSet<String>, String> {
+    if commits.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let input = format!("{}\n", commits.join("\n"));
+    let output = git_input(
+        root,
+        &["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        input.as_bytes(),
+    )?;
+    if !output.status.success() {
+        return Err("could not batch-check rewrite commits".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let sha = fields.next()?;
+            (fields.next()? == "commit").then(|| sha.to_owned())
+        })
+        .collect())
+}
+
+fn batch_commit_times(root: &Path, commits: &[String]) -> Result<BTreeMap<String, i64>, String> {
+    if commits.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let input = format!("{}\n", commits.join("\n"));
+    let output = git_input(
+        root,
+        &["log", "--no-walk=unsorted", "--format=%H %ct", "--stdin"],
+        input.as_bytes(),
+    )?;
+    if !output.status.success() {
+        return Err("could not batch-read rewrite commit times".into());
+    }
+    let mut times = BTreeMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(sha), Some(time)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if let Ok(time) = time.parse() {
+            times.insert(sha.to_owned(), time);
+        }
+    }
+    Ok(times)
+}
+
+fn git_input(root: &Path, args: &[&str], input: &[u8]) -> Result<Output, String> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or("could not open git stdin")?
+        .write_all(input);
+    if let Err(error) = write_result {
+        let _ = child.wait();
+        return Err(error.to_string());
+    }
+    child.wait_with_output().map_err(|error| error.to_string())
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<Output, String> {
@@ -600,4 +734,8 @@ fn check_budget(started: Instant) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn system_time_seconds(time: SystemTime) -> Option<i64> {
+    i64::try_from(time.duration_since(UNIX_EPOCH).ok()?.as_secs()).ok()
 }
