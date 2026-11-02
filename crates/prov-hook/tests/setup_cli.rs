@@ -201,12 +201,15 @@ fn dry_run_uses_unified_diff_with_local_context() {
 }
 
 #[test]
-fn install_preserves_unrelated_config_and_quotes_spaced_windows_binary() {
+fn install_preserves_unrelated_config_and_quotes_spaced_binary() {
     let fixture = Fixture::new("existing");
     fs::create_dir_all(&fixture.codex_home).unwrap();
     let original = "model = \"unchanged\"\n[other]\nkey = true\n";
     fs::write(fixture.config(), original).unwrap();
+    #[cfg(windows)]
     let binary = fixture.root.join("Program Files").join("prov hook.exe");
+    #[cfg(not(windows))]
+    let binary = fixture.root.join("Program Files").join("prov hook");
     let result = fixture.cli(&[
         "install",
         "--codex-home",
@@ -221,7 +224,10 @@ fn install_preserves_unrelated_config_and_quotes_spaced_windows_binary() {
     ));
     let installed = fs::read_to_string(fixture.config()).unwrap();
     assert!(installed.starts_with(original));
+    #[cfg(windows)]
     assert!(installed.contains(r#"Program Files\\prov hook.exe\" codex"#));
+    #[cfg(not(windows))]
+    assert!(installed.contains(&format!(r#"\"{}\" codex"#, binary.display())));
     assert_eq!(installed.matches("# >>> prov-hook >>>").count(), 1);
     assert_eq!(installed.matches("# <<< prov-hook <<<").count(), 1);
     assert_eq!(

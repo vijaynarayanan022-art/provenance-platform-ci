@@ -767,33 +767,66 @@ fn unchanged_dirty_file_metadata_skips_locked_read() {
 
 #[cfg(windows)]
 #[test]
+fn identical_locked_blob_write_succeeds_and_preserves_blob() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let _serial = test_guard();
+    let fixture = Fixture::new("locked-identical-blob");
+    fixture.hook("PreToolUse", "blob-tool", "blob-tool", None);
+    let contents = b"identical content-addressed snapshot\n";
+    fs::write(fixture.repo.join("tracked.txt"), contents).unwrap();
+    let digest = sha(contents);
+    let repo_id = fs::read_dir(fixture.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .into_owned();
+    let blob = fixture
+        .home
+        .join("repos")
+        .join(repo_id)
+        .join("blobs")
+        .join(&digest);
+    fs::write(&blob, contents).unwrap();
+
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&blob)
+        .unwrap();
+    let (code, stdout, stderr) = fixture.hook("PostToolUse", "blob-tool", "blob-tool", None);
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty() && stderr.is_empty());
+    drop(handle);
+
+    assert_eq!(fs::read(&blob).unwrap(), contents);
+    let events = fixture.events();
+    assert!(select(&events, "ai_change")
+        .iter()
+        .any(|event| event["path"] == "tracked.txt" && event["after_sha"] == digest));
+    fixture.drop_root();
+}
+
+#[cfg(windows)]
+#[test]
 fn one_windows_sharing_violation_degrades_only_that_file() {
     let _serial = test_guard();
-    use std::thread;
-    use std::time::{Duration, Instant};
+    use std::os::windows::fs::OpenOptionsExt;
     let f = Fixture::new("sharing-error");
     f.hook("PreToolUse", "s", "share", None);
     let file = f.repo.join("tracked.txt");
-    let ready = f.root.join("held-ready");
-    let command = format!("$p='{}'; $f=[IO.File]::Open($p,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None); $f.SetLength(0); $b=[Text.Encoding]::UTF8.GetBytes('locked edit`n'); $f.Write($b,0,$b.Length); Set-Content -LiteralPath '{}' ready; Start-Sleep -Seconds 20", file.display().to_string().replace('\'', "''"), ready.display().to_string().replace('\'', "''"));
-    let mut holder = Command::new("powershell.exe")
-        .args(["-NoProfile", "-Command", &command])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    fs::write(&file, "locked edit\n").unwrap();
+    let handle = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&file)
         .unwrap();
-    let start = Instant::now();
-    while !ready.exists() && start.elapsed() < Duration::from_secs(5) {
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        ready.exists(),
-        "PowerShell did not acquire the exclusive handle"
-    );
     fs::write(f.repo.join("other.txt"), "another file\n").unwrap();
     f.hook("PostToolUse", "s", "share", None);
-    let _ = holder.kill();
-    let _ = holder.wait();
+    drop(handle);
     let all = f.events();
     assert!(all.iter().any(|e| e["path"] == "tracked.txt"
         && e["reason"].as_str().is_some_and(|r| r.starts_with("open:"))));

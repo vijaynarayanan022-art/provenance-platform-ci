@@ -1684,6 +1684,12 @@ fn write_once(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     let result = atomic_bytes(path, bytes, false);
     add_ns(&TIMINGS.writes_ns, start.elapsed());
+    if result.is_err()
+        && fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64)
+    {
+        return Ok(());
+    }
     result
 }
 fn read_blob(path: &Path, expected_sha: &str) -> Option<Vec<u8>> {
@@ -1749,11 +1755,10 @@ fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     }
     match fs::rename(&temp, path) {
         Ok(()) => Ok(()),
-        Err(_e) if path.exists() => {
+        Err(error) => {
             let _ = fs::remove_file(&temp);
-            Ok(())
+            Err(error)
         }
-        Err(e) => Err(e),
     }
 }
 fn append_line(path: &Path, event: &Event) -> bool {
