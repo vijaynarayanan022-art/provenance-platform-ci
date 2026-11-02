@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Git version
+        run: git --version
+        shell: bash
+
+      - name: Check formatting
+        run: cargo fmt -p prov-capture -p prov-hook -- --check
+        shell: bash
+
+      - name: Clippy
+        run: cargo clippy -p prov-capture -p prov-hook --all-targets -- -D warnings
+        shell: bash
+
+      - name: Build release hook
+        run: cargo build --release -p prov-hook
+        shell: bash
+
+      - name: Test workspace
+        run: cargo test --workspace
+        shell: bash
