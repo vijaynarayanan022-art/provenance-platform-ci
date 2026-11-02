@@ -5,7 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_FILE: usize = 1024 * 1024;
 const MAX_PATCH_DIFF_SIZE: usize = 8 * 1024 * 1024;
@@ -142,6 +142,95 @@ pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String
     let events = read_events(&store.join("events"));
     let event_index = index_events(&events);
     derive_commit_with_events(&repo, &repo_id, &store, revision, &events, &event_index)
+}
+
+pub fn enqueue_git_commits(repo_path: &Path, commits: &[String]) -> Result<bool, String> {
+    if commits.is_empty() {
+        return Ok(false);
+    }
+    let Some((root, git_dir, common_dir)) = crate::find_git_dirs(repo_path) else {
+        return Ok(false);
+    };
+    let Some(home) = crate::store_home() else {
+        return Ok(false);
+    };
+    if crate::normalized_path(&home).starts_with(crate::normalized_path(&root)) {
+        return Ok(false);
+    }
+
+    let cache_path = home.join("repo-cache").join(format!(
+        "{}.json",
+        crate::hash(git_dir.to_string_lossy().as_bytes())
+    ));
+    let cached: Option<crate::RepoCache> = crate::read_json(&cache_path);
+    let shallow = [git_dir.join("shallow"), common_dir.join("shallow")]
+        .iter()
+        .any(|path| fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0));
+    let git_dir_created_ns = fs::metadata(&git_dir)
+        .ok()
+        .and_then(|metadata| metadata.created().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+
+    let repo_id = if shallow {
+        cached.map(|cache| cache.repo_id)
+    } else {
+        let cached_is_current = cached.as_ref().is_some_and(|cache| {
+            if let Some(created) = git_dir_created_ns {
+                cache.git_dir_created_ns == Some(created)
+            } else {
+                roots_check(&root).is_ok_and(|root_check| cache.root_check == root_check)
+            }
+        });
+        if cached_is_current {
+            cached.map(|cache| cache.repo_id)
+        } else {
+            let root_check = roots_check(&root)?;
+            (!root_check.is_empty()).then(|| crate::hash(root_check.as_bytes()))
+        }
+    };
+    let Some(repo_id) = repo_id else {
+        return Ok(false);
+    };
+    let store = home.join("repos").join(&repo_id);
+    let events_dir = store.join("events");
+    if !events_dir.is_dir()
+        || !fs::read_dir(&events_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+                    && entry.metadata().is_ok_and(|metadata| metadata.len() > 0)
+            })
+    {
+        return Ok(false);
+    }
+
+    let mut unique = BTreeSet::new();
+    let mut events = Vec::new();
+    for commit in commits {
+        let commit = commit.to_ascii_lowercase();
+        if !matches!(commit.len(), 40 | 64)
+            || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !unique.insert(commit.clone())
+        {
+            continue;
+        }
+        let mut event =
+            crate::Event::new("head_move", Some("git"), Some(&repo_id), Some("git"), None);
+        event.new_head = Some(commit);
+        event.head_moved = Some(true);
+        event.commit_in_window = Some(false);
+        events.push(event);
+    }
+    if events.is_empty() {
+        return Ok(false);
+    }
+    Ok(crate::append_events(&events_dir.join("git.jsonl"), &events))
 }
 
 pub fn derive_pending(repo_path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -796,6 +885,16 @@ fn repo_context(path: &Path) -> Result<(crate::RepoInfo, String, PathBuf), Strin
         .ok_or("repository identity unavailable")?;
     let store = home.join("repos").join(&repo_id);
     Ok((repo, repo_id, store))
+}
+
+fn roots_check(root: &Path) -> Result<String, String> {
+    let roots = git_checked(
+        root,
+        &["rev-list", "--first-parent", "--max-parents=0", "HEAD"],
+    )?;
+    let mut roots: Vec<_> = roots.lines().map(str::to_owned).collect();
+    roots.sort();
+    Ok(roots.join("\n"))
 }
 
 fn resolve_commit(root: &Path, revision: &str) -> Result<String, String> {

@@ -1814,10 +1814,14 @@ fn trigger_auto_derive(repo_root: &Path) {
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
-    spawn_pending_derive(&executable, repo_root);
+    spawn_detached_pending_derive(&executable, repo_root);
 }
 
-fn spawn_pending_derive(executable: &Path, repo_root: &Path) {
+pub fn spawn_pending_derive(repo_root: &Path) {
+    trigger_auto_derive(repo_root);
+}
+
+fn spawn_detached_pending_derive(executable: &Path, repo_root: &Path) {
     let mut command = Command::new(executable);
     command
         .args(["derive", "--pending", "--repo"])
@@ -2104,7 +2108,7 @@ mod tests {
         let missing = std::env::temp_dir()
             .join(format!("prov-missing-derive-{}", std::process::id()))
             .join("prov-hook");
-        spawn_pending_derive(&missing, Path::new("."));
+        spawn_detached_pending_derive(&missing, Path::new("."));
         assert!(started.elapsed() < Duration::from_millis(1400));
     }
 

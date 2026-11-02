@@ -92,3 +92,28 @@ After a `head_move` event is successfully appended, `prov-hook codex` starts a d
 ## Round 4b
 
 Deriving a rewritten commit performs a bounded post-step using only this repository's stored commit reports and hash-only line sidecars. It first stats sidecar filenames and modified times, keeps the newest 200 within the 14-day candidate window plus a one-day margin, then batches Git object-existence and committer-time checks before applying the exact non-ancestor/time/14-day filters and retaining the newest 50; only those final sidecars are parsed. Exact non-null `patch_id` matches carry labels by ordered `(path, hash)` multiset pairing. Without a patch pair, a content source is used only when at least 50% of its eligible added-line multiset appears in the target; matching also requires the target line's trimmed text to be at least eight characters and caps inherited labels at `ai_probable`. A source line is used at most once per path; conflicting source labels resolve to the weakest (`unknown < mixed < ai_probable < ai_strong`). Commit JSON adds `rewrite.method`, sorted `rewrite.sources`, and `rewrite.carried_lines`; zero carried lines retain method `none`, empty sources, and the original files unchanged. Files with carried labels count as covered when recomputing coverage, without changing their evidence value. Totals and the sidecar are recomputed after carry-over. Carry-over stops without changing the normal report if it exceeds five seconds or 200,000 hash entries. It does not cover interactive rebases that split commits, rewrites older than 14 days or outside the newest 50 sources, or cross-repository moves.
+
+## Round 7: git-side post-commit and post-rewrite trigger
+
+This round adds the git-side trigger path that feeds the existing pending-queue and detached auto-derive flow in the repo without writing into the analyzed worktree.
+
+### Commands
+- `prov-hook git-event post-commit --repo <path>`: resolves the repo root, reads the current `HEAD`, and enqueues that commit hash if the repo already has a capture store/history.
+- `prov-hook git-event post-rewrite --repo <path>`: reads stdin as newline-delimited `<old> <new>` pairs, keeps only the newest SHA per line, caps the queue at 1000 entries, and enqueues the new commit SHA values.
+- `prov-hook install-git --repo <path>`: installs hooks into the effective hooks directory (absolute or relative `core.hooksPath`, or `git rev-parse --git-path hooks`) for `post-commit` and `post-rewrite`.
+- `prov-hook uninstall-git --repo <path>`: removes only the managed block and restores the original hook bytes exactly.
+- `prov-hook doctor --repo <path>`: prints the git-hooks status line without writing anything to disk.
+
+### Queue semantics
+The queue reuses the existing pending-derive mechanism in `prov-capture`. Once a hook adds one or more git SHAs, the hook immediately spawns the detached `prov-hook derive --pending --repo <root>` command, honoring `PROV_NO_AUTODERIVE=1` as a test/debug bypass. If the repo has no capture store/history, the hook exits silently and creates nothing.
+
+### Hook behavior
+- `post-commit` runs in the background and redirects stdin from `/dev/null`.
+- `post-rewrite` captures stdin into a temporary file, launches the git-event processor in the background, then replays stdin to the remainder of the original script so the original hook continues to receive the rewrite payload exactly as it expects.
+- Existing shell hooks are preserved outside a marked block. Non-shell hooks are left untouched and reported as `unsupported` without being modified.
+- Uninstall removes only the managed block; if the file was created for us and nothing else remains, the file is deleted.
+
+### Known limits
+- The trigger is intentionally quiet and non-blocking. It never fails the Git operation if the capture store is absent.
+- The queue is best-effort and limited to a short, bounded set of commit SHAs; the existing pending derive loop remains the authority for replay and backpressure.
+- The git-side trigger is not a replacement for the capture-store record itself; it only feeds the existing deterministic derive pipeline.

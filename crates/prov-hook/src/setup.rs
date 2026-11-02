@@ -247,6 +247,13 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
         .is_ok_and(|output| output.status.success());
     check(&mut lines, &mut failed, git_available, "git", "available");
 
+    let hooks_repo = repo
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    if let Some(repo) = hooks_repo {
+        lines.push(crate::git_hooks::doctor_status(&repo));
+    }
+
     if let Some(repo) = repo {
         match repo_diagnostics(repo, &store, &default_store) {
             Ok((repo_id, resolved_event_count, other_event_count, last_event)) => {
