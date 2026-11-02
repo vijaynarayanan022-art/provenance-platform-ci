@@ -139,6 +139,10 @@ impl Fixture {
         serde_json::from_slice(&fs::read(self.derived_path(commit)).unwrap()).unwrap()
     }
 
+    fn sidecar_value(&self, commit: &str) -> Value {
+        serde_json::from_slice(&fs::read(self.lines_path(commit)).unwrap()).unwrap()
+    }
+
     fn pending(&self) -> Output {
         self.cli(&["derive", "--pending", "--repo", self.repo.to_str().unwrap()])
     }
@@ -179,6 +183,15 @@ impl Fixture {
                 json!({"event":"head_move", "timestamp":now(), "new_head":commit})
             )
             .unwrap();
+        }
+    }
+
+    fn clear_events(&self) {
+        let event_dir = self.home.join("repos").join(self.repo_id()).join("events");
+        if let Ok(entries) = fs::read_dir(event_dir) {
+            for entry in entries.flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 
@@ -348,6 +361,46 @@ fn assert_counts_consistent(value: &Value) {
             + totals["mixed"].as_u64().unwrap()
             + totals["unknown"].as_u64().unwrap()
     );
+}
+
+fn assert_sidecar_counts_match(report: &Value, sidecar: &Value) {
+    for key in ["e", "ai_strong", "ai_probable", "mixed", "unknown"] {
+        assert_eq!(sidecar["totals"][key], report["totals"][key], "{key}");
+    }
+}
+
+fn line_label<'a>(sidecar: &'a Value, path: &str, hash: &str) -> &'a str {
+    sidecar["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == path)
+        .unwrap()["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["hash"] == hash)
+        .unwrap()["label"]
+        .as_str()
+        .unwrap()
+}
+
+fn ai_commit(fixture: &Fixture, contents: &str, message: &str) -> String {
+    fixture.hook("PreToolUse", message);
+    fs::write(fixture.repo.join("tracked.txt"), contents).unwrap();
+    fixture.hook("PostToolUse", message);
+    let commit = fixture.commit(message);
+    let result = derive(fixture, &commit);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    commit
+}
+
+fn line_hash(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))[..16].to_owned()
 }
 
 #[test]
@@ -819,7 +872,9 @@ fn merge_commits_write_skip_record_and_empty_sidecar() {
     let value = fixture.derived_value(&merge);
     assert_eq!(value["skipped"], "merge_commit");
     assert_eq!(value["patch_id"], Value::Null);
-    assert_eq!(value.as_object().unwrap().len(), 4);
+    assert_eq!(value["rewrite"]["method"], "none");
+    assert_eq!(value["rewrite"]["sources"], json!([]));
+    assert_eq!(value.as_object().unwrap().len(), 5);
     let lines_path = fixture
         .derived_path(&merge)
         .with_file_name(format!("{merge}.lines.json"));
@@ -1068,5 +1123,391 @@ fn pending_derivation_caps_at_fifty_and_continues_next_run() {
     let second = fixture.pending();
     assert_eq!(second.status.code(), Some(0));
     assert_eq!(count_derived(), 60);
+    fixture.drop_root();
+}
+
+#[test]
+fn amend_message_carries_strong_labels_by_patch_id_and_pending_is_deterministic() {
+    let fixture = Fixture::new("rewrite-amend-message");
+    let phrase = "AI-authored persistent phrase";
+    let source = ai_commit(
+        &fixture,
+        &format!("one\ntwo\n{phrase}\n"),
+        "AI source commit",
+    );
+    assert_eq!(
+        file(&fixture.derived_value(&source), "tracked.txt")["ai_strong"],
+        1
+    );
+    fixture.clear_events();
+    git(
+        &fixture.repo,
+        &["commit", "--amend", "-m", "amended message only"],
+    );
+    let amended = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    fixture.queue_head_moves(std::slice::from_ref(&amended));
+
+    let pending = fixture.pending();
+    assert_eq!(pending.status.code(), Some(0));
+    assert!(pending.stdout.is_empty() && pending.stderr.is_empty());
+    let report = fixture.derived_value(&amended);
+    let sidecar = fixture.sidecar_value(&amended);
+    assert_eq!(report["rewrite"]["method"], "patch_id");
+    assert_eq!(report["rewrite"]["sources"], json!([source]));
+    assert_eq!(report["rewrite"]["carried_lines"], 1);
+    assert_eq!(report["coverage"], "high");
+    assert_eq!(line_label(&sidecar, "tracked.txt", &line_hash(phrase)), "s");
+    assert_sidecar_counts_match(&report, &sidecar);
+    assert!(
+        !String::from_utf8_lossy(&fs::read(fixture.lines_path(&amended)).unwrap()).contains(phrase)
+    );
+
+    let report_bytes = fs::read(fixture.derived_path(&amended)).unwrap();
+    let sidecar_bytes = fs::read(fixture.lines_path(&amended)).unwrap();
+    assert!(derive(&fixture, &amended).status.success());
+    assert_eq!(
+        fs::read(fixture.derived_path(&amended)).unwrap(),
+        report_bytes
+    );
+    assert_eq!(
+        fs::read(fixture.lines_path(&amended)).unwrap(),
+        sidecar_bytes
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn cherry_picked_rebase_carries_strong_labels_by_patch_id() {
+    let fixture = Fixture::new("rewrite-rebase");
+    let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    let phrase = "AI-authored rebased phrase";
+    git(&fixture.repo, &["checkout", "-b", "ai-source"]);
+    let source = ai_commit(
+        &fixture,
+        &format!("one\ntwo\n{phrase}\n"),
+        "AI source for rebase",
+    );
+
+    git(&fixture.repo, &["checkout", &base]);
+    git(&fixture.repo, &["checkout", "-b", "rebased-base"]);
+    fs::write(fixture.repo.join("other.txt"), b"different base\n").unwrap();
+    let _ = fixture.commit("different base commit");
+    git(&fixture.repo, &["cherry-pick", &source]);
+    let rewritten = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    assert!(derive(&fixture, &rewritten).status.success());
+
+    let report = fixture.derived_value(&rewritten);
+    let sidecar = fixture.sidecar_value(&rewritten);
+    assert_eq!(report["rewrite"]["method"], "patch_id");
+    assert_eq!(report["rewrite"]["sources"], json!([source]));
+    assert_eq!(line_label(&sidecar, "tracked.txt", &line_hash(phrase)), "s");
+    assert_sidecar_counts_match(&report, &sidecar);
+    fixture.drop_root();
+}
+
+#[test]
+fn changed_amend_uses_content_and_caps_inherited_labels_at_probable() {
+    let fixture = Fixture::new("rewrite-amend-content");
+    let persistent = "persistent AI-authored phrase";
+    let replaced = "old AI-authored phrase";
+    let replacement = "new replacement wording";
+    let source = ai_commit(
+        &fixture,
+        &format!("one\ntwo\n{persistent}\n{replaced}\n"),
+        "AI source before edited amend",
+    );
+    fixture.clear_events();
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        format!("one\ntwo\n{persistent}\n{replacement}\n"),
+    )
+    .unwrap();
+    git(&fixture.repo, &["add", "tracked.txt"]);
+    git(
+        &fixture.repo,
+        &["commit", "--amend", "-m", "amend with one edit"],
+    );
+    let amended = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    assert!(derive(&fixture, &amended).status.success());
+
+    let report = fixture.derived_value(&amended);
+    let sidecar = fixture.sidecar_value(&amended);
+    assert_eq!(report["rewrite"]["method"], "content");
+    assert_eq!(report["rewrite"]["sources"], json!([source]));
+    assert_eq!(report["rewrite"]["carried_lines"], 1);
+    assert_eq!(
+        line_label(&sidecar, "tracked.txt", &line_hash(persistent)),
+        "p"
+    );
+    assert_eq!(
+        line_label(&sidecar, "tracked.txt", &line_hash(replacement)),
+        "u"
+    );
+    assert_sidecar_counts_match(&report, &sidecar);
+    fixture.drop_root();
+}
+
+#[test]
+fn soft_reset_squash_carries_lines_from_both_derived_sources() {
+    let fixture = Fixture::new("rewrite-squash");
+    let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    let first_line = "first source AI phrase";
+    let second_line = "second source AI phrase";
+    let first = ai_commit(
+        &fixture,
+        &format!("one\ntwo\n{first_line}\n"),
+        "first AI source",
+    );
+    let second = ai_commit(
+        &fixture,
+        &format!("one\ntwo\n{first_line}\n{second_line}\n"),
+        "second AI source",
+    );
+    fixture.clear_events();
+    git(&fixture.repo, &["reset", "--soft", &base]);
+    let squashed = fixture.commit("squashed AI edits");
+    assert!(derive(&fixture, &squashed).status.success());
+
+    let report = fixture.derived_value(&squashed);
+    let sidecar = fixture.sidecar_value(&squashed);
+    let mut expected_sources = vec![first, second];
+    expected_sources.sort();
+    assert_eq!(report["rewrite"]["method"], "content");
+    assert_eq!(report["rewrite"]["sources"], json!(expected_sources));
+    assert_eq!(report["rewrite"]["carried_lines"], 2);
+    assert_eq!(
+        line_label(&sidecar, "tracked.txt", &line_hash(first_line)),
+        "p"
+    );
+    assert_eq!(
+        line_label(&sidecar, "tracked.txt", &line_hash(second_line)),
+        "p"
+    );
+    assert_sidecar_counts_match(&report, &sidecar);
+    let serialized = String::from_utf8(fs::read(fixture.lines_path(&squashed)).unwrap()).unwrap();
+    assert!(!serialized.contains(first_line));
+    assert!(!serialized.contains(second_line));
+    fixture.drop_root();
+}
+
+#[test]
+fn ancestor_sources_and_short_content_lines_are_not_carried() {
+    let ancestor = Fixture::new("rewrite-ancestor");
+    let shared = "long identical ancestor phrase";
+    let source = ai_commit(
+        &ancestor,
+        &format!("one\ntwo\n{shared}\n"),
+        "ancestor source",
+    );
+    ancestor.clear_events();
+    fs::write(
+        ancestor.repo.join("tracked.txt"),
+        format!("one\ntwo\n{shared}\n{shared}\nnew target phrase\n"),
+    )
+    .unwrap();
+    let target = ancestor.commit("descendant with duplicate line");
+    assert!(derive(&ancestor, &target).status.success());
+    let report = ancestor.derived_value(&target);
+    assert_eq!(report["rewrite"]["method"], "none");
+    assert_eq!(report["rewrite"]["carried_lines"], 0);
+    assert_ne!(target, source);
+    ancestor.drop_root();
+
+    let short = Fixture::new("rewrite-short");
+    let base = git_text(&short.repo, &["rev-parse", "HEAD"]);
+    git(&short.repo, &["checkout", "-b", "short-source"]);
+    let source = ai_commit(
+        &short,
+        "one\ntwo\n}\npass\nsource-only phrase\n",
+        "short source",
+    );
+    git(&short.repo, &["checkout", &base]);
+    short.clear_events();
+    fs::write(
+        short.repo.join("tracked.txt"),
+        "one\ntwo\n}\npass\ntarget-only phrase\n",
+    )
+    .unwrap();
+    let target = short.commit("short target");
+    assert!(derive(&short, &target).status.success());
+    let report = short.derived_value(&target);
+    let sidecar = short.sidecar_value(&target);
+    assert_eq!(report["rewrite"]["method"], "none");
+    assert_eq!(report["rewrite"]["carried_lines"], 0);
+    assert_eq!(report["rewrite"]["sources"], json!([]));
+    assert_eq!(line_label(&sidecar, "tracked.txt", &line_hash("}")), "u");
+    assert_eq!(line_label(&sidecar, "tracked.txt", &line_hash("pass")), "u");
+    assert_ne!(target, source);
+    short.drop_root();
+}
+
+#[test]
+fn conflicting_content_sources_choose_the_weakest_label() {
+    let fixture = Fixture::new("rewrite-conflict");
+    let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    let shared = "long shared conflicting phrase";
+    git(&fixture.repo, &["checkout", "-b", "unknown-source"]);
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        format!("one\ntwo\n{shared}\n"),
+    )
+    .unwrap();
+    let unknown = fixture.commit("unknown source");
+    assert!(derive(&fixture, &unknown).status.success());
+    assert_eq!(
+        file(&fixture.derived_value(&unknown), "tracked.txt")["unknown"],
+        1
+    );
+
+    git(&fixture.repo, &["checkout", &base]);
+    git(&fixture.repo, &["checkout", "-b", "strong-source"]);
+    let strong = ai_commit(&fixture, &format!("one\ntwo\n{shared}\n"), "strong source");
+    git(&fixture.repo, &["checkout", &base]);
+    fixture.clear_events();
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        format!("one\ntwo\n{shared}\ntarget-only phrase\n"),
+    )
+    .unwrap();
+    let target = fixture.commit("conflicting target");
+    assert!(derive(&fixture, &target).status.success());
+    let report = fixture.derived_value(&target);
+    let sidecar = fixture.sidecar_value(&target);
+    assert_eq!(report["rewrite"]["method"], "none");
+    assert_eq!(report["rewrite"]["carried_lines"], 0);
+    assert_eq!(line_label(&sidecar, "tracked.txt", &line_hash(shared)), "u");
+    assert_eq!(report["rewrite"]["sources"], json!([]));
+    assert_ne!(strong, unknown);
+    fixture.drop_root();
+}
+
+#[test]
+fn rewrite_hash_entry_limit_keeps_the_normal_report() {
+    let fixture = Fixture::new("rewrite-entry-limit");
+    let source = ai_commit(
+        &fixture,
+        "one\ntwo\nAI source phrase for entry limit\n",
+        "large source",
+    );
+    let source_sidecar_path = fixture.lines_path(&source);
+    let source_sidecar = fixture.sidecar_value(&source);
+    let hash = source_sidecar["files"][0]["lines"][0]["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let entries: Vec<_> = (1..=200_001)
+        .map(|line| json!({"line":line,"hash":hash,"label":"s"}))
+        .collect();
+    let oversized = json!({
+        "schema":"prov.lines/0.1",
+        "repo_id":source_sidecar["repo_id"],
+        "commit":source,
+        "totals":{"e":200001,"ai_strong":200001,"ai_probable":0,"mixed":0,"unknown":0},
+        "files":[{"path":"tracked.txt","lines":entries}],
+    });
+    fs::write(
+        &source_sidecar_path,
+        serde_json::to_vec(&oversized).unwrap(),
+    )
+    .unwrap();
+    fixture.clear_events();
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        "one\ntwo\nindependent target phrase\n",
+    )
+    .unwrap();
+    let target = fixture.commit("target after entry cap");
+    assert!(derive(&fixture, &target).status.success());
+    let report = fixture.derived_value(&target);
+    assert_eq!(report["rewrite"]["method"], "none");
+    assert_eq!(report["rewrite"]["carried_lines"], 0);
+    assert_eq!(file(&report, "tracked.txt")["unknown"], 1);
+    assert_sidecar_counts_match(&report, &fixture.sidecar_value(&target));
+    fixture.drop_root();
+}
+
+#[test]
+fn unrelated_source_with_one_common_line_fails_overlap_threshold() {
+    let fixture = Fixture::new("rewrite-overlap-filter");
+    let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    let common = "import numpy as np";
+    git(&fixture.repo, &["checkout", "-b", "unrelated-ai"]);
+    let source = ai_commit(
+        &fixture,
+        &format!("one\ntwo\n{common}\nsource-only alpha\nsource-only beta\n"),
+        "unrelated AI source",
+    );
+
+    git(&fixture.repo, &["checkout", &base]);
+    git(&fixture.repo, &["checkout", "-b", "target-branch"]);
+    fixture.clear_events();
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        format!("one\ntwo\n{common}\ntarget-only phrase\n"),
+    )
+    .unwrap();
+    let target = fixture.commit("unrelated target");
+    assert!(derive(&fixture, &target).status.success());
+
+    let report = fixture.derived_value(&target);
+    let sidecar = fixture.sidecar_value(&target);
+    assert_eq!(report["rewrite"]["method"], "none");
+    assert_eq!(report["rewrite"]["sources"], json!([]));
+    assert_eq!(report["rewrite"]["carried_lines"], 0);
+    assert_eq!(line_label(&sidecar, "tracked.txt", &line_hash(common)), "u");
+    assert_ne!(source, target);
+    fixture.drop_root();
+}
+
+#[test]
+fn rewrite_scan_with_three_hundred_derived_commits_stays_bounded() {
+    let fixture = Fixture::new("rewrite-bounded-scan");
+    fixture.hook("Stop", "large-rewrite-init");
+    let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    let noise = fixture.empty_commits(300);
+    let range = format!("{base}..{}", noise.last().unwrap());
+    let derived_noise = fixture.cli(&[
+        "derive",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--range",
+        &range,
+    ]);
+    assert!(
+        derived_noise.status.success(),
+        "{}",
+        String::from_utf8_lossy(&derived_noise.stderr)
+    );
+
+    let noise_tip = noise.last().unwrap();
+    git(&fixture.repo, &["checkout", "-b", "bounded-ai-source"]);
+    let phrase = "AI source phrase survives bounded scanning";
+    let source = ai_commit(
+        &fixture,
+        &format!("one\ntwo\n{phrase}\n"),
+        "AI source among many reports",
+    );
+    git(&fixture.repo, &["checkout", noise_tip]);
+    git(&fixture.repo, &["checkout", "-b", "bounded-rewrite"]);
+    git(&fixture.repo, &["cherry-pick", &source]);
+    let rewritten = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+
+    let started = Instant::now();
+    let result = derive(&fixture, &rewritten);
+    let elapsed = started.elapsed();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "rewrite derive took {elapsed:?}"
+    );
+    let report = fixture.derived_value(&rewritten);
+    let sidecar = fixture.sidecar_value(&rewritten);
+    assert_eq!(report["rewrite"]["method"], "patch_id");
+    assert_eq!(report["rewrite"]["sources"], json!([source]));
+    assert_eq!(line_label(&sidecar, "tracked.txt", &line_hash(phrase)), "s");
     fixture.drop_root();
 }

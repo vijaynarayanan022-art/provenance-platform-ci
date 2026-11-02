@@ -25,6 +25,7 @@ struct CommitOutput {
     coverage: &'static str,
     files: Vec<FileOutput>,
     patch_id: Option<String>,
+    rewrite: RewriteOutput,
 }
 
 #[derive(Serialize)]
@@ -33,6 +34,7 @@ struct MergeOutput {
     commit: String,
     skipped: &'static str,
     patch_id: Option<String>,
+    rewrite: RewriteOutput,
 }
 
 #[derive(Serialize)]
@@ -90,6 +92,15 @@ struct FileOutput {
     unknown: usize,
     excluded: usize,
     evidence: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    carried: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct RewriteOutput {
+    method: &'static str,
+    sources: Vec<String>,
+    carried_lines: usize,
 }
 
 #[derive(Clone)]
@@ -363,6 +374,11 @@ fn derive_resolved_commit(
             commit,
             skipped: "merge_commit",
             patch_id: None,
+            rewrite: RewriteOutput {
+                method: "none",
+                sources: Vec::new(),
+                carried_lines: 0,
+            },
         })
         .map_err(|error| error.to_string())?;
         crate::ensure_private_dir(output_path.parent().ok_or("invalid commit path")?)
@@ -553,6 +569,7 @@ fn derive_resolved_commit(
             unknown: counts.u,
             excluded: 0,
             evidence,
+            carried: None,
         });
     }
 
@@ -618,11 +635,17 @@ fn derive_resolved_commit(
         coverage,
         files: output_files,
         patch_id,
+        rewrite: RewriteOutput {
+            method: "none",
+            sources: Vec::new(),
+            carried_lines: 0,
+        },
     })
     .map_err(|error| error.to_string())?;
     crate::ensure_private_dir(output_path.parent().ok_or("invalid commit path")?)
         .map_err(|error| error.to_string())?;
     crate::atomic_bytes(&output_path, &bytes, false).map_err(|error| error.to_string())?;
+    let _ = crate::rewrite::apply(&repo.root, store, &commit);
     Ok(output_path)
 }
 
@@ -658,6 +681,11 @@ fn write_empty_commit(
         coverage: "none",
         files: Vec::new(),
         patch_id: None,
+        rewrite: RewriteOutput {
+            method: "none",
+            sources: Vec::new(),
+            carried_lines: 0,
+        },
     })
     .map_err(|error| error.to_string())?;
     crate::ensure_private_dir(&commits_dir).map_err(|error| error.to_string())?;
@@ -1122,6 +1150,7 @@ fn skipped_file(
         unknown: 0,
         excluded: added_nonblank(parent, committed),
         evidence,
+        carried: None,
     }
 }
 
@@ -1135,6 +1164,7 @@ fn skipped_file_added(path: String, added_lines: usize, evidence: &'static str) 
         unknown: 0,
         excluded: added_lines,
         evidence,
+        carried: None,
     }
 }
 
@@ -1148,6 +1178,7 @@ fn unknown_file(path: String, evidence: &'static str, added: usize) -> FileOutpu
         unknown: added,
         excluded: 0,
         evidence,
+        carried: None,
     }
 }
 
