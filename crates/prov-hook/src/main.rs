@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod git_hooks;
 mod setup;
 
 fn main() -> ExitCode {
@@ -56,7 +57,85 @@ fn main() -> ExitCode {
             }
             Err(error) => cli_error(error),
         },
+        Some("git-event") => git_event_command(args),
+        Some("install-git") => match install_git_command(args) {
+            Ok((output, _unsupported)) => {
+                print!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => cli_error(error),
+        },
+        Some("uninstall-git") => match uninstall_git_command(args) {
+            Ok(output) => {
+                print!("{output}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => cli_error(error),
+        },
         _ => run_codex(),
+    }
+}
+
+fn git_event_command(args: impl Iterator<Item = String>) -> ExitCode {
+    let watchdog = prov_capture::start_watchdog(Duration::from_millis(1400));
+    let args: Vec<_> = args.collect();
+    let _ = panic::catch_unwind(|| git_event_inner(args));
+    watchdog.finish();
+    ExitCode::SUCCESS
+}
+
+fn git_event_inner(args: Vec<String>) {
+    let Some(event) = args.first().map(String::as_str) else {
+        return;
+    };
+    if event != "post-commit" && event != "post-rewrite" {
+        return;
+    }
+    let mut repo = std::env::current_dir().unwrap_or_default();
+    let mut args = args.iter().skip(1);
+    while let Some(argument) = args.next() {
+        if argument == "--repo" {
+            let Some(path) = args.next() else {
+                return;
+            };
+            repo = PathBuf::from(path);
+        }
+    }
+    let Ok(repo) = git_hooks::repo_root(&repo) else {
+        return;
+    };
+    let commits = if event == "post-commit" {
+        let Ok(commit) = git_hooks::head_commit(&repo) else {
+            return;
+        };
+        vec![commit]
+    } else {
+        let mut input = Vec::new();
+        let _ = std::io::stdin().take(256 * 1024).read_to_end(&mut input);
+        input
+            .split(|byte| *byte == b'\n')
+            .take(1000)
+            .filter_map(|line| {
+                let line = std::str::from_utf8(line).ok()?.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                let mut fields = line.split_whitespace();
+                let old = fields.next()?;
+                let new = fields.next()?;
+                let _ = old;
+                if new.len() != 40 && new.len() != 64 {
+                    return None;
+                }
+                if !new.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return None;
+                }
+                Some(new.to_owned())
+            })
+            .collect()
+    };
+    if prov_capture::commit::enqueue_git_commits(&repo, &commits).unwrap_or(false) {
+        prov_capture::spawn_pending_derive(&repo);
     }
 }
 
@@ -199,6 +278,32 @@ fn uninstall_command(args: impl Iterator<Item = String>) -> Result<String, Strin
         }
     }
     setup::uninstall(codex_home.as_deref(), dry_run)
+}
+
+fn install_git_command(args: impl Iterator<Item = String>) -> Result<(String, bool), String> {
+    let mut repo = None;
+    let mut args = args;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--repo" => repo = Some(PathBuf::from(args.next().ok_or("--repo needs a path")?)),
+            _ => return Err(format!("unknown install-git argument: {argument}")),
+        }
+    }
+    let repo = repo.ok_or("install-git requires --repo")?;
+    git_hooks::install(&repo)
+}
+
+fn uninstall_git_command(args: impl Iterator<Item = String>) -> Result<String, String> {
+    let mut repo = None;
+    let mut args = args;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--repo" => repo = Some(PathBuf::from(args.next().ok_or("--repo needs a path")?)),
+            _ => return Err(format!("unknown uninstall-git argument: {argument}")),
+        }
+    }
+    let repo = repo.ok_or("uninstall-git requires --repo")?;
+    git_hooks::uninstall(&repo)
 }
 
 fn doctor_command(args: impl Iterator<Item = String>) -> Result<bool, String> {
