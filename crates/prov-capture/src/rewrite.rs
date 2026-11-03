@@ -677,15 +677,16 @@ fn batch_commit_times(root: &Path, commits: &[String]) -> Result<BTreeMap<String
 }
 
 fn git_input(root: &Path, args: &[&str], input: &[u8]) -> Result<Output, String> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+        .stderr(Stdio::null());
+    crate::configure_process_command(&mut command, false);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
     let write_result = child
         .stdin
         .take()
@@ -699,13 +700,14 @@ fn git_input(root: &Path, args: &[&str], input: &[u8]) -> Result<Output, String>
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<Output, String> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| error.to_string())
+        .stdin(Stdio::null());
+    crate::configure_process_command(&mut command, false);
+    command.output().map_err(|error| error.to_string())
 }
 
 fn load_commit_file(root: &Path, commit: &str, path: &str) -> Result<Vec<u8>, String> {

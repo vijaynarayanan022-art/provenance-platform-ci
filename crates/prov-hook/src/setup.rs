@@ -164,18 +164,19 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
     let configured_binary = configured_binaries.first().cloned();
     let binary_runs = configured_binaries.len() == HOOK_EVENTS.len()
         && configured_binaries.iter().all(|binary| {
-            binary.is_file()
-                && Command::new(binary)
-                    .arg("codex")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .is_ok_and(|output| {
-                        output.status.success()
-                            && output.stdout.is_empty()
-                            && output.stderr.is_empty()
-                    })
+            if !binary.is_file() {
+                return false;
+            }
+            let mut command = Command::new(binary);
+            command
+                .arg("codex")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            prov_capture::configure_process_command(&mut command, false);
+            command.output().is_ok_and(|output| {
+                output.status.success() && output.stdout.is_empty() && output.stderr.is_empty()
+            })
         });
     if let Some(binary) = configured_binary.as_ref() {
         if binary_runs {
@@ -1184,13 +1185,14 @@ fn store_writable(path: &Path) -> (bool, String) {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| error.to_string())
+        .stdin(Stdio::null());
+    prov_capture::configure_process_command(&mut command, false);
+    command.output().map_err(|error| error.to_string())
 }
 
 fn repo_diagnostics(
