@@ -361,11 +361,12 @@ fn contains(bytes: &[u8], needle: &[u8]) -> bool {
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| error.to_string())
+        .stdin(Stdio::null());
+    prov_capture::configure_process_command(&mut command, false);
+    command.output().map_err(|error| error.to_string())
 }
