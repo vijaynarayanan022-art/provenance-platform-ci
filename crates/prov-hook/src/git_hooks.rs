@@ -39,13 +39,13 @@ struct HookBlock {
 }
 
 pub fn install(repo: &Path) -> Result<(String, bool), String> {
-    let (root, hooks_dir) = resolve_repo_and_hooks(repo)?;
+    let (_, hooks_dir) = resolve_repo_and_hooks(repo)?;
     let binary = env::current_exe().map_err(|error| error.to_string())?;
     fs::create_dir_all(&hooks_dir).map_err(|error| error.to_string())?;
     let mut output = String::new();
     let mut unsupported = false;
     for name in HOOK_NAMES {
-        let action = install_hook(&hooks_dir.join(name), name, &binary, &root)?;
+        let action = install_hook(&hooks_dir.join(name), name, &binary)?;
         unsupported |= matches!(action, HookAction::Unsupported);
         output.push_str(&format!("{name}: {}\n", action.as_str()));
     }
@@ -97,8 +97,11 @@ pub fn repo_root(repo: &Path) -> Result<PathBuf, String> {
     if !output.status.success() {
         return Err("not a Git worktree".into());
     }
-    let root = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let root = strip_verbatim_prefix(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ));
     root.canonicalize()
+        .map(strip_verbatim_prefix)
         .or(Ok(root))
         .map_err(|error: std::io::Error| error.to_string())
 }
@@ -119,7 +122,7 @@ fn resolve_repo_and_hooks(repo: &Path) -> Result<(PathBuf, PathBuf), String> {
             .trim()
             .to_owned();
         if !value.is_empty() {
-            let path = PathBuf::from(value);
+            let path = strip_verbatim_prefix(PathBuf::from(value));
             let hooks = if path.is_absolute() {
                 path
             } else {
@@ -133,7 +136,9 @@ fn resolve_repo_and_hooks(repo: &Path) -> Result<(PathBuf, PathBuf), String> {
     if !output.status.success() {
         return Err("could not resolve Git hooks directory".into());
     }
-    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let path = strip_verbatim_prefix(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ));
     let hooks = if path.is_absolute() {
         path
     } else {
@@ -142,7 +147,7 @@ fn resolve_repo_and_hooks(repo: &Path) -> Result<(PathBuf, PathBuf), String> {
     Ok((root, hooks))
 }
 
-fn install_hook(path: &Path, name: &str, binary: &Path, repo: &Path) -> Result<HookAction, String> {
+fn install_hook(path: &Path, name: &str, binary: &Path) -> Result<HookAction, String> {
     let existing = match fs::read(path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -150,16 +155,24 @@ fn install_hook(path: &Path, name: &str, binary: &Path, repo: &Path) -> Result<H
     };
     if let Some(bytes) = existing {
         if has_marker(&bytes) {
-            return Ok(if find_block(&bytes).is_some() {
-                HookAction::AlreadyInstalled
-            } else {
-                HookAction::Unsupported
-            });
+            let Some(block) = find_block(&bytes) else {
+                return Ok(HookAction::Unsupported);
+            };
+            let expected = render_block(name, binary, block.created, block.added_newline);
+            if bytes[block.start..block.end] == expected {
+                return Ok(HookAction::AlreadyInstalled);
+            }
+            let mut updated = Vec::with_capacity(bytes.len() + expected.len());
+            updated.extend_from_slice(&bytes[..block.start]);
+            updated.extend_from_slice(&expected);
+            updated.extend_from_slice(&bytes[block.end..]);
+            fs::write(path, updated).map_err(|error| error.to_string())?;
+            return Ok(HookAction::Installed);
         }
         let Some((shebang_end, has_newline)) = shell_shebang_end(&bytes) else {
             return Ok(HookAction::Unsupported);
         };
-        let block = render_block(name, binary, repo, false, !has_newline);
+        let block = render_block(name, binary, false, !has_newline);
         let mut updated = Vec::with_capacity(bytes.len() + block.len() + 1);
         updated.extend_from_slice(&bytes[..shebang_end]);
         if !has_newline {
@@ -172,7 +185,7 @@ fn install_hook(path: &Path, name: &str, binary: &Path, repo: &Path) -> Result<H
     }
 
     let mut contents = b"#!/bin/sh\n".to_vec();
-    contents.extend_from_slice(&render_block(name, binary, repo, true, false));
+    contents.extend_from_slice(&render_block(name, binary, true, false));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -218,15 +231,8 @@ fn uninstall_hook(path: &Path) -> Result<HookAction, String> {
     Ok(HookAction::Removed)
 }
 
-fn render_block(
-    name: &str,
-    binary: &Path,
-    repo: &Path,
-    created: bool,
-    added_newline: bool,
-) -> Vec<u8> {
+fn render_block(name: &str, binary: &Path, created: bool, added_newline: bool) -> Vec<u8> {
     let binary = shell_quote(binary);
-    let repo = shell_quote(repo);
     let mut block = String::new();
     block.push_str("# >>> prov-hook >>>\n");
     if created {
@@ -240,21 +246,36 @@ fn render_block(
         block.push_str("if [ -n \"$prov_hook_stdin\" ]; then\n");
         block.push_str("  cat > \"$prov_hook_stdin\"\n");
         block.push_str(&format!(
-            "  [ -x {binary} ] && {binary} git-event post-rewrite --repo {repo} \"$@\" < \"$prov_hook_stdin\" >/dev/null 2>&1 &\n"
+            "  [ -x {binary} ] && {binary} git-event post-rewrite \"$@\" < \"$prov_hook_stdin\" >/dev/null 2>&1 &\n"
         ));
         block.push_str("  exec < \"$prov_hook_stdin\"\n");
         block.push_str("  rm -f \"$prov_hook_stdin\" 2>/dev/null || :\n");
         block.push_str("fi\n");
     } else {
         block.push_str(&format!(
-            "[ -x {binary} ] && {binary} git-event post-commit --repo {repo} \"$@\" </dev/null >/dev/null 2>&1 &\n"
+            "[ -x {binary} ] && {binary} git-event post-commit \"$@\" </dev/null >/dev/null 2>&1 &\n"
         ));
     }
     block.push_str("# <<< prov-hook <<<\n");
     block.into_bytes()
 }
 
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = value
+        .strip_prefix(r"\\?\")
+        .or_else(|| value.strip_prefix("//?/"))
+    {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
 fn shell_quote(path: &Path) -> String {
+    let path = strip_verbatim_prefix(path.to_path_buf());
     let value = path.to_string_lossy().replace('\\', "/");
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -340,11 +361,12 @@ fn contains(bytes: &[u8], needle: &[u8]) -> bool {
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| error.to_string())
+        .stdin(Stdio::null());
+    prov_capture::configure_process_command(&mut command, false);
+    command.output().map_err(|error| error.to_string())
 }

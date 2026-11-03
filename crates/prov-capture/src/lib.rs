@@ -15,6 +15,29 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub fn configure_process_command(command: &mut Command, background_derive: bool) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_process_creation_flags(background_derive));
+    }
+
+    #[cfg(not(windows))]
+    let _ = (command, background_derive);
+}
+
+#[cfg(windows)]
+fn windows_process_creation_flags(background_derive: bool) -> u32 {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    CREATE_NO_WINDOW
+        | if background_derive {
+            CREATE_NEW_PROCESS_GROUP
+        } else {
+            0
+        }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct TimingSnapshot {
     pub total_ns: u64,
@@ -925,6 +948,7 @@ fn git_output(
         .current_dir(cwd)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stderr(Stdio::null());
+    configure_process_command(&mut command, false);
     if let Some(input) = input {
         command.stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child = command.spawn()?;
@@ -1829,11 +1853,7 @@ fn spawn_detached_pending_derive(executable: &Path, repo_root: &Path) {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0000_0008 | 0x0800_0000);
-    }
+    configure_process_command(&mut command, true);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -2019,6 +2039,18 @@ pub fn process_json_timed(input: &[u8]) -> TimingSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn process_command_flags_hide_windows_without_detaching() {
+        assert_eq!(windows_process_creation_flags(false), 0x0800_0000);
+        assert_eq!(
+            windows_process_creation_flags(true),
+            0x0800_0000 | 0x0000_0200
+        );
+        assert_eq!(windows_process_creation_flags(true) & 0x0000_0008, 0);
+    }
+
     #[test]
     fn status_parser_handles_spaces_untracked_and_renames() {
         let mut b = b"? new file\0".to_vec();

@@ -41,8 +41,21 @@ pub fn install(
             existing_metadata,
         )
     };
-    let block = managed_block(&binary, block_features, metadata.as_deref());
-    let updated = install_block(&feature_text, &block)?;
+    let updated = if has_codex_handler(&feature_text) {
+        let mut updated = install_handlers(&feature_text, &binary)?;
+        if (metadata.is_some() || (block_features && !feature_enabled(&updated)))
+            && locate_block(&updated)?.is_none()
+        {
+            let metadata = metadata.as_deref().or_else(|| {
+                (block_features && !feature_enabled(&updated)).then_some(FEATURE_INSERTED)
+            });
+            updated = append_feature_marker(&updated, block_features, metadata);
+        }
+        updated
+    } else {
+        let block = managed_block(&binary, block_features, metadata.as_deref());
+        install_block(&feature_text, &block)?
+    };
     let warning = if binary.to_string_lossy().chars().any(char::is_whitespace) {
         "WARNING: executable path contains spaces; verify with doctor and a real Codex session.\n"
     } else {
@@ -99,7 +112,12 @@ pub fn uninstall(codex_home: Option<&Path>, dry_run: bool) -> Result<String, Str
     let home = resolve_home(codex_home)?;
     let config = home.join("config.toml");
     let original = read_config(&config)?;
-    let updated = uninstall_block(&original)?;
+    let marker_exists = locate_block(&original)?.is_some();
+    let updated = if !marker_exists || has_foreign_handler_in_block(&original) {
+        uninstall_handlers(&original)?
+    } else {
+        uninstall_block(&uninstall_handlers(&original)?)?
+    };
     if updated == original {
         return Ok(if dry_run {
             "No changes.\n".into()
@@ -127,28 +145,57 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
     let mut lines = Vec::new();
     let mut failed = false;
 
-    let configured_binary = managed_command(&contents).map(PathBuf::from);
-    let binary_runs = configured_binary.as_ref().is_some_and(|binary| {
-        binary.is_file()
-            && Command::new(binary)
+    let current_binary = strip_verbatim_prefix(current_binary);
+    let handlers = hook_handlers(&contents);
+    let mut configured_binaries = Vec::new();
+    let mut handler_counts_match = true;
+    for (event, _) in HOOK_EVENTS {
+        let matching: Vec<_> = handlers
+            .iter()
+            .filter(|handler| handler.event == event && handler.args == ["codex"])
+            .collect();
+        handler_counts_match &= matching.len() == 1;
+        configured_binaries.extend(
+            matching
+                .into_iter()
+                .map(|handler| handler.executable.clone()),
+        );
+    }
+    let configured_binary = configured_binaries.first().cloned();
+    let binary_runs = configured_binaries.len() == HOOK_EVENTS.len()
+        && configured_binaries.iter().all(|binary| {
+            if !binary.is_file() {
+                return false;
+            }
+            let mut command = Command::new(binary);
+            command
                 .arg("codex")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .is_ok_and(|output| {
-                    output.status.success() && output.stdout.is_empty() && output.stderr.is_empty()
-                })
-    });
+                .stderr(Stdio::piped());
+            prov_capture::configure_process_command(&mut command, false);
+            command.output().is_ok_and(|output| {
+                output.status.success() && output.stdout.is_empty() && output.stderr.is_empty()
+            })
+        });
     if let Some(binary) = configured_binary.as_ref() {
         if binary_runs {
-            if same_file(binary, &current_binary) {
+            if configured_binaries
+                .iter()
+                .all(|configured| same_file(configured, &current_binary))
+            {
                 lines.push("PASS binary: configured executable runs silently".into());
             } else {
-                lines.push(format!(
-                    "WARN binary: configured executable differs from running binary ({})",
-                    binary.display()
-                ));
+                check(
+                    &mut lines,
+                    &mut failed,
+                    false,
+                    "binary",
+                    &format!(
+                        "handler executable differs from this binary ({})",
+                        binary.display()
+                    ),
+                );
             }
         } else {
             check(
@@ -165,7 +212,7 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
             &mut failed,
             false,
             "binary",
-            "managed block has no command executable",
+            "one or more hook events have no unique command executable",
         );
     }
     check(
@@ -183,26 +230,17 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
         "config.toml must have [features] with hooks = true; install with --enable-hooks-feature",
     );
 
-    let expected_block = configured_binary
-        .as_ref()
-        .map(|binary| {
-            managed_block(
-                binary,
-                block_has_features(&contents),
-                feature_metadata(&contents).as_deref(),
-            )
-        })
-        .unwrap_or_default();
-    let block_matches = locate_block(&contents)
-        .ok()
-        .flatten()
-        .is_some_and(|(start, end)| contents[start..end] == expected_block);
+    let block_matches = handler_counts_match
+        && configured_binaries.len() == HOOK_EVENTS.len()
+        && configured_binaries
+            .iter()
+            .all(|binary| same_file(binary, &current_binary));
     check(
         &mut lines,
         &mut failed,
         block_matches,
         "managed block",
-        "present and matches this executable",
+        "exactly one matching command handler per event",
     );
 
     for event in ["PreToolUse", "PostToolUse", "Stop"] {
@@ -216,15 +254,13 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
         );
     }
 
-    let marker_start = locate_block(&contents)
-        .ok()
-        .flatten()
-        .map(|(start, _)| start);
-    let trusted = marker_start.is_some_and(|start| {
-        HOOK_EVENTS.iter().all(|(event, snake)| {
-            let group_index = hook_group_index(&contents[..start], event);
-            trusted_state_entry(&contents, &config, snake, group_index)
-        })
+    let trusted = HOOK_EVENTS.iter().all(|(event, snake)| {
+        handlers
+            .iter()
+            .find(|handler| handler.event == *event && handler.args == ["codex"])
+            .is_some_and(|handler| {
+                trusted_state_entry(&contents, &config, snake, handler.group_index)
+            })
     });
     lines.push(if trusted {
         "PASS hook state/trust: all three entries are trusted and not disabled".into()
@@ -332,22 +368,18 @@ fn binary_path(binary: Option<&Path>) -> Result<PathBuf, String> {
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, String> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        Ok(std::env::current_dir()
+        std::env::current_dir()
             .map_err(|error| error.to_string())?
-            .join(path))
-    }
+            .join(path)
+    };
+    Ok(strip_verbatim_prefix(absolute))
 }
 
 fn managed_block(binary: &Path, features: bool, metadata: Option<&str>) -> String {
-    let path = binary.to_string_lossy();
-    let command = if !path.chars().any(char::is_whitespace) && !path.contains('\'') {
-        format!("'{path} codex'")
-    } else {
-        toml_basic_string(&format!("\"{path}\" codex"))
-    };
+    let command = render_command(binary);
     let mut block = String::from(OPEN_MARKER);
     if features {
         block.push_str("\n\n[features]\nhooks = true # prov-hook");
@@ -364,6 +396,26 @@ fn managed_block(binary: &Path, features: bool, metadata: Option<&str>) -> Strin
     block.push('\n');
     block.push_str(CLOSE_MARKER);
     block
+}
+
+fn append_feature_marker(original: &str, features: bool, metadata: Option<&str>) -> String {
+    let mut block = String::from(OPEN_MARKER);
+    if features {
+        block.push_str("\n\n[features]\nhooks = true # prov-hook");
+    }
+    if let Some(metadata) = metadata {
+        block.push('\n');
+        block.push_str(metadata);
+    }
+    block.push('\n');
+    block.push_str(CLOSE_MARKER);
+    let mut updated = original.to_owned();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(&block);
+    updated.push('\n');
+    updated
 }
 
 fn block_has_features(contents: &str) -> bool {
@@ -558,20 +610,261 @@ fn hex_decode(value: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn managed_command(contents: &str) -> Option<String> {
-    let (start, end) = locate_block(contents).ok()??;
-    let block = &contents[start..end];
-    let command = block
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("command ="))?
-        .trim();
-    let value = parse_toml_string(command)?;
-    if let Some(quoted) = value.strip_prefix('"') {
-        let end = quoted.find('"')?;
-        Some(quoted[..end].to_owned())
-    } else {
-        value.split_whitespace().next().map(str::to_owned)
+#[derive(Clone)]
+struct HookHandler {
+    event: String,
+    start: usize,
+    end: usize,
+    group_start: usize,
+    group_header_end: usize,
+    group_index: usize,
+    command_value: (usize, usize),
+    executable: PathBuf,
+    args: Vec<String>,
+}
+
+fn hook_handlers(contents: &str) -> Vec<HookHandler> {
+    let lines = line_offsets(contents);
+    let headers: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, line))| {
+            let header = line.trim();
+            header
+                .strip_prefix("[[hooks.")
+                .and_then(|suffix| suffix.strip_suffix(".hooks]]"))
+                .filter(|event| HOOK_EVENTS.iter().any(|(known, _)| event == known))
+                .map(|event| (index, event.to_owned()))
+        })
+        .collect();
+    let mut result = Vec::new();
+    for (header_index, event) in headers {
+        let (start, _) = lines[header_index];
+        let table_end = lines[header_index + 1..]
+            .iter()
+            .position(|(_, line)| line.trim_start().starts_with('['))
+            .map(|relative| lines[header_index + 1 + relative].0)
+            .unwrap_or(contents.len());
+        let table_end = contents[start..table_end]
+            .find(CLOSE_MARKER)
+            .map(|close| start + close)
+            .unwrap_or(table_end);
+        let end = lines
+            .iter()
+            .take_while(|(line_start, _)| *line_start < table_end)
+            .filter(|(line_start, line)| {
+                *line_start >= start
+                    && !line.trim().is_empty()
+                    && !line.trim_start().starts_with('#')
+            })
+            .last()
+            .map(|(line_start, line)| line_start + line.len())
+            .unwrap_or(start);
+        let group_header = lines[..header_index]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (_, line))| line.trim() == format!("[[hooks.{event}]]"));
+        let Some((group_line_index, (group_start, group_line))) = group_header else {
+            continue;
+        };
+        let group_header_end = group_start + group_line.len();
+        let group_index = lines[..group_line_index]
+            .iter()
+            .filter(|(_, line)| line.trim() == format!("[[hooks.{event}]]"))
+            .count();
+        for (line_index, (line_start, line)) in lines[header_index + 1..].iter().enumerate() {
+            let absolute_index = header_index + 1 + line_index;
+            if *line_start >= end {
+                break;
+            }
+            let Some((executable, args, value_start, value_end)) = parse_hook_command(line) else {
+                continue;
+            };
+            result.push(HookHandler {
+                event: event.clone(),
+                start,
+                end,
+                group_start: *group_start,
+                group_header_end,
+                group_index,
+                command_value: (line_start + value_start, line_start + value_end),
+                executable,
+                args,
+            });
+            let _ = absolute_index;
+            break;
+        }
     }
+    result
+}
+
+fn parse_hook_command(line: &str) -> Option<(PathBuf, Vec<String>, usize, usize)> {
+    let (key, value) = line.split_once('=')?;
+    if key.trim() != "command" {
+        return None;
+    }
+    let value_offset = key.len() + 1;
+    let leading = value.len() - value.trim_start().len();
+    let start = value_offset + leading;
+    let value = &line[start..];
+    let quote = *value.as_bytes().first()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let mut escaped = false;
+    let end = value
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, byte)| {
+            if quote == b'"' && escaped {
+                escaped = false;
+                return None;
+            }
+            if quote == b'"' && *byte == b'\\' {
+                escaped = true;
+                return None;
+            }
+            (*byte == quote).then_some(index + 1)
+        })?;
+    let decoded = parse_toml_string(&value[..end])?;
+    let (executable, args) = if let Some(quoted) = decoded.strip_prefix('"') {
+        let path_end = quoted.find('"')?;
+        (
+            PathBuf::from(&quoted[..path_end]),
+            quoted[path_end + 1..]
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+        )
+    } else {
+        let mut parts = decoded.split_whitespace();
+        let executable = PathBuf::from(parts.next()?);
+        (executable, parts.map(str::to_owned).collect())
+    };
+    Some((strip_verbatim_prefix(executable), args, start, start + end))
+}
+
+fn render_command(binary: &Path) -> String {
+    let path = strip_verbatim_prefix(binary.to_path_buf());
+    let path = path.to_string_lossy();
+    if !path.chars().any(char::is_whitespace) && !path.contains('\'') {
+        format!("'{path} codex'")
+    } else {
+        toml_basic_string(&format!("\"{path}\" codex"))
+    }
+}
+
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = value
+        .strip_prefix(r"\\?\")
+        .or_else(|| value.strip_prefix("//?/"))
+    {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+fn handler_is_ours(handler: &HookHandler) -> bool {
+    handler.args.len() == 1 && handler.args[0] == "codex"
+}
+
+fn has_codex_handler(contents: &str) -> bool {
+    hook_handlers(contents).iter().any(handler_is_ours)
+}
+
+fn has_foreign_handler_in_block(contents: &str) -> bool {
+    let Some((start, end)) = locate_block(contents).ok().flatten() else {
+        return false;
+    };
+    hook_handlers(contents)
+        .iter()
+        .any(|handler| handler.start >= start && handler.start < end && !handler_is_ours(handler))
+}
+
+fn install_handlers(contents: &str, binary: &Path) -> Result<String, String> {
+    let handlers = hook_handlers(contents);
+    let command = render_command(binary);
+    let mut edits = Vec::<(usize, usize, String)>::new();
+    let mut additions = String::new();
+    for (event, _) in HOOK_EVENTS {
+        let own: Vec<_> = handlers
+            .iter()
+            .filter(|handler| handler.event == event && handler_is_ours(handler))
+            .collect();
+        if let Some(primary) = own.first() {
+            let (start, end) = primary.command_value;
+            if contents[start..end] != command {
+                edits.push((start, end, command.clone()));
+            }
+            for duplicate in own.iter().skip(1) {
+                edits.push((duplicate.start, duplicate.end, String::new()));
+            }
+        } else {
+            if !additions.is_empty() || !contents.is_empty() {
+                additions.push('\n');
+            }
+            additions.push_str(&format!(
+                "[[hooks.{event}]]\n[[hooks.{event}.hooks]]\ntype = \"command\"\ncommand = {command}\n"
+            ));
+        }
+    }
+    edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    let mut updated = contents.to_owned();
+    for (start, end, replacement) in edits {
+        updated.replace_range(start..end, &replacement);
+    }
+    if !additions.is_empty() {
+        if !updated.is_empty() && !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&additions);
+    }
+    Ok(updated)
+}
+
+fn uninstall_handlers(contents: &str) -> Result<String, String> {
+    let handlers = hook_handlers(contents);
+    let own: Vec<_> = handlers
+        .iter()
+        .filter(|handler| handler_is_ours(handler))
+        .collect();
+    let mut edits = Vec::<(usize, usize)>::new();
+    for handler in &own {
+        edits.push((handler.start, handler.end));
+        let siblings_in_group = handlers.iter().any(|other| {
+            other.group_start == handler.group_start
+                && other.event == handler.event
+                && !handler_is_ours(other)
+        });
+        if !siblings_in_group {
+            let parent_has_values = contents[handler.group_header_end..handler.start]
+                .lines()
+                .any(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.is_empty() && !trimmed.starts_with('#')
+                });
+            if !parent_has_values {
+                let newline_end = contents[handler.group_start..handler.group_header_end]
+                    .find('\n')
+                    .map(|offset| handler.group_start + offset + 1)
+                    .unwrap_or(handler.group_header_end);
+                edits.push((handler.group_start, newline_end));
+            }
+        }
+    }
+    edits.sort_by_key(|(start, _)| std::cmp::Reverse(*start));
+    let mut updated = contents.to_owned();
+    for (start, end) in edits {
+        updated.replace_range(start..end, "");
+    }
+    Ok(updated)
 }
 
 fn parse_toml_string(value: &str) -> Option<String> {
@@ -796,14 +1089,6 @@ fn check(lines: &mut Vec<String>, failed: &mut bool, passed: bool, name: &str, d
     lines.push(format!("{status} {name}: {detail}"));
 }
 
-fn hook_group_index(before_block: &str, event: &str) -> usize {
-    let table = format!("[[hooks.{event}]]");
-    before_block
-        .lines()
-        .filter(|line| line.trim() == table)
-        .count()
-}
-
 fn trusted_state_entry(
     contents: &str,
     config_path: &Path,
@@ -900,13 +1185,14 @@ fn store_writable(path: &Path) -> (bool, String) {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| error.to_string())
+        .stdin(Stdio::null());
+    prov_capture::configure_process_command(&mut command, false);
+    command.output().map_err(|error| error.to_string())
 }
 
 fn repo_diagnostics(

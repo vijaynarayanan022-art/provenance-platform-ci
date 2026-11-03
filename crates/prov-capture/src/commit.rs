@@ -850,15 +850,16 @@ fn stable_patch_id(root: &Path, parent: &str, commit: &str) -> Option<String> {
     if !diff.status.success() || !patch_diff_size_allowed(diff.stdout.len()) {
         return None;
     }
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["patch-id", "--stable"])
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    crate::configure_process_command(&mut command, false);
+    let mut child = command.spawn().ok()?;
     child.stdin.take()?.write_all(&diff.stdout).ok()?;
     let output = child.wait_with_output().ok()?;
     if !output.status.success() {
@@ -1358,13 +1359,14 @@ pub fn coverage_band(covered: usize, total: usize) -> &'static str {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<Output, String> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| error.to_string())
+        .stdin(Stdio::null());
+    crate::configure_process_command(&mut command, false);
+    command.output().map_err(|error| error.to_string())
 }
 
 fn git_checked(root: &Path, args: &[&str]) -> Result<String, String> {
