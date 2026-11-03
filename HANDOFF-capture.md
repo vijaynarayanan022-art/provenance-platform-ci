@@ -117,3 +117,9 @@ The queue reuses the existing pending-derive mechanism in `prov-capture`. Once a
 - The trigger is intentionally quiet and non-blocking. It never fails the Git operation if the capture store is absent.
 - The queue is best-effort and limited to a short, bounded set of commit SHAs; the existing pending derive loop remains the authority for replay and backpressure.
 - The git-side trigger is not a replacement for the capture-store record itself; it only feeds the existing deterministic derive pipeline.
+
+## Round 8: coexistence and repo-less Git hooks
+
+Codex setup now identifies its handler by the executable plus the sole `codex` argument, even when other command handlers share the same event group. Doctor checks for exactly one matching handler per event and remains read-only. Install updates only our command values or appends missing handler tables; uninstall removes only our tables and retains sibling handlers and hook-state tables byte-for-byte. Legacy marker blocks remain supported, and reversible `[features].hooks` metadata is preserved.
+
+New Git hook blocks invoke `git-event` without `--repo`; the command resolves the worktree using Git's current-directory and environment context. Existing `--repo` invocations remain supported, and `install-git` upgrades old managed blocks without rewriting surrounding hook content. Windows verbatim `\\?\` prefixes are stripped from emitted and normalized paths.
