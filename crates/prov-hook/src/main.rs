@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod git_hooks;
+mod pr_report;
 mod setup;
 
 fn main() -> ExitCode {
@@ -31,6 +32,21 @@ fn main() -> ExitCode {
         }
         Some("show") => match show_command(args) {
             Ok(()) => ExitCode::SUCCESS,
+            Err(error) => cli_error(error),
+        },
+        Some("pr-report") => match pr_report::command(args) {
+            Ok((bytes, output_path)) => {
+                let result = if let Some(path) = output_path {
+                    std::fs::write(path, bytes)
+                } else {
+                    use std::io::Write;
+                    std::io::stdout().write_all(&bytes)
+                };
+                match result {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => cli_error(error.to_string()),
+                }
+            }
             Err(error) => cli_error(error),
         },
         Some("install") => match install_command(args) {

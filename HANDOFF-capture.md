@@ -118,6 +118,15 @@ The queue reuses the existing pending-derive mechanism in `prov-capture`. Once a
 - The queue is best-effort and limited to a short, bounded set of commit SHAs; the existing pending derive loop remains the authority for replay and backpressure.
 - The git-side trigger is not a replacement for the capture-store record itself; it only feeds the existing deterministic derive pipeline.
 
+## Round 9: per-PR attribution report
+
+`prov-hook pr-report --repo <path> --base <rev> --head <rev>` emits a single `prov.pr-report/0.1` JSON object. Add optional `--pr`, `--title`, `--author`, `--status`, and `--url` metadata. `--prs-file <prs.json>` emits a `prov.dashboard/0.1` document with PR entries in file order; `--out <file>` writes the same JSON bytes that otherwise go to stdout. `--no-derive` reports missing commit reports as underived without failing.
+
+PR commits come from `git rev-list --no-merges <base>..<head>`, capped at 500; `truncated` marks a larger range. Missing reports are queued and processed once through the existing pending derive path, retaining its 50-commit/20-second cap, lock, attempt markers, and tombstones. Any remainder is underived. The report aggregates stored per-commit JSON and does not recompute line labels. Incomplete attribution metrics are `null`; percentages are rounded to one decimal, and empty eligible totals have null percentages. `files_changed` is the distinct path count in the base-to-head Git tree diff, including deletions. Evidence, coverage, tools, carried lines, and top files summarize only a complete range; a missing commit report or capped range makes unavailable aggregate fields null.
+
+Counts are summed per commit, not deduplicated across the pull request: if a line is rewritten in two commits, it can count once in each commit. `tools` comes from stored AI-change events matched to each commit's changed paths and time window; rewrite source commits are included for carried attribution. The current capture source records `codex` as its agent tool.
+
+To prepare `prs.json`, start with `gh pr list --state all --json number,title,author,state,url,baseRefOid,headRefOid`, then map `state` to `status` (`OPEN`/`MERGED`/`CLOSED` to `open`/`merged`/`closed`), `author.login` to `author`, and `baseRefOid`/`headRefOid` to `base`/`head`. If the PR commits are not present locally, first fetch them with `git fetch origin "refs/pull/*/head:refs/remotes/origin/pr/*"`.
 ## Round 8: coexistence and repo-less Git hooks
 
 Codex setup now identifies its handler by the executable plus the sole `codex` argument, even when other command handlers share the same event group. Doctor checks for exactly one matching handler per event and remains read-only. Install updates only our command values or appends missing handler tables; uninstall removes only our tables and retains sibling handlers and hook-state tables byte-for-byte. Legacy marker blocks remain supported, and reversible `[features].hooks` metadata is preserved.

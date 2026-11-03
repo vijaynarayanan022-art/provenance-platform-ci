@@ -160,6 +160,7 @@ version = "0.1.0"
 dependencies = [
  "fd-lock",
  "prov-capture",
+ "serde",
  "serde_json",
  "sha2",
  "similar",

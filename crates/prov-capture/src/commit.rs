@@ -118,6 +118,8 @@ struct EventRecord {
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
+    tool: Option<String>,
+    #[serde(default)]
     after_sha: Option<String>,
     #[serde(default)]
     degraded: Option<bool>,
@@ -142,6 +144,58 @@ pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String
     let events = read_events(&store.join("events"));
     let event_index = index_events(&events);
     derive_commit_with_events(&repo, &repo_id, &store, revision, &events, &event_index)
+}
+
+pub fn reports_for_commits(repo_path: &Path, commits: &[String]) -> Result<CommitReports, String> {
+    let (_, repo_id, store) = repo_context(repo_path)?;
+    let reports = commits
+        .iter()
+        .map(
+            |commit| match fs::read(store.join("commits").join(format!("{commit}.json"))) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.to_string()),
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CommitReports { repo_id, reports })
+}
+
+pub struct CommitReports {
+    pub repo_id: String,
+    pub reports: Vec<Option<Vec<u8>>>,
+}
+
+pub fn tools_for_commits(repo_path: &Path, commits: &[String]) -> Result<Vec<Vec<String>>, String> {
+    let (repo, _, store) = repo_context(repo_path)?;
+    let events = read_events(&store.join("events"));
+    let mut result = Vec::with_capacity(commits.len());
+    for commit in commits {
+        let parents = git_checked(&repo.root, &["show", "-s", "--format=%P", commit])?;
+        let parent = parents.split_whitespace().next();
+        let start = parent
+            .map(|parent| committer_time_ns(&repo.root, parent))
+            .transpose()?
+            .unwrap_or_default();
+        let end = committer_time_ns(&repo.root, commit)?.saturating_add(2 * NANOSECOND);
+        let (files, _) = commit_files(&repo.root, parent, commit)?;
+        let changed_paths: BTreeSet<_> = files.into_iter().map(|file| file.path).collect();
+        let tools: BTreeSet<_> = events
+            .iter()
+            .filter(|event| {
+                event.event == "ai_change"
+                    && event.timestamp >= start
+                    && event.timestamp <= end
+                    && event
+                        .path
+                        .as_deref()
+                        .is_some_and(|path| changed_paths.contains(path))
+            })
+            .filter_map(|event| event.tool.clone())
+            .collect();
+        result.push(tools.into_iter().collect());
+    }
+    Ok(result)
 }
 
 pub fn enqueue_git_commits(repo_path: &Path, commits: &[String]) -> Result<bool, String> {
@@ -1282,7 +1336,7 @@ fn unknown_file(path: String, evidence: &'static str, added: usize) -> FileOutpu
     }
 }
 
-fn percentage_tenths(numerator: usize, denominator: usize) -> Option<f64> {
+pub fn percentage_tenths(numerator: usize, denominator: usize) -> Option<f64> {
     if denominator == 0 {
         None
     } else {
@@ -1292,7 +1346,7 @@ fn percentage_tenths(numerator: usize, denominator: usize) -> Option<f64> {
     }
 }
 
-fn coverage_band(covered: usize, total: usize) -> &'static str {
+pub fn coverage_band(covered: usize, total: usize) -> &'static str {
     if total == 0 || covered == 0 {
         "none"
     } else if covered.saturating_mul(3) < total {
