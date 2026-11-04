@@ -257,7 +257,16 @@ fn two_commit_report_sums_stored_reports_and_out_matches_stdout() {
     );
     assert_keys(
         &value["pr"],
-        &["number", "title", "author", "status", "url", "base", "head"],
+        &[
+            "number",
+            "title",
+            "author",
+            "status",
+            "url",
+            "base",
+            "merge_base",
+            "head",
+        ],
     );
     assert_keys(
         &value["commits"],
@@ -281,6 +290,7 @@ fn two_commit_report_sums_stored_reports_and_out_matches_stdout() {
     );
     assert_eq!(value["pr"]["number"], 42);
     assert_eq!(value["pr"]["base"], base);
+    assert_eq!(value["pr"]["merge_base"], base);
     assert_eq!(value["pr"]["head"], second);
     assert_eq!(value["commits"]["total"], 2);
     assert_eq!(value["commits"]["derived"], 2);
@@ -481,5 +491,75 @@ fn deleted_path_counts_as_changed_without_inventing_eligible_lines() {
     assert_eq!(value["lines"]["eligible"], 0);
     assert!(value["ai_deterministic_pct"].is_null());
     assert!(value["ai_linked_pct"].is_null());
+    fixture.drop_root();
+}
+
+#[test]
+fn advanced_base_changes_do_not_inflate_pr_files_changed() {
+    let fixture = Fixture::new("merge-base-advanced-base");
+    let fork_point = fixture.base();
+    let base_branch = git_text(&fixture.repo, &["symbolic-ref", "--short", "HEAD"]);
+    git(&fixture.repo, &["checkout", "-b", "pr-branch"]);
+    for index in 0..5 {
+        fs::write(
+            fixture.repo.join(format!("pr-file-{index}.txt")),
+            format!("PR change {index}\n"),
+        )
+        .unwrap();
+    }
+    let pr_head = fixture.commit("change five PR files");
+
+    git(&fixture.repo, &["checkout", &base_branch]);
+    fs::write(fixture.repo.join("notes.txt"), "base-only notes change\n").unwrap();
+    let advanced_base = fixture.commit("advance base with notes");
+
+    let output = fixture.cli(&[
+        "pr-report",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--base",
+        &advanced_base,
+        "--head",
+        &pr_head,
+        "--no-derive",
+    ]);
+    let value = parsed(&output);
+    assert_eq!(value["pr"]["base"], advanced_base);
+    assert_eq!(value["pr"]["merge_base"], fork_point);
+    assert_eq!(value["pr"]["head"], pr_head);
+    assert_eq!(value["files_changed"], 5);
+    assert_eq!(value["commits"]["total"], 1);
+    fixture.drop_root();
+}
+
+#[test]
+fn unrelated_histories_report_null_merge_base_and_changed_files() {
+    let fixture = Fixture::new("merge-base-unrelated");
+    let base = fixture.base();
+    git(
+        &fixture.repo,
+        &["checkout", "--orphan", "unrelated-history"],
+    );
+    fs::remove_file(fixture.repo.join("tracked.txt")).unwrap();
+    fs::write(fixture.repo.join("unrelated.txt"), "independent root\n").unwrap();
+    let head = fixture.commit("unrelated root commit");
+
+    let output = fixture.cli(&[
+        "pr-report",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--base",
+        &base,
+        "--head",
+        &head,
+        "--no-derive",
+    ]);
+    let value = parsed(&output);
+    assert_eq!(value["schema"], "prov.pr-report/0.1");
+    assert_eq!(value["pr"]["base"], base);
+    assert_eq!(value["pr"]["head"], head);
+    assert!(value["pr"]["merge_base"].is_null());
+    assert!(value["files_changed"].is_null());
+    assert_eq!(value["commits"]["total"], 1);
     fixture.drop_root();
 }
