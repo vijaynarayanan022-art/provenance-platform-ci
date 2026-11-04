@@ -242,6 +242,8 @@ fn two_commit_report_sums_stored_reports_and_out_matches_stdout() {
         &value,
         &[
             "schema",
+            "created_at",
+            "versions",
             "pr",
             "commits",
             "files_changed",
@@ -311,7 +313,13 @@ fn two_commit_report_sums_stored_reports_and_out_matches_stdout() {
     let file_output = fixture.cli(&with_out);
     assert!(file_output.status.success());
     assert!(file_output.stdout.is_empty() && file_output.stderr.is_empty());
-    assert_eq!(fs::read(output_path).unwrap(), output.stdout);
+    let mut stdout_value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut file_value: Value = serde_json::from_slice(&fs::read(output_path).unwrap()).unwrap();
+    assert!(stdout_value["created_at"].as_str().unwrap().ends_with('Z'));
+    assert!(file_value["created_at"].as_str().unwrap().ends_with('Z'));
+    stdout_value["created_at"] = json!("normalized");
+    file_value["created_at"] = json!("normalized");
+    assert_eq!(file_value, stdout_value);
     fixture.drop_root();
 }
 
@@ -388,6 +396,28 @@ fn prs_file_produces_dashboard_in_input_order() {
     assert_eq!(value["schema"], "prov.dashboard/0.1");
     assert!(value["generated_at"].as_str().unwrap().ends_with('Z'));
     assert_eq!(value["prs"].as_array().unwrap().len(), 3);
+    let pr = &value["prs"][0];
+    assert!(pr["created_at"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(
+        pr["versions"],
+        json!({
+            "engine": env!("CARGO_PKG_VERSION"),
+            "algorithm": "derive-v1",
+            "formula": "strict-v1",
+            "eligibility": "non-blank-added-v1",
+            "coverage": "coverage-v1",
+        })
+    );
+    assert_eq!(
+        pr["coverage"],
+        json!({
+            "band": "high",
+            "analysis": "complete",
+            "content": "complete",
+            "source": "high",
+            "history": "unknown",
+        })
+    );
     assert_eq!(value["prs"][0]["pr"]["number"], 30);
     assert_eq!(value["prs"][1]["pr"]["number"], 10);
     assert_eq!(value["prs"][2]["pr"]["number"], 20);

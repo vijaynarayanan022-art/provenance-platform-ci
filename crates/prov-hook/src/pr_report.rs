@@ -7,6 +7,11 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_COMMITS: usize = 500;
+const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const ALGORITHM_VERSION: &str = "derive-v1";
+const FORMULA_VERSION: &str = "strict-v1";
+const ELIGIBILITY_VERSION: &str = "non-blank-added-v1";
+const COVERAGE_VERSION: &str = "coverage-v1";
 
 #[derive(Default)]
 struct Options {
@@ -50,7 +55,7 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<(Vec<u8>, Option<Pa
     let repo = resolve_repo(&repo)?;
     let repo_id = prov_capture::commit::reports_for_commits(&repo, &[])?.repo_id;
 
-    let prs = if let Some(path) = &options.prs_file {
+    let mut prs = if let Some(path) = &options.prs_file {
         let bytes = fs::read(path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
         let inputs: Vec<PrInput> =
@@ -79,10 +84,17 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<(Vec<u8>, Option<Pa
         vec![build_pr_report(&repo, &input, options.no_derive)?]
     };
 
+    let generated_at = iso8601_now();
+    for pr in &mut prs {
+        pr.as_object_mut()
+            .ok_or("PR report is not a JSON object")?
+            .insert("created_at".into(), Value::String(generated_at.clone()));
+    }
+
     let output = if options.prs_file.is_some() {
         json!({
             "schema": "prov.dashboard/0.1",
-            "generated_at": iso8601_now(),
+            "generated_at": generated_at,
             "repo_id": repo_id,
             "prs": prs,
         })
@@ -397,9 +409,24 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
     } else {
         None
     };
+    let coverage_dimensions = coverage_dimensions(
+        derived,
+        commits.len(),
+        eligible,
+        &evidence,
+        complete,
+        tools.as_deref(),
+    );
 
     Ok(json!({
         "schema": "prov.pr-report/0.1",
+        "versions": {
+            "engine": ENGINE_VERSION,
+            "algorithm": ALGORITHM_VERSION,
+            "formula": FORMULA_VERSION,
+            "eligibility": ELIGIBILITY_VERSION,
+            "coverage": COVERAGE_VERSION,
+        },
         "pr": pr,
         "commits": {
             "total": commits.len(),
@@ -412,11 +439,97 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
         "ai_deterministic_pct": deterministic_pct,
         "ai_linked_pct": linked_pct,
         "evidence": evidence_json,
-        "coverage": {"band": coverage_band},
+        "coverage": {
+            "band": coverage_band,
+            "analysis": coverage_dimensions.analysis,
+            "content": coverage_dimensions.content,
+            "source": coverage_dimensions.source,
+            "history": coverage_dimensions.history,
+        },
         "tools": tools,
         "carried_lines": complete.then_some(carried_lines),
         "top_files": top_files,
     }))
+}
+
+struct CoverageDimensions {
+    analysis: &'static str,
+    content: &'static str,
+    source: &'static str,
+    history: &'static str,
+}
+
+fn coverage_dimensions(
+    derived: usize,
+    total: usize,
+    eligible: usize,
+    evidence: &BTreeMap<&str, usize>,
+    evidence_complete: bool,
+    tools: Option<&[String]>,
+) -> CoverageDimensions {
+    CoverageDimensions {
+        analysis: analysis_coverage(derived, total),
+        content: content_coverage(evidence, eligible, evidence_complete),
+        source: source_coverage(tools),
+        history: history_coverage(),
+    }
+}
+
+// Analysis is complete only when every listed commit was derived; a nonempty partial
+// derivation is partial, and a range with no commits has no analysis coverage.
+fn analysis_coverage(derived: usize, total: usize) -> &'static str {
+    if total == 0 {
+        "unknown"
+    } else if derived == total {
+        "complete"
+    } else if derived == 0 {
+        "low"
+    } else {
+        "partial"
+    }
+}
+
+// Content tiers require a strict majority of eligible lines, except that all-exact
+// evidence is complete. A tie or unavailable evidence counts is unknown, not guessed.
+fn content_coverage(
+    evidence: &BTreeMap<&str, usize>,
+    eligible: usize,
+    evidence_complete: bool,
+) -> &'static str {
+    if eligible == 0 || !evidence_complete {
+        return "unknown";
+    }
+    let exact = evidence.get("exact").copied().unwrap_or_default();
+    let time_cut = evidence.get("time_cut").copied().unwrap_or_default();
+    let reconstructed = evidence.get("reconstructed").copied().unwrap_or_default();
+    let none = evidence.get("none").copied().unwrap_or_default();
+
+    if exact == eligible {
+        "complete"
+    } else if exact.saturating_mul(2) > eligible {
+        "high"
+    } else if time_cut.saturating_add(reconstructed).saturating_mul(2) > eligible {
+        "partial"
+    } else if none.saturating_mul(2) > eligible {
+        "low"
+    } else {
+        "unknown"
+    }
+}
+
+// Source coverage only reports what stored tool metadata establishes; absent metadata
+// is unknown, while a known empty tool set is low coverage.
+fn source_coverage(tools: Option<&[String]>) -> &'static str {
+    match tools {
+        Some(tools) if !tools.is_empty() => "high",
+        Some(_) => "low",
+        None => "unknown",
+    }
+}
+
+// Rewrite/rebase lineage is not yet verified by this report.
+fn history_coverage() -> &'static str {
+    "unknown"
 }
 
 fn resolve_revision(repo: &Path, revision: &str) -> Result<String, String> {
@@ -514,4 +627,75 @@ fn iso8601_now() -> String {
         day_seconds % 3600 / 60,
         day_seconds % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        analysis_coverage, content_coverage, history_coverage, source_coverage, ALGORITHM_VERSION,
+        COVERAGE_VERSION, ELIGIBILITY_VERSION, ENGINE_VERSION, FORMULA_VERSION,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn versions_are_named_and_use_the_hook_package_version() {
+        assert_eq!(ENGINE_VERSION, env!("CARGO_PKG_VERSION"));
+        assert_eq!(ALGORITHM_VERSION, "derive-v1");
+        assert_eq!(FORMULA_VERSION, "strict-v1");
+        assert_eq!(ELIGIBILITY_VERSION, "non-blank-added-v1");
+        assert_eq!(COVERAGE_VERSION, "coverage-v1");
+    }
+
+    #[test]
+    fn analysis_coverage_handles_empty_complete_partial_and_missing_reports() {
+        assert_eq!(analysis_coverage(0, 0), "unknown");
+        assert_eq!(analysis_coverage(3, 3), "complete");
+        assert_eq!(analysis_coverage(0, 3), "low");
+        assert_eq!(analysis_coverage(1, 3), "partial");
+    }
+
+    #[test]
+    fn content_coverage_uses_eligible_line_majorities() {
+        assert_eq!(content_coverage(&BTreeMap::new(), 0, true), "unknown");
+        assert_eq!(
+            content_coverage(&BTreeMap::from([("exact", 10)]), 10, true),
+            "complete"
+        );
+        assert_eq!(
+            content_coverage(&BTreeMap::from([("exact", 6), ("none", 4)]), 10, true),
+            "high"
+        );
+        assert_eq!(
+            content_coverage(
+                &BTreeMap::from([("time_cut", 3), ("reconstructed", 3), ("exact", 4)]),
+                10,
+                true
+            ),
+            "partial"
+        );
+        assert_eq!(
+            content_coverage(&BTreeMap::from([("none", 6), ("exact", 4)]), 10, true),
+            "low"
+        );
+        assert_eq!(
+            content_coverage(&BTreeMap::from([("exact", 5), ("none", 5)]), 10, true),
+            "unknown"
+        );
+        assert_eq!(
+            content_coverage(&BTreeMap::from([("exact", 10)]), 10, false),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn source_coverage_distinguishes_seen_empty_and_unavailable_tools() {
+        assert_eq!(source_coverage(Some(&["codex".to_owned()])), "high");
+        assert_eq!(source_coverage(Some(&[])), "low");
+        assert_eq!(source_coverage(None), "unknown");
+    }
+
+    #[test]
+    fn history_coverage_remains_unknown() {
+        assert_eq!(history_coverage(), "unknown");
+    }
 }
