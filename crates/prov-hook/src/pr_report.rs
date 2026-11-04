@@ -165,7 +165,9 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
     }
     let base = resolve_revision(repo, &input.base)?;
     let head = resolve_revision(repo, &input.head)?;
-    let range = format!("{base}..{head}");
+    let merge_base = resolve_merge_base(repo, &base, &head)?;
+    let range_base = merge_base.as_deref().unwrap_or(&base);
+    let range = format!("{range_base}..{head}");
     let commits_output = git(
         repo,
         &["rev-list", "--no-merges", "--max-count=501", &range],
@@ -179,7 +181,10 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
         .collect();
     let truncated = commits.len() > MAX_COMMITS;
     commits.truncate(MAX_COMMITS);
-    let files_changed = changed_files_count(repo, &base, &head)?;
+    let files_changed = merge_base
+        .as_deref()
+        .map(|merge_base| changed_files_count(repo, merge_base, &head))
+        .transpose()?;
 
     let mut reports = prov_capture::commit::reports_for_commits(repo, &commits)?.reports;
     if !no_derive {
@@ -310,6 +315,7 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
         "status": input.status,
         "url": input.url,
         "base": base,
+        "merge_base": merge_base,
         "head": head,
     });
     let lines = if complete {
@@ -423,6 +429,18 @@ fn resolve_revision(repo: &Path, revision: &str) -> Result<String, String> {
         return Err(format!("could not resolve Git revision {revision}"));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn resolve_merge_base(repo: &Path, base: &str, head: &str) -> Result<Option<String>, String> {
+    let output = git(repo, &["merge-base", base, head])?;
+    if !output.status.success() {
+        return match output.status.code() {
+            Some(1) => Ok(None),
+            _ => Err("could not resolve Git merge base".into()),
+        };
+    }
+    let merge_base = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((!merge_base.is_empty()).then_some(merge_base))
 }
 
 fn changed_files_count(repo: &Path, base: &str, head: &str) -> Result<usize, String> {
