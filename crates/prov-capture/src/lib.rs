@@ -356,21 +356,25 @@ pub fn process_vscode_json(input: &[u8]) {
     let require_window = match (event_name, tool_name) {
         ("Stop", _) => false,
         ("PreToolUse" | "PostToolUse", Some("create_file")) => {
-            target_paths = Some(payload
-                .get("tool_input")
-                .and_then(|v| v.get("filePath"))
-                .and_then(|v| v.as_str())
-                .map(|path| vec![path.to_owned()])
-                .unwrap_or_default());
+            target_paths = Some(
+                payload
+                    .get("tool_input")
+                    .and_then(|v| v.get("filePath"))
+                    .and_then(|v| v.as_str())
+                    .map(|path| vec![path.to_owned()])
+                    .unwrap_or_default(),
+            );
             true
         }
         ("PreToolUse" | "PostToolUse", Some("apply_patch")) => {
-            target_paths = Some(payload
-                .get("tool_input")
-                .and_then(|v| v.get("input"))
-                .and_then(|v| v.as_str())
-                .map(parse_apply_patch_paths)
-                .unwrap_or_default());
+            target_paths = Some(
+                payload
+                    .get("tool_input")
+                    .and_then(|v| v.get("input"))
+                    .and_then(|v| v.as_str())
+                    .map(parse_apply_patch_paths)
+                    .unwrap_or_default(),
+            );
             true
         }
         ("PreToolUse" | "PostToolUse", Some("run_in_terminal")) => {
@@ -454,7 +458,10 @@ fn append_vscode_diagnostic(cwd: Option<&Path>, tool_name: &str, pre_event: bool
     let path = cwd
         .filter(|path| path.is_dir())
         .and_then(|cwd| repo_info(cwd, &home))
-        .and_then(|repo| repo.repo_id.map(|id| home.join("repos").join(id).join("markers.jsonl")))
+        .and_then(|repo| {
+            repo.repo_id
+                .map(|id| home.join("repos").join(id).join("markers.jsonl"))
+        })
         .unwrap_or_else(|| home.join("inbox.jsonl"));
     let Some(parent) = path.parent() else { return };
     if ensure_private_dir(parent).is_err() {
@@ -785,9 +792,10 @@ fn process_hook(
                 .map(str::len);
             let now = now_ns();
             let mut event_batch = Vec::with_capacity(changes.len());
-            for change in changes.into_iter().filter(|change| {
-                scoped_paths.is_none_or(|paths| paths.contains(&change.path))
-            }) {
+            for change in changes
+                .into_iter()
+                .filter(|change| scoped_paths.is_none_or(|paths| paths.contains(&change.path)))
+            {
                 let duplicate = tool_id.as_ref().is_some_and(|id| {
                     state.recent_keys.iter().any(|k| {
                         k.tool_use_id == *id && k.path == change.path && k.after_sha == change.after
@@ -796,15 +804,12 @@ fn process_hook(
                 if duplicate {
                     continue;
                 }
-                let kind = if head_moved
-                    || bulk_window
-                    || change.degraded.is_some()
-                    || missing_window
-                {
-                    "external_change"
-                } else {
-                    "ai_change"
-                };
+                let kind =
+                    if head_moved || bulk_window || change.degraded.is_some() || missing_window {
+                        "external_change"
+                    } else {
+                        "ai_change"
+                    };
                 let mut e = change_event(
                     kind,
                     change,
@@ -2238,8 +2243,7 @@ pub fn start_watchdog_with_output(cap: Duration, timeout_output: &'static [u8]) 
     let d = done.clone();
     std::thread::spawn(move || {
         std::thread::sleep(cap);
-        if d
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        if d.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
             if let Some(ctx) = MARKER_CONTEXT.lock().ok().and_then(|x| x.clone()) {
