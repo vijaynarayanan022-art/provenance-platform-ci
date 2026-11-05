@@ -161,6 +161,23 @@ pub fn reports_for_commits(repo_path: &Path, commits: &[String]) -> Result<Commi
     Ok(CommitReports { repo_id, reports })
 }
 
+pub fn lines_for_commits(
+    repo_path: &Path,
+    commits: &[String],
+) -> Result<Vec<Option<Vec<u8>>>, String> {
+    let (_, _, store) = repo_context(repo_path)?;
+    commits
+        .iter()
+        .map(
+            |commit| match fs::read(store.join("commits").join(format!("{commit}.lines.json"))) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.to_string()),
+            },
+        )
+        .collect()
+}
+
 pub struct CommitReports {
     pub repo_id: String,
     pub reports: Vec<Option<Vec<u8>>>,

@@ -5,8 +5,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod git_hooks;
+mod manage_hooks;
 mod pr_report;
 mod setup;
+mod summary;
 mod vscode_setup;
 
 fn main() -> ExitCode {
@@ -34,6 +36,13 @@ fn main() -> ExitCode {
         }
         Some("show") => match show_command(args) {
             Ok(()) => ExitCode::SUCCESS,
+            Err(error) => cli_error(error),
+        },
+        Some("summary") => match summary::command(args) {
+            Ok(output) => {
+                println!("{output}");
+                ExitCode::SUCCESS
+            }
             Err(error) => cli_error(error),
         },
         Some("pr-report") => match pr_report::command(args) {
@@ -75,6 +84,8 @@ fn main() -> ExitCode {
             }
             Err(error) => cli_error(error),
         },
+        Some("enable") => manage_hooks_command(args, true),
+        Some("disable") => manage_hooks_command(args, false),
         Some("setup") => match vscode_setup_command(args) {
             Ok(output) => {
                 print!("{output}");
@@ -276,6 +287,20 @@ fn show_command(args: impl Iterator<Item = String>) -> Result<(), String> {
 fn cli_error(error: String) -> ExitCode {
     eprintln!("{error}");
     ExitCode::FAILURE
+}
+
+fn manage_hooks_command(args: impl Iterator<Item = String>, enabling: bool) -> ExitCode {
+    match manage_hooks::command(args, enabling) {
+        Ok((output, failed)) => {
+            print!("{output}");
+            if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => cli_error(error),
+    }
 }
 
 fn install_command(args: impl Iterator<Item = String>) -> Result<String, String> {
