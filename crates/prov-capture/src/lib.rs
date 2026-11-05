@@ -136,8 +136,6 @@ struct HookInput {
     turn_id: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
-    #[serde(rename = "tool_name")]
-    _tool_name: Option<String>,
     tool_use_id: Option<String>,
     tool_input: Option<ToolInput>,
 }
@@ -164,6 +162,8 @@ struct Shadow {
 struct WindowState {
     session_id: String,
     tool_use_id: Option<String>,
+    #[serde(default)]
+    target_paths: Option<Vec<String>>,
     opened_at: u128,
     head: String,
     branch: String,
@@ -334,23 +334,212 @@ pub fn process_json(input: &[u8]) {
     let Ok(hook) = serde_json::from_slice::<HookInput>(input) else {
         return;
     };
-    let (Some(event_name), Some(cwd)) = (hook.hook_event_name.as_deref(), hook.cwd.as_deref())
-    else {
+    process_hook(hook, "codex", None, false);
+}
+
+pub fn process_vscode_json(input: &[u8]) {
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(input) else {
         return;
     };
-    let cwd = Path::new(cwd);
-    if !cwd.is_dir() {
+    let Some(event_name) = payload.get("hook_event_name").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if event_name == "SessionStart" {
+        return;
+    }
+    if !matches!(event_name, "PreToolUse" | "PostToolUse" | "Stop") {
+        return;
+    }
+    let tool_name = payload.get("tool_name").and_then(|v| v.as_str());
+    let mut target_paths = None;
+    let mut command = None;
+    let require_window = match (event_name, tool_name) {
+        ("Stop", _) => false,
+        ("PreToolUse" | "PostToolUse", Some("create_file")) => {
+            target_paths = Some(
+                payload
+                    .get("tool_input")
+                    .and_then(|v| v.get("filePath"))
+                    .and_then(|v| v.as_str())
+                    .map(|path| vec![path.to_owned()])
+                    .unwrap_or_default(),
+            );
+            true
+        }
+        ("PreToolUse" | "PostToolUse", Some("apply_patch")) => {
+            target_paths = Some(
+                payload
+                    .get("tool_input")
+                    .and_then(|v| v.get("input"))
+                    .and_then(|v| v.as_str())
+                    .map(parse_apply_patch_paths)
+                    .unwrap_or_default(),
+            );
+            true
+        }
+        ("PreToolUse" | "PostToolUse", Some("run_in_terminal")) => {
+            command = payload
+                .get("tool_input")
+                .and_then(|v| v.get("command"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            false
+        }
+        ("PreToolUse" | "PostToolUse", Some(name)) if is_read_only_vscode_tool(name) => return,
+        ("PreToolUse" | "PostToolUse", Some(name)) => {
+            append_vscode_diagnostic(
+                payload.get("cwd").and_then(|v| v.as_str()).map(Path::new),
+                name,
+                event_name == "PreToolUse",
+            );
+            return;
+        }
+        _ => return,
+    };
+    let hook = HookInput {
+        hook_event_name: Some(event_name.to_owned()),
+        session_id: payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        turn_id: None,
+        cwd: payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        model: payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        tool_use_id: payload
+            .get("tool_use_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        tool_input: command.map(|command| ToolInput {
+            command: Some(command),
+        }),
+    };
+    process_hook(hook, "vscode-copilot", target_paths, require_window);
+}
+
+fn is_read_only_vscode_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "file_search"
+            | "get_errors"
+            | "grep_search"
+            | "list_dir"
+            | "read_file"
+            | "memory"
+            | "vscode_askQuestions"
+            | "semantic_search"
+    )
+}
+
+fn parse_apply_patch_paths(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            ["*** Update File: ", "*** Add File: ", "*** Delete File: "]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+        })
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn append_vscode_diagnostic(cwd: Option<&Path>, tool_name: &str, pre_event: bool) {
+    if !pre_event {
+        return;
+    }
+    let Some(home) = store_home() else { return };
+    let path = cwd
+        .filter(|path| path.is_dir())
+        .and_then(|cwd| repo_info(cwd, &home))
+        .and_then(|repo| {
+            repo.repo_id
+                .map(|id| home.join("repos").join(id).join("markers.jsonl"))
+        })
+        .unwrap_or_else(|| home.join("inbox.jsonl"));
+    let Some(parent) = path.parent() else { return };
+    if ensure_private_dir(parent).is_err() {
+        return;
+    }
+    let mut bytes = serde_json::to_vec(&serde_json::json!({
+        "event": "unsupported_tool",
+        "tool_name": tool_name,
+    }))
+    .unwrap_or_default();
+    bytes.push(b'\n');
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)
+    {
+        let mut last = [0];
+        let torn = file
+            .seek(SeekFrom::End(-1))
+            .ok()
+            .and_then(|_| file.read_exact(&mut last).ok())
+            .is_some()
+            && last[0] != b'\n';
+        if !torn || file.write_all(b"\n").is_ok() {
+            let _ = file.write_all(&bytes);
+        }
+    }
+}
+
+fn process_hook(
+    hook: HookInput,
+    tool_label: &str,
+    target_paths: Option<Vec<String>>,
+    require_window: bool,
+) {
+    let Some(event_name) = hook.hook_event_name.as_deref() else {
+        return;
+    };
+    let cwd = hook
+        .cwd
+        .as_deref()
+        .map(Path::new)
+        .filter(|cwd| cwd.is_dir());
+    if cwd.is_none() && tool_label != "vscode-copilot" {
         return;
     }
     let Some(home) = store_home() else { return };
     let session = clean_id(hook.session_id.as_deref().unwrap_or("unknown"));
     let tool_id = hook.tool_use_id.as_deref().map(str::to_owned);
     let discovery_start = Instant::now();
-    let Some(mut repo) = repo_info(cwd, &home) else {
+    let repo = cwd.and_then(|cwd| repo_info(cwd, &home)).or_else(|| {
+        target_paths.as_ref()?.iter().find_map(|path| {
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                cwd?.join(path)
+            };
+            let start = if path.is_dir() {
+                path
+            } else {
+                path.parent()?.to_path_buf()
+            };
+            repo_info(&start, &home)
+        })
+    });
+    let Some(mut repo) = repo else {
         add_ns(&TIMINGS.repo_discovery_ns, discovery_start.elapsed());
         return;
     };
     add_ns(&TIMINGS.repo_discovery_ns, discovery_start.elapsed());
+    let target_paths = target_paths.map(|paths| {
+        paths
+            .iter()
+            .filter_map(|path| repo_relative_path(&repo.root, path))
+            .collect::<Vec<_>>()
+    });
     let marker_context = MarkerContext {
         home: home.clone(),
         repo_id: repo.repo_id.clone(),
@@ -500,6 +689,7 @@ pub fn process_json(input: &[u8]) {
             let window = WindowState {
                 session_id: session.clone(),
                 tool_use_id: tool_id.clone(),
+                target_paths: target_paths.clone(),
                 opened_at: now,
                 head: head.clone(),
                 branch: branch.clone(),
@@ -549,6 +739,11 @@ pub fn process_json(input: &[u8]) {
                 .iter()
                 .rposition(|w| w.session_id == session && w.tool_use_id == tool_id);
             let window = ix.map(|i| state.windows.remove(i));
+            let missing_window = require_window && window.is_none();
+            let scoped_paths = window
+                .as_ref()
+                .and_then(|window| window.target_paths.as_ref())
+                .or(target_paths.as_ref());
             let opened = window.as_ref().map(|w| w.opened_at);
             let prior_bulk = window.as_ref().and_then(|w| w.bulk_count);
             let bulk_window = prior_bulk.is_some() || bulk_count.is_some();
@@ -597,7 +792,10 @@ pub fn process_json(input: &[u8]) {
                 .map(str::len);
             let now = now_ns();
             let mut event_batch = Vec::with_capacity(changes.len());
-            for change in changes {
+            for change in changes
+                .into_iter()
+                .filter(|change| scoped_paths.is_none_or(|paths| paths.contains(&change.path)))
+            {
                 let duplicate = tool_id.as_ref().is_some_and(|id| {
                     state.recent_keys.iter().any(|k| {
                         k.tool_use_id == *id && k.path == change.path && k.after_sha == change.after
@@ -606,11 +804,12 @@ pub fn process_json(input: &[u8]) {
                 if duplicate {
                     continue;
                 }
-                let kind = if head_moved || bulk_window || change.degraded.is_some() {
-                    "external_change"
-                } else {
-                    "ai_change"
-                };
+                let kind =
+                    if head_moved || bulk_window || change.degraded.is_some() || missing_window {
+                        "external_change"
+                    } else {
+                        "ai_change"
+                    };
                 let mut e = change_event(
                     kind,
                     change,
@@ -622,7 +821,7 @@ pub fn process_json(input: &[u8]) {
                 );
                 e.turn_id = hook.turn_id.clone();
                 e.model = hook.model.clone();
-                e.tool = Some("codex".into());
+                e.tool = Some(tool_label.into());
                 e.command_sha256 = command_sha.clone();
                 e.command_length = command_length;
                 e.window_open = opened;
@@ -630,7 +829,11 @@ pub fn process_json(input: &[u8]) {
                 e.overlap = Some(overlap);
                 e.head = Some(close_head.clone());
                 e.branch = Some(close_branch.clone());
-                if head_moved {
+                if missing_window {
+                    e.reason = Some("before_unavailable".into());
+                    e.degraded = Some(true);
+                    e.line_ranges = None;
+                } else if head_moved {
                     e.reason = Some("head_moved".into());
                     e.head_moved = Some(true);
                 } else if bulk_window {
@@ -819,6 +1022,79 @@ fn normalized_path(path: &Path) -> PathBuf {
         }
     }
     parts.into_iter().collect()
+}
+
+fn repo_relative_path(root: &Path, value: &str) -> Option<String> {
+    let value = value.replace('\\', "/");
+    let path = PathBuf::from(&value);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    let candidate = normalize_drive_letter(canonicalized_normalized_path(&candidate));
+    let root = normalize_drive_letter(normalized_path(root));
+    let relative = candidate.strip_prefix(root).ok()?;
+    let value = relative.to_string_lossy().replace('\\', "/");
+    (!value.is_empty() && value != "." && !value.starts_with("../")).then_some(value)
+}
+
+fn canonicalized_normalized_path(path: &Path) -> PathBuf {
+    let normalized = lexical_normalized_path(path);
+    if let Ok(canonical) = normalized.canonicalize() {
+        return canonical;
+    }
+    let mut existing = normalized.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return normalized;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return normalized;
+        };
+        existing = parent;
+    }
+    let mut canonical = existing
+        .canonicalize()
+        .unwrap_or_else(|_| existing.to_path_buf());
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    canonical
+}
+
+fn lexical_normalized_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut parts = Vec::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_owned()),
+        }
+    }
+    parts.into_iter().collect()
+}
+
+fn normalize_drive_letter(path: PathBuf) -> PathBuf {
+    let value = path.to_string_lossy();
+    let bytes = value.as_bytes();
+    if bytes.len() > 1 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        let mut normalized = value.into_owned();
+        let drive = normalized[0..1].to_ascii_lowercase();
+        normalized.replace_range(0..1, &drive);
+        PathBuf::from(normalized)
+    } else {
+        path
+    }
 }
 
 fn find_git_dirs(cwd: &Path) -> Option<(PathBuf, PathBuf, PathBuf)> {
@@ -1991,8 +2267,10 @@ fn ranges(mut lines: Vec<usize>) -> Vec<[usize; 2]> {
 #[derive(Clone)]
 pub struct Watchdog(Arc<AtomicBool>);
 impl Watchdog {
-    pub fn finish(self) {
-        self.0.store(true, Ordering::SeqCst);
+    pub fn finish(self) -> bool {
+        self.0
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 }
 static MARKER_CONTEXT: Mutex<Option<MarkerContext>> = Mutex::new(None);
@@ -2002,11 +2280,17 @@ fn set_marker_context(ctx: &MarkerContext) {
     }
 }
 pub fn start_watchdog(cap: Duration) -> Watchdog {
+    start_watchdog_with_output(cap, &[])
+}
+
+pub fn start_watchdog_with_output(cap: Duration, timeout_output: &'static [u8]) -> Watchdog {
     let done = Arc::new(AtomicBool::new(false));
     let d = done.clone();
     std::thread::spawn(move || {
         std::thread::sleep(cap);
-        if !d.load(Ordering::SeqCst) {
+        if d.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             if let Some(ctx) = MARKER_CONTEXT.lock().ok().and_then(|x| x.clone()) {
                 let mut e = Event::new(
                     "time_cap",
@@ -2018,6 +2302,11 @@ pub fn start_watchdog(cap: Duration) -> Watchdog {
                 e.degraded = Some(true);
                 e.reason = Some("time_cap".into());
                 append_marker(&ctx, &e);
+            }
+            if !timeout_output.is_empty() {
+                let mut stdout = std::io::stdout();
+                let _ = stdout.write_all(timeout_output);
+                let _ = stdout.flush();
             }
             std::process::exit(0);
         }
