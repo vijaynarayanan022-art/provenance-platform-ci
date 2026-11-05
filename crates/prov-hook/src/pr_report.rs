@@ -394,18 +394,19 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
     } else {
         Value::Null
     };
+    let tool_commits: Vec<_> = tool_commits.into_iter().collect();
+    let observed_tools = prov_capture::commit::tools_for_commits(repo, &tool_commits)
+        .ok()
+        .map(|per_commit| {
+            per_commit
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        });
     let tools = if complete {
-        let tool_commits: Vec<_> = tool_commits.into_iter().collect();
-        prov_capture::commit::tools_for_commits(repo, &tool_commits)
-            .ok()
-            .map(|per_commit| {
-                per_commit
-                    .into_iter()
-                    .flatten()
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-            })
+        observed_tools.clone()
     } else {
         None
     };
@@ -415,7 +416,7 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
         eligible,
         &evidence,
         complete,
-        tools.as_deref(),
+        observed_tools.as_deref(),
     );
 
     Ok(json!({
@@ -632,8 +633,9 @@ fn iso8601_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        analysis_coverage, content_coverage, history_coverage, source_coverage, ALGORITHM_VERSION,
-        COVERAGE_VERSION, ELIGIBILITY_VERSION, ENGINE_VERSION, FORMULA_VERSION,
+        analysis_coverage, content_coverage, coverage_dimensions, history_coverage,
+        source_coverage, ALGORITHM_VERSION, COVERAGE_VERSION, ELIGIBILITY_VERSION, ENGINE_VERSION,
+        FORMULA_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -692,6 +694,22 @@ mod tests {
         assert_eq!(source_coverage(Some(&["codex".to_owned()])), "high");
         assert_eq!(source_coverage(Some(&[])), "low");
         assert_eq!(source_coverage(None), "unknown");
+    }
+
+    #[test]
+    fn source_coverage_uses_observed_tools_when_analysis_is_partial() {
+        let dimensions = coverage_dimensions(
+            1,
+            2,
+            10,
+            &BTreeMap::from([("exact", 10)]),
+            false,
+            Some(&["codex".to_owned()]),
+        );
+        assert_eq!(dimensions.analysis, "partial");
+        assert_eq!(dimensions.content, "unknown");
+        assert_eq!(dimensions.source, "high");
+        assert_eq!(dimensions.history, "unknown");
     }
 
     #[test]
