@@ -62,6 +62,11 @@ pub fn uninstall(repo: &Path) -> Result<String, String> {
     Ok(output)
 }
 
+pub fn managed_hook_paths(repo: &Path) -> Result<Vec<PathBuf>, String> {
+    let (_, hooks_dir) = resolve_repo_and_hooks(repo)?;
+    Ok(HOOK_NAMES.iter().map(|name| hooks_dir.join(name)).collect())
+}
+
 pub fn doctor_status(repo: &Path) -> String {
     match resolve_repo_and_hooks(repo) {
         Ok((_, hooks_dir)) => {

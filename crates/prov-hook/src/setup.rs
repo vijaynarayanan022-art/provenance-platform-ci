@@ -358,6 +358,10 @@ fn resolve_home(home: Option<&Path>) -> Result<PathBuf, String> {
     absolute_path(&selected)
 }
 
+pub fn config_path(home: Option<&Path>) -> Result<PathBuf, String> {
+    Ok(resolve_home(home)?.join("config.toml"))
+}
+
 fn binary_path(binary: Option<&Path>) -> Result<PathBuf, String> {
     let path = if let Some(path) = binary {
         path.to_path_buf()

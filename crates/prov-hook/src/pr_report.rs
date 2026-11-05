@@ -175,24 +175,12 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
     if input.base.trim().is_empty() || input.head.trim().is_empty() {
         return Err("PR base and head must not be empty".into());
     }
-    let base = resolve_revision(repo, &input.base)?;
-    let head = resolve_revision(repo, &input.head)?;
-    let merge_base = resolve_merge_base(repo, &base, &head)?;
-    let range_base = merge_base.as_deref().unwrap_or(&base);
-    let range = format!("{range_base}..{head}");
-    let commits_output = git(
-        repo,
-        &["rev-list", "--no-merges", "--max-count=501", &range],
-    )?;
-    if !commits_output.status.success() {
-        return Err("could not read PR commits from Git".into());
-    }
-    let mut commits: Vec<String> = String::from_utf8_lossy(&commits_output.stdout)
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    let truncated = commits.len() > MAX_COMMITS;
-    commits.truncate(MAX_COMMITS);
+    let range = resolve_commit_range(repo, &input.base, &input.head)?;
+    let base = range.base;
+    let head = range.head;
+    let merge_base = range.merge_base;
+    let commits = range.commits;
+    let truncated = range.truncated;
     let files_changed = merge_base
         .as_deref()
         .map(|merge_base| changed_files_count(repo, merge_base, &head))
@@ -421,13 +409,7 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
 
     Ok(json!({
         "schema": "prov.pr-report/0.1",
-        "versions": {
-            "engine": ENGINE_VERSION,
-            "algorithm": ALGORITHM_VERSION,
-            "formula": FORMULA_VERSION,
-            "eligibility": ELIGIBILITY_VERSION,
-            "coverage": COVERAGE_VERSION,
-        },
+        "versions": versions(),
         "pr": pr,
         "commits": {
             "total": commits.len(),
@@ -451,6 +433,63 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
         "carried_lines": complete.then_some(carried_lines),
         "top_files": top_files,
     }))
+}
+
+pub(crate) struct CommitRange {
+    pub base: String,
+    pub head: String,
+    pub merge_base: Option<String>,
+    pub commits: Vec<String>,
+    pub truncated: bool,
+}
+
+pub(crate) fn resolve_commit_range(
+    repo: &Path,
+    requested_base: &str,
+    requested_head: &str,
+) -> Result<CommitRange, String> {
+    if requested_base.trim().is_empty() || requested_head.trim().is_empty() {
+        return Err("PR base and head must not be empty".into());
+    }
+    let base = resolve_revision(repo, requested_base)?;
+    let head = resolve_revision(repo, requested_head)?;
+    let merge_base = resolve_merge_base(repo, &base, &head)?;
+    let range_base = merge_base.as_deref().unwrap_or(&base);
+    let range = format!("{range_base}..{head}");
+    let commits_output = git(
+        repo,
+        &["rev-list", "--no-merges", "--max-count=501", &range],
+    )?;
+    if !commits_output.status.success() {
+        return Err("could not read PR commits from Git".into());
+    }
+    let mut commits: Vec<String> = String::from_utf8_lossy(&commits_output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let truncated = commits.len() > MAX_COMMITS;
+    commits.truncate(MAX_COMMITS);
+    Ok(CommitRange {
+        base,
+        head,
+        merge_base,
+        commits,
+        truncated,
+    })
+}
+
+pub(crate) fn versions() -> Value {
+    json!({
+        "engine": ENGINE_VERSION,
+        "algorithm": ALGORITHM_VERSION,
+        "formula": FORMULA_VERSION,
+        "eligibility": ELIGIBILITY_VERSION,
+        "coverage": COVERAGE_VERSION,
+    })
+}
+
+pub(crate) fn created_at() -> String {
+    iso8601_now()
 }
 
 struct CoverageDimensions {

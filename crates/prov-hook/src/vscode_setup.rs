@@ -216,7 +216,7 @@ fn write_document(path: &Path, document: &Value) -> Result<(), String> {
     fs::write(path, bytes).map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
-fn hooks_file(home: Option<&Path>) -> Result<PathBuf, String> {
+pub fn hooks_file_path(home: Option<&Path>) -> Result<PathBuf, String> {
     let home = home
         .map(Path::to_path_buf)
         .or_else(|| {
@@ -232,6 +232,10 @@ fn hooks_file(home: Option<&Path>) -> Result<PathBuf, String> {
         })
         .ok_or("could not determine Copilot home directory")?;
     Ok(home.join("hooks").join("prov-hook.json"))
+}
+
+fn hooks_file(home: Option<&Path>) -> Result<PathBuf, String> {
+    hooks_file_path(home)
 }
 
 fn absolute_path(path: Option<&Path>) -> Result<PathBuf, String> {
