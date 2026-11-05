@@ -88,7 +88,7 @@ impl Fixture {
 
     fn repo_payload(&self, name: &str) -> Value {
         let mut payload = self.fixture(name);
-        payload["cwd"] = json!(self.repo);
+        payload["cwd"] = json!(fs::canonicalize(&self.repo).unwrap_or_else(|_| self.repo.clone()));
         payload["session_id"] = json!("vscode-test-session");
         payload
     }
@@ -165,6 +165,88 @@ fn events(home: &Path) -> Vec<Value> {
         }
     }
     all
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap().join(path)
+    };
+    let mut parts = Vec::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_owned()),
+        }
+    }
+    let normalized: PathBuf = parts.into_iter().collect();
+    if let Ok(canonical) = normalized.canonicalize() {
+        return canonical;
+    }
+    let mut existing = normalized.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return normalized;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return normalized;
+        };
+        existing = parent;
+    }
+    let mut canonical = existing
+        .canonicalize()
+        .unwrap_or_else(|_| existing.to_path_buf());
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    canonical
+}
+
+fn event_file_diagnostics(home: &Path) -> String {
+    let mut pending = vec![home.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                let contents = fs::read_to_string(&path).unwrap_or_default();
+                files.push(format!("{}:\n{contents}", path.display()));
+            }
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        "<no event files>".into()
+    } else {
+        files.join("\n")
+    }
+}
+
+fn failure_diagnostics(fixture: &Fixture, raw_target: &str, report: &Value) -> String {
+    format!(
+        "payload cwd={:?}\nnormalized cwd={:?}\nrepo root={:?}\nnormalized repo root={:?}\npayload filePath/patch path={raw_target:?}\nnormalized target={:?}\nevent files:\n{}\nreport JSON:\n{}",
+        fs::canonicalize(&fixture.repo).unwrap_or_else(|_| fixture.repo.clone()),
+        normalized_path(&fixture.repo),
+        fixture.repo,
+        fs::canonicalize(&fixture.repo).unwrap_or_else(|_| fixture.repo.clone()),
+        normalized_path(Path::new(raw_target)),
+        event_file_diagnostics(&fixture.store),
+        serde_json::to_string_pretty(report).unwrap_or_default(),
+    )
 }
 
 fn file_report(fixture: &Fixture, commit: &str) -> Value {
@@ -289,7 +371,8 @@ fn read_only_tools_are_ignored_and_unknown_tool_only_logs_diagnostic() {
 fn create_file_and_patch_replay_derive_exact_vscode_labels_and_report_tool() {
     let fixture = Fixture::new("exact-labels");
     let base = fixture.base();
-    let hello = fixture.repo.join("hello.py");
+    let canonical_repo = fs::canonicalize(&fixture.repo).unwrap();
+    let hello = canonical_repo.join("hello.py");
     let mut target_path = fixture
         .repo
         .join("nested")
@@ -346,10 +429,11 @@ fn create_file_and_patch_replay_derive_exact_vscode_labels_and_report_tool() {
         .iter()
         .find(|file| file["path"] == "hello.py")
         .unwrap();
-    assert_eq!(hello_report["evidence"], "exact");
-    assert_eq!(hello_report["ai_strong"], 4);
-    assert_eq!(hello_report["ai_probable"], 0);
-    assert_eq!(hello_report["unknown"], 0);
+    let diagnostics = failure_diagnostics(&fixture, &target_path, &report);
+    assert_eq!(hello_report["evidence"], "exact", "{diagnostics}");
+    assert_eq!(hello_report["ai_strong"], 4, "{diagnostics}");
+    assert_eq!(hello_report["ai_probable"], 0, "{diagnostics}");
+    assert_eq!(hello_report["unknown"], 0, "{diagnostics}");
 
     let pr = fixture.cli(&[
         "pr-report",
@@ -422,7 +506,7 @@ fn missing_pre_snapshot_is_degraded_and_never_ai_credited() {
 #[test]
 fn terminal_changes_match_codex_shell_path_evidence() {
     let fixture = Fixture::new("terminal-vscode");
-    let base = fixture.base();
+    let initial_blob = git_text(&fixture.repo, &["rev-parse", "HEAD:tracked.txt"]);
     let pre = fixture.repo_payload("pre-run-in-terminal");
     assert_hook_response(&fixture.hook(&pre, "vscode"));
     fs::write(fixture.repo.join("tracked.txt"), "base\nterminal line\n").unwrap();
@@ -439,14 +523,25 @@ fn terminal_changes_match_codex_shell_path_evidence() {
         ])
         .status
         .success());
+    let vscode_report = file_report(&fixture, &commit);
+    let vscode_blob = git_text(&fixture.repo, &["rev-parse", "HEAD:tracked.txt"]);
+    let vscode_diagnostics = failure_diagnostics(
+        &fixture,
+        fixture.repo.join("tracked.txt").to_string_lossy().as_ref(),
+        &vscode_report,
+    );
+    assert_ne!(initial_blob, vscode_blob, "{vscode_diagnostics}");
     let vscode_event = events(&fixture.store)
         .into_iter()
         .find(|event| event["event"] == "ai_change" && event["path"] == "tracked.txt")
-        .unwrap();
-    assert_eq!(vscode_event["tool"], "vscode-copilot");
+        .unwrap_or_else(|| panic!("{vscode_diagnostics}"));
+    assert_eq!(
+        vscode_event["tool"], "vscode-copilot",
+        "{vscode_diagnostics}"
+    );
 
     let codex = Fixture::new("terminal-codex");
-    let codex_base = codex.base();
+    let codex_initial_blob = git_text(&codex.repo, &["rev-parse", "HEAD:tracked.txt"]);
     let pre = json!({
         "hook_event_name":"PreToolUse","session_id":"codex-shell-session","turn_id":"t",
         "cwd":codex.repo,"tool_name":"Bash","tool_use_id":"shell-1","tool_input":{"command":"python make_file.py"}
@@ -461,7 +556,6 @@ fn terminal_changes_match_codex_shell_path_evidence() {
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
     let codex_commit = codex.commit("terminal edit");
-    assert_ne!(base, codex_base);
     assert!(codex
         .cli(&[
             "derive",
@@ -473,21 +567,32 @@ fn terminal_changes_match_codex_shell_path_evidence() {
         .status
         .success());
     let codex_report = file_report(&codex, &codex_commit);
+    let codex_blob = git_text(&codex.repo, &["rev-parse", "HEAD:tracked.txt"]);
+    let codex_diagnostics = failure_diagnostics(
+        &codex,
+        &codex.repo.join("tracked.txt").to_string_lossy(),
+        &codex_report,
+    );
+    assert_ne!(codex_initial_blob, codex_blob, "{codex_diagnostics}");
     let codex_file = codex_report["files"]
         .as_array()
         .unwrap()
         .iter()
         .find(|file| file["path"] == "tracked.txt")
-        .unwrap();
+        .unwrap_or_else(|| panic!("{codex_diagnostics}"));
     let vscode_file = file_report(&fixture, &commit)["files"]
         .as_array()
         .unwrap()
         .iter()
         .find(|file| file["path"] == "tracked.txt")
-        .unwrap()
+        .unwrap_or_else(|| panic!("{vscode_diagnostics}"))
         .clone();
     for field in ["ai_strong", "ai_probable", "mixed", "unknown", "evidence"] {
-        assert_eq!(vscode_file[field], codex_file[field], "field {field}");
+        assert_eq!(
+            vscode_file[field],
+            codex_file[field],
+            "field {field}\nVS Code diagnostics:\n{vscode_diagnostics}\nCodex diagnostics:\n{codex_diagnostics}"
+        );
     }
     fixture.drop_root();
     codex.drop_root();

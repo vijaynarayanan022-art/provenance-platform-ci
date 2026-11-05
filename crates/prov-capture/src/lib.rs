@@ -1032,11 +1032,56 @@ fn repo_relative_path(root: &Path, value: &str) -> Option<String> {
     } else {
         root.join(path)
     };
-    let candidate = normalize_drive_letter(normalized_path(&candidate));
+    let candidate = normalize_drive_letter(canonicalized_normalized_path(&candidate));
     let root = normalize_drive_letter(normalized_path(root));
     let relative = candidate.strip_prefix(root).ok()?;
     let value = relative.to_string_lossy().replace('\\', "/");
     (!value.is_empty() && value != "." && !value.starts_with("../")).then_some(value)
+}
+
+fn canonicalized_normalized_path(path: &Path) -> PathBuf {
+    let normalized = lexical_normalized_path(path);
+    if let Ok(canonical) = normalized.canonicalize() {
+        return canonical;
+    }
+    let mut existing = normalized.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            return normalized;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            return normalized;
+        };
+        existing = parent;
+    }
+    let mut canonical = existing
+        .canonicalize()
+        .unwrap_or_else(|_| existing.to_path_buf());
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    canonical
+}
+
+fn lexical_normalized_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    let mut parts = Vec::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other.as_os_str().to_owned()),
+        }
+    }
+    parts.into_iter().collect()
 }
 
 fn normalize_drive_letter(path: PathBuf) -> PathBuf {
