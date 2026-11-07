@@ -136,6 +136,7 @@ struct HookInput {
     turn_id: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
+    tool_name: Option<String>,
     tool_use_id: Option<String>,
     tool_input: Option<ToolInput>,
 }
@@ -212,6 +213,8 @@ struct Event {
     tool_use_id: Option<String>,
     model: Option<String>,
     tool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<String>,
     command_sha256: Option<String>,
     command_length: Option<usize>,
     window_open: Option<u128>,
@@ -260,6 +263,7 @@ impl Event {
             tool_use_id: tool.map(str::to_owned),
             model: None,
             tool: None,
+            operation: None,
             command_sha256: None,
             command_length: None,
             window_open: None,
@@ -411,6 +415,7 @@ pub fn process_vscode_json(input: &[u8]) {
             .get("model")
             .and_then(|v| v.as_str())
             .map(str::to_owned),
+        tool_name: tool_name.map(str::to_owned),
         tool_use_id: payload
             .get("tool_use_id")
             .and_then(|v| v.as_str())
@@ -822,6 +827,7 @@ fn process_hook(
                 e.turn_id = hook.turn_id.clone();
                 e.model = hook.model.clone();
                 e.tool = Some(tool_label.into());
+                e.operation = hook.tool_name.clone();
                 e.command_sha256 = command_sha.clone();
                 e.command_length = command_length;
                 e.window_open = opened;

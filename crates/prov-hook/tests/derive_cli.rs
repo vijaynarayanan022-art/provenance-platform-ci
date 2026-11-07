@@ -464,6 +464,47 @@ fn file<'a>(value: &'a Value, path: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing file {path}"))
 }
 
+fn sidecar_value(fixture: &Fixture, commit: &str) -> Value {
+    serde_json::from_slice(&fs::read(fixture.lines_path(commit)).unwrap()).unwrap()
+}
+
+fn attribution_for<'a>(sidecar: &'a Value, path: &str, category: &str) -> &'a Value {
+    sidecar["attributions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|range| range["path"] == path && range["category"] == category)
+        .unwrap_or_else(|| panic!("missing {category} attribution for {path}"))
+}
+
+fn set_ai_change_field(fixture: &Fixture, field: &str, value: Value) {
+    let event_path = fs::read_dir(
+        fixture
+            .home
+            .join("repos")
+            .join(fixture.repo_id())
+            .join("events"),
+    )
+    .unwrap()
+    .next()
+    .unwrap()
+    .unwrap()
+    .path();
+    let mut output = Vec::new();
+    for line in fs::read(&event_path).unwrap().split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut event: Value = serde_json::from_slice(line).unwrap();
+        if event["event"] == "ai_change" && event["path"] == "tracked.txt" {
+            event[field] = value.clone();
+        }
+        serde_json::to_writer(&mut output, &event).unwrap();
+        output.push(b'\n');
+    }
+    fs::write(event_path, output).unwrap();
+}
+
 fn assert_counts_consistent(value: &Value) {
     for counts in value["files"].as_array().unwrap() {
         assert_eq!(
@@ -594,6 +635,246 @@ fn human_edit_after_ai_snapshot_is_mixed() {
     assert_eq!(tracked["mixed"], 1);
     assert_eq!(tracked["evidence"], "exact");
     fixture.drop_root();
+}
+
+#[test]
+fn sidecar_metadata_is_additive_coalesced_and_count_neutral() {
+    let fixture = Fixture::new("line-metadata");
+    fixture.hook("PreToolUse", "metadata-tool");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"one\ntwo\nai first\nai second\n",
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "metadata-tool");
+    let commit = fixture.commit("metadata lines");
+    assert!(derive(&fixture, &commit).status.success());
+
+    let report: Value =
+        serde_json::from_slice(&fs::read(fixture.derived_path(&commit)).unwrap()).unwrap();
+    let sidecar: Value =
+        serde_json::from_slice(&fs::read(fixture.lines_path(&commit)).unwrap()).unwrap();
+    assert_eq!(sidecar["schema"], "prov.lines/0.1");
+    assert_eq!(sidecar["totals"]["e"], report["totals"]["e"]);
+    assert_eq!(
+        sidecar["totals"]["ai_strong"],
+        report["totals"]["ai_strong"]
+    );
+    assert_eq!(
+        sidecar["totals"]["ai_probable"],
+        report["totals"]["ai_probable"]
+    );
+    assert_eq!(sidecar["totals"]["mixed"], report["totals"]["mixed"]);
+    assert_eq!(sidecar["totals"]["unknown"], report["totals"]["unknown"]);
+    assert_eq!(report["totals"]["ai_direct"], 0);
+    let ranges = sidecar["attributions"].as_array().unwrap();
+    let tracked: Vec<_> = ranges
+        .iter()
+        .filter(|range| range["path"] == "tracked.txt")
+        .collect();
+    assert_eq!(tracked.len(), 1);
+    assert_eq!(tracked[0]["startLine"], 3);
+    assert_eq!(tracked[0]["endLine"], 4);
+    assert_eq!(tracked[0]["endLineExclusive"], 5);
+    assert_eq!(tracked[0]["category"], "ai_strong");
+    assert_eq!(tracked[0]["score"], 0.92);
+    assert_eq!(tracked[0]["confidenceBand"], "high");
+    assert_eq!(tracked[0]["primaryBasis"], "EXACT_FRAGMENT_MATCH");
+    assert_eq!(tracked[0]["source"]["adapterId"], "codex");
+    assert_eq!(tracked[0]["source"]["toolId"], "codex");
+    assert_eq!(tracked[0]["source"]["sessionRef"], "metadata-tool");
+    assert_eq!(tracked[0]["operation"], "PowerShell");
+    assert_eq!(tracked[0]["algorithmProfile"], "deterministic-v1");
+    assert_eq!(tracked[0]["scoreProfile"], "score-v1");
+    assert_eq!(tracked[0]["limitingBasis"], json!([]));
+    assert_eq!(tracked[0]["supportingBasis"], json!([]));
+    assert_eq!(tracked[0]["source"]["toolId"], "codex");
+    assert_eq!(tracked[0]["source"]["sessionRef"], "metadata-tool");
+    assert_eq!(report["totals"]["e"], 2);
+    assert_eq!(report["totals"]["ai_strong"], 2);
+    assert_eq!(report["totals"]["ai_probable"], 0);
+    assert_eq!(report["totals"]["mixed"], 0);
+    assert_eq!(report["totals"]["unknown"], 0);
+    assert_eq!(report["totals"]["ai_deterministic_pct"], 100.0);
+    assert_eq!(report["totals"]["ai_linked_pct"], 100.0);
+    assert_eq!(sidecar["totals"]["e"], 2);
+    assert_eq!(sidecar["totals"]["ai_strong"], 2);
+    assert_eq!(sidecar["totals"]["ai_probable"], 0);
+    assert_eq!(sidecar["totals"]["mixed"], 0);
+    assert_eq!(sidecar["totals"]["unknown"], 0);
+    fixture.drop_root();
+}
+
+#[test]
+fn score_metadata_covers_evidence_limitations_and_no_score_categories() {
+    let time_cut = Fixture::new("metadata-time-cut");
+    time_cut.hook("PreToolUse", "time-cut-tool");
+    fs::write(time_cut.repo.join("tracked.txt"), b"one\nai line\n").unwrap();
+    time_cut.hook("PostToolUse", "time-cut-tool");
+    fs::write(time_cut.repo.join("tracked.txt"), b"one\nai line\nlate\n").unwrap();
+    let time_cut_commit = time_cut.commit("time cut");
+    assert!(derive(&time_cut, &time_cut_commit).status.success());
+    let time_cut_range = attribution_for(
+        &sidecar_value(&time_cut, &time_cut_commit),
+        "tracked.txt",
+        "ai_probable",
+    )
+    .clone();
+    assert_eq!(time_cut_range["score"], 0.79);
+    assert_eq!(time_cut_range["confidenceBand"], "medium");
+    assert!(time_cut_range["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_TIME_CUT")));
+    time_cut.drop_root();
+
+    for (name, field, expected_basis, expected_category, expected_score) in [
+        (
+            "metadata-overlap",
+            "overlap",
+            "X_OVERLAPPING_SESSIONS",
+            "ai_probable",
+            0.79,
+        ),
+        (
+            "metadata-degraded",
+            "degraded",
+            "X_DEGRADED",
+            "ai_probable",
+            0.79,
+        ),
+        (
+            "metadata-incomplete",
+            "after_incomplete",
+            "X_DEGRADED",
+            "ai_strong",
+            0.82,
+        ),
+    ] {
+        let fixture = Fixture::new(name);
+        fixture.hook("PreToolUse", "limited-tool");
+        fs::write(fixture.repo.join("tracked.txt"), b"one\nai line\n").unwrap();
+        fixture.hook("PostToolUse", "limited-tool");
+        set_ai_change_field(&fixture, field, json!(true));
+        let commit = fixture.commit("limited evidence");
+        assert!(derive(&fixture, &commit).status.success());
+        let sidecar = sidecar_value(&fixture, &commit);
+        let range = attribution_for(&sidecar, "tracked.txt", expected_category);
+        assert_eq!(range["score"], expected_score);
+        assert_eq!(
+            range["confidenceBand"],
+            if expected_score >= 0.8 {
+                "high"
+            } else {
+                "medium"
+            }
+        );
+        assert!(range["limitingBasis"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(expected_basis)));
+        fixture.drop_root();
+    }
+
+    let duplicate = Fixture::new("metadata-duplicate");
+    duplicate.hook("PreToolUse", "duplicate-ai");
+    fs::write(duplicate.repo.join("tracked.txt"), b"one\nsame\n").unwrap();
+    duplicate.hook("PostToolUse", "duplicate-ai");
+    fs::write(duplicate.repo.join("tracked.txt"), b"one\nsame\nsame\n").unwrap();
+    duplicate.hook("PreToolUse", "duplicate-copy");
+    duplicate.hook("PostToolUse", "duplicate-copy");
+    let duplicate_commit = duplicate.commit("duplicate line copy");
+    assert!(derive(&duplicate, &duplicate_commit).status.success());
+    let duplicate_sidecar = sidecar_value(&duplicate, &duplicate_commit);
+    let ambiguous = attribution_for(&duplicate_sidecar, "tracked.txt", "ai_probable");
+    assert_eq!(ambiguous["score"], 0.79);
+    assert!(ambiguous["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("CONFLICTING_EVIDENCE")));
+    duplicate.drop_root();
+
+    let reconstructed = Fixture::new("metadata-reconstructed");
+    reconstructed.hook("PreToolUse", "commit-tool");
+    fs::write(
+        reconstructed.repo.join("tracked.txt"),
+        b"one\nreconstructed line\n",
+    )
+    .unwrap();
+    let reconstructed_commit = reconstructed.commit("commit in window");
+    reconstructed.hook("PostToolUse", "commit-tool");
+    assert!(derive(&reconstructed, &reconstructed_commit)
+        .status
+        .success());
+    let reconstructed_sidecar = sidecar_value(&reconstructed, &reconstructed_commit);
+    let reconstructed_range = attribution_for(&reconstructed_sidecar, "tracked.txt", "ai_probable");
+    assert_eq!(reconstructed_range["score"], 0.6);
+    assert!(reconstructed_range["primaryBasis"].is_null());
+    assert!(reconstructed_range["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_RECONSTRUCTED_WINDOW")));
+    reconstructed.drop_root();
+
+    let mixed = Fixture::new("metadata-mixed");
+    mixed.hook("PreToolUse", "mixed-source");
+    fs::write(mixed.repo.join("tracked.txt"), b"one\nai line\n").unwrap();
+    mixed.hook("PostToolUse", "mixed-source");
+    fs::write(mixed.repo.join("tracked.txt"), b"one\nmodified line\n").unwrap();
+    mixed.hook("PreToolUse", "modifier-tool");
+    mixed.hook("PostToolUse", "modifier-tool");
+    let mixed_commit = mixed.commit("mixed range");
+    assert!(derive(&mixed, &mixed_commit).status.success());
+    let mixed_sidecar = sidecar_value(&mixed, &mixed_commit);
+    let mixed_range = attribution_for(&mixed_sidecar, "tracked.txt", "mixed");
+    assert_eq!(mixed_range["score"], 0.84);
+    assert_eq!(mixed_range["confidenceBand"], "high");
+    assert_eq!(mixed_range["primaryBasis"], "EXACT_FRAGMENT_MATCH");
+    assert!(mixed_range["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("CONFLICTING_EVIDENCE")));
+    assert_eq!(mixed_range["source"]["toolId"], "codex");
+    assert_eq!(mixed_range["source"]["sessionRef"], "mixed-source");
+    mixed.drop_root();
+
+    let unbound = Fixture::new("metadata-unknown");
+    fs::write(unbound.repo.join("tracked.txt"), b"one\nunbound line\n").unwrap();
+    let unbound_commit = unbound.commit("unbound line");
+    assert!(derive(&unbound, &unbound_commit).status.success());
+    let unbound_sidecar = sidecar_value(&unbound, &unbound_commit);
+    let unknown = attribution_for(&unbound_sidecar, "tracked.txt", "unknown");
+    assert!(unknown["score"].is_null());
+    assert_eq!(unknown["confidenceBand"], "none");
+    assert!(unknown["primaryBasis"].is_null());
+    assert_eq!(unknown["supportingBasis"], json!([]));
+    assert_eq!(unknown["limitingBasis"], json!([]));
+    unbound.drop_root();
+
+    let excluded = Fixture::new("metadata-excluded");
+    fs::write(excluded.repo.join("credentials.txt"), b"secret text\n").unwrap();
+    let excluded_commit = excluded.commit("excluded file");
+    assert!(derive(&excluded, &excluded_commit).status.success());
+    let excluded_sidecar = sidecar_value(&excluded, &excluded_commit);
+    let excluded_range = attribution_for(&excluded_sidecar, "credentials.txt", "excluded");
+    assert!(excluded_range["score"].is_null());
+    assert_eq!(excluded_range["confidenceBand"], "none");
+    assert!(excluded_range["primaryBasis"].is_null());
+    excluded.drop_root();
+
+    let binary = Fixture::new("metadata-binary");
+    fs::write(binary.repo.join("data.bin"), [b'x', 0, b'y', b'\n']).unwrap();
+    let binary_commit = binary.commit("binary file");
+    assert!(derive(&binary, &binary_commit).status.success());
+    let binary_sidecar = sidecar_value(&binary, &binary_commit);
+    let binary_range = attribution_for(&binary_sidecar, "data.bin", "excluded");
+    assert!(binary_range["score"].is_null());
+    assert_eq!(binary_range["confidenceBand"], "none");
+    assert!(binary_range["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("CONTENT_RESTRICTED")));
+    binary.drop_root();
 }
 
 #[test]
@@ -874,6 +1155,29 @@ fn symlinks_are_not_counted_as_added_text() {
         .unwrap()
         .iter()
         .all(|entry| entry["path"] != "link.txt"));
+    fixture.drop_root();
+}
+
+#[test]
+fn submodule_gitlinks_are_not_counted_as_added_text() {
+    let fixture = Fixture::new("submodule-gitlink");
+    let target = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    let cacheinfo = format!("160000,{target},vendor/module");
+    git(
+        &fixture.repo,
+        &["update-index", "--add", "--cacheinfo", &cacheinfo],
+    );
+    git(&fixture.repo, &["commit", "-m", "add gitlink"]);
+    let commit = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    assert!(derive(&fixture, &commit).status.success());
+    let value = fixture.derived_value(&commit);
+    assert!(value["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["path"] != "vendor/module"));
+    assert_eq!(value["totals"]["e"], 0);
+    assert_eq!(value["totals"]["excluded"], 0);
     fixture.drop_root();
 }
 
@@ -1419,6 +1723,20 @@ fn changed_amend_uses_content_and_caps_inherited_labels_at_probable() {
         line_label(&sidecar, "tracked.txt", &line_hash(replacement)),
         "u"
     );
+    let carried_range = sidecar["attributions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|range| {
+            range["path"] == "tracked.txt"
+                && range["category"] == "ai_probable"
+                && range["startLine"] == 3
+        })
+        .unwrap();
+    assert_eq!(carried_range["score"], 0.60);
+    assert_eq!(carried_range["confidenceBand"], "medium");
+    assert_eq!(carried_range["primaryBasis"], "MOVE_LINEAGE");
+    assert_eq!(carried_range["source"]["adapterId"], "codex");
     assert_sidecar_counts_match(&report, &sidecar);
     fixture.drop_root();
 }

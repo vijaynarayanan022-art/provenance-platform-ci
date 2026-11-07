@@ -98,6 +98,8 @@ struct LinesSidecar {
     commit: String,
     totals: LineTotals,
     files: Vec<LineFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attributions: Vec<crate::commit::AttributionRange>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -140,6 +142,7 @@ struct CarryResult {
     sources: Vec<String>,
     carried_lines: usize,
     carried_by_file: BTreeMap<String, usize>,
+    carried_attributions: Vec<crate::commit::AttributionRange>,
 }
 
 struct CarryContext<'a> {
@@ -171,6 +174,7 @@ pub(crate) fn apply(root: &Path, store: &Path, commit: &str) -> Result<(), Strin
     for file in &mut report.files {
         file.carried = carry.carried_by_file.get(&file.path).copied();
     }
+    replace_carried_attributions(&mut sidecar, carry.carried_attributions);
     recompute_totals(&mut report);
     sidecar.totals = LineTotals {
         e: report.totals.e,
@@ -404,6 +408,7 @@ fn carry_matching_lines(
     let mut used = HashSet::new();
     let mut used_sources = BTreeSet::new();
     let mut carried_by_file = BTreeMap::new();
+    let mut carried_attributions = Vec::new();
     let mut carried_lines = 0;
     let patch_source_set: BTreeSet<_> = patch_sources.iter().cloned().collect();
 
@@ -458,12 +463,16 @@ fn carry_matching_lines(
                     continue;
                 };
                 used.insert((source.sha.clone(), target_file.path.clone(), index));
-                matching.push((source.sha.as_str(), label));
+                matching.push((source, label, line));
             }
-            let Some(weakest) = matching.iter().map(|(_, label)| *label).min() else {
+            let Some(weakest) = matching.iter().map(|(_, label, _)| *label).min() else {
                 continue;
             };
-            used_sources.extend(matching.iter().map(|(sha, _)| (*sha).to_owned()));
+            used_sources.extend(matching.iter().map(|(source, _, _)| source.sha.clone()));
+            let selected_source = matching
+                .iter()
+                .filter(|(_, label, _)| *label == weakest)
+                .min_by_key(|(source, _, _)| source.sha.as_str());
             let current = Label::parse(&target_line.label).unwrap_or(Label::Unknown);
             let next = if method == "patch_id" {
                 Some(weakest)
@@ -477,6 +486,25 @@ fn carry_matching_lines(
             };
             if current != next {
                 adjust_file_counts(report, &target_file.path, current, next);
+            }
+            if let Some((source, _, source_line)) = selected_source {
+                let source_range = source
+                    .sidecar
+                    .attributions
+                    .iter()
+                    .find(|range| {
+                        range.path == target_file.path
+                            && range.start_line <= source_line.line
+                            && source_line.line <= range.end_line
+                    })
+                    .cloned();
+                carried_attributions.push(carried_attribution(
+                    &target_file.path,
+                    target_line.line,
+                    next,
+                    method,
+                    source_range,
+                ));
             }
             target_line.label = next.as_char().to_string();
             file_carried += 1;
@@ -492,6 +520,7 @@ fn carry_matching_lines(
         sources,
         carried_lines,
         carried_by_file,
+        carried_attributions,
     })
 }
 
@@ -512,6 +541,136 @@ fn adjust_file_counts(report: &mut CommitReport, path: &str, previous: Label, ne
         Label::Probable => file.ai_probable += 1,
         Label::Strong => file.ai_strong += 1,
     }
+}
+
+fn carried_attribution(
+    path: &str,
+    line: usize,
+    label: Label,
+    method: &str,
+    source: Option<crate::commit::AttributionRange>,
+) -> crate::commit::AttributionRange {
+    let category = match label {
+        Label::Strong => "ai_strong",
+        Label::Probable => "ai_probable",
+        Label::Mixed => "mixed",
+        Label::Unknown => "unknown",
+    };
+    let primary_basis = if method == "patch_id" {
+        "REBASE_PATCH_ID"
+    } else {
+        "MOVE_LINEAGE"
+    };
+    let mut supporting_basis = source
+        .as_ref()
+        .map(|range| range.supporting_basis.clone())
+        .unwrap_or_default();
+    if let Some(basis) = source
+        .as_ref()
+        .and_then(|range| range.primary_basis.as_ref())
+    {
+        if !supporting_basis.contains(basis) {
+            supporting_basis.push(basis.clone());
+        }
+    }
+    let mut limiting_basis = source
+        .as_ref()
+        .map(|range| range.limiting_basis.clone())
+        .unwrap_or_default();
+    if source.is_none()
+        && !limiting_basis
+            .iter()
+            .any(|basis| basis == "INCOMPLETE_SOURCE")
+    {
+        limiting_basis.push("INCOMPLETE_SOURCE".into());
+    }
+    if label == Label::Unknown {
+        supporting_basis.clear();
+        limiting_basis.clear();
+    }
+    let fallback_score = match (method, label) {
+        ("patch_id", Label::Strong) => Some(0.82),
+        ("patch_id", Label::Probable) => Some(0.72),
+        ("content", Label::Probable) => Some(0.60),
+        (_, Label::Mixed) => None,
+        (_, Label::Unknown) => None,
+        _ => Some(0.60),
+    };
+    let score = match (method, label) {
+        (_, Label::Unknown) => None,
+        ("content", Label::Probable) => Some(0.60),
+        (_, _) => source
+            .as_ref()
+            .and_then(|range| range.score)
+            .or(fallback_score),
+    };
+    let confidence_band = match label {
+        Label::Unknown => "none",
+        Label::Mixed | Label::Strong | Label::Probable => {
+            score.map_or("none", crate::commit::confidence_band)
+        }
+    };
+    crate::commit::AttributionRange {
+        path: path.into(),
+        start_line: line,
+        end_line: line,
+        end_line_exclusive: Some(line + 1),
+        category: category.into(),
+        score,
+        confidence_band: confidence_band.into(),
+        primary_basis: (label != Label::Unknown).then(|| primary_basis.into()),
+        supporting_basis,
+        limiting_basis,
+        source: source.as_ref().and_then(|range| range.source.clone()),
+        operation: source.as_ref().and_then(|range| range.operation.clone()),
+        algorithm_profile: "deterministic-v1".into(),
+        score_profile: "score-v1".into(),
+    }
+}
+
+fn replace_carried_attributions(
+    sidecar: &mut LinesSidecar,
+    carried: Vec<crate::commit::AttributionRange>,
+) {
+    let mut lines = BTreeMap::new();
+    for range in sidecar.attributions.drain(..) {
+        for line in range.start_line..=range.end_line {
+            let mut singleton = range.clone();
+            singleton.start_line = line;
+            singleton.end_line = line;
+            lines.insert((singleton.path.clone(), line), singleton);
+        }
+    }
+    for range in carried {
+        lines.insert((range.path.clone(), range.start_line), range);
+    }
+    for (_, range) in lines {
+        if let Some(previous) = sidecar.attributions.last_mut() {
+            if same_attribution(previous, &range) && previous.end_line + 1 == range.start_line {
+                previous.end_line = range.end_line;
+                previous.end_line_exclusive = Some(range.end_line + 1);
+                continue;
+            }
+        }
+        sidecar.attributions.push(range);
+    }
+}
+
+fn same_attribution(
+    left: &crate::commit::AttributionRange,
+    right: &crate::commit::AttributionRange,
+) -> bool {
+    left.path == right.path
+        && left.category == right.category
+        && left.score == right.score
+        && left.confidence_band == right.confidence_band
+        && left.primary_basis == right.primary_basis
+        && left.supporting_basis == right.supporting_basis
+        && left.limiting_basis == right.limiting_basis
+        && left.source == right.source
+        && left.operation == right.operation
+        && left.algorithm_profile == right.algorithm_profile
+        && left.score_profile == right.score_profile
 }
 
 fn recompute_totals(report: &mut CommitReport) {
@@ -578,6 +737,7 @@ fn empty_result() -> CarryResult {
         sources: Vec::new(),
         carried_lines: 0,
         carried_by_file: BTreeMap::new(),
+        carried_attributions: Vec::new(),
     }
 }
 
@@ -592,6 +752,11 @@ fn sort_sidecar(sidecar: &mut LinesSidecar) {
     for file in &mut sidecar.files {
         file.lines.sort_by_key(|line| line.line);
     }
+    sidecar.attributions.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
 }
 
 fn sidecar_sha(path: &Path) -> Option<String> {
@@ -708,6 +873,36 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Output, String> {
         .stdin(Stdio::null());
     crate::configure_process_command(&mut command, false);
     command.output().map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LinesSidecar;
+
+    #[test]
+    fn old_format_sidecar_loads_without_attribution_ranges() {
+        let bytes = br#"{"schema":"prov.lines/0.1","repo_id":"repo","commit":"commit","totals":{"e":1,"ai_strong":0,"ai_probable":0,"mixed":0,"unknown":1},"files":[{"path":"file.txt","lines":[{"line":2,"hash":"0123456789abcdef","label":"u"}]}]}"#;
+        let sidecar: LinesSidecar = serde_json::from_slice(bytes).unwrap();
+        assert!(sidecar.attributions.is_empty());
+        let round_trip = serde_json::to_value(sidecar).unwrap();
+        assert!(round_trip.get("attributions").is_none());
+    }
+
+    #[test]
+    fn missing_optional_range_fields_default_safely() {
+        let bytes = br#"{"path":"file.txt","startLine":2,"endLine":2}"#;
+        let range: crate::commit::AttributionRange = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(range.category, "unknown");
+        assert!(range.score.is_none());
+        assert_eq!(range.confidence_band, "none");
+        assert!(range.primary_basis.is_none());
+        assert!(range.supporting_basis.is_empty());
+        assert!(range.limiting_basis.is_empty());
+        assert!(range.source.is_none());
+        assert!(range.operation.is_none());
+        assert_eq!(range.algorithm_profile, "deterministic-v1");
+        assert_eq!(range.score_profile, "score-v1");
+    }
 }
 
 fn load_commit_file(root: &Path, commit: &str, path: &str) -> Result<Vec<u8>, String> {
