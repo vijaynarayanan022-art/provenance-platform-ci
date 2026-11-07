@@ -119,6 +119,10 @@ pub(crate) struct AttributionRange {
     pub algorithm_profile: String,
     #[serde(default = "default_score_profile")]
     pub score_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusion_classifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusion_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -725,12 +729,15 @@ fn derive_resolved_commit(
         };
 
         let added_count = added_nonblank(&parent_content, &committed_content);
-        if crate::is_excluded(&file.path) {
+        let path_exclusion = crate::exclusion::classify_path(&file.path);
+        if path_exclusion.is_some_and(|exclusion| exclusion.reason_code != "BINARY_FILE") {
+            let exclusion = path_exclusion.expect("checked path exclusion");
             attributions.extend(excluded_attributions(
                 &file.path,
                 &parent_content,
                 &committed_content,
-                None,
+                exclusion.reason_code,
+                exclusion.limiting_basis,
             ));
             output_files.push(skipped_file(
                 file.path,
@@ -740,14 +747,23 @@ fn derive_resolved_commit(
             ));
             continue;
         }
-        if parent_content[..parent_content.len().min(8000)].contains(&0)
-            || committed_content[..committed_content.len().min(8000)].contains(&0)
+        let binary_content = parent_content[..parent_content.len().min(8192)].contains(&0)
+            || committed_content[..committed_content.len().min(8192)].contains(&0);
+        let content_exclusion = if binary_content {
+            crate::exclusion::classify_content(&committed_content)
+                .or_else(|| crate::exclusion::classify_content(&parent_content))
+        } else {
+            crate::exclusion::classify_content(&committed_content)
+        };
+        if let Some(exclusion) = content_exclusion
+            .or_else(|| path_exclusion.filter(|exclusion| exclusion.reason_code == "BINARY_FILE"))
         {
             attributions.extend(excluded_attributions(
                 &file.path,
                 &parent_content,
                 &committed_content,
-                Some("CONTENT_RESTRICTED"),
+                exclusion.reason_code,
+                exclusion.limiting_basis,
             ));
             output_files.push(skipped_file(
                 file.path,
@@ -760,11 +776,16 @@ fn derive_resolved_commit(
         if old_size.is_some_and(|size| size > MAX_FILE)
             || new_size.is_some_and(|size| size > MAX_FILE)
         {
+            let exclusion = crate::exclusion::Exclusion {
+                reason_code: crate::exclusion::FILE_SIZE_LIMIT_REASON,
+                limiting_basis: None,
+            };
             attributions.extend(excluded_attributions(
                 &file.path,
                 &parent_content,
                 &committed_content,
-                None,
+                exclusion.reason_code,
+                exclusion.limiting_basis,
             ));
             output_files.push(skipped_file(
                 file.path,
@@ -1748,6 +1769,8 @@ fn attribution_ranges(
             operation: step.and_then(|step| step.operation.clone()),
             algorithm_profile: "deterministic-v1".into(),
             score_profile: "score-v1".into(),
+            exclusion_classifier: None,
+            exclusion_reason: None,
         };
         push_attribution_range(&mut ranges, attribution);
     }
@@ -2116,6 +2139,7 @@ fn excluded_attributions(
     path: &str,
     parent: &[u8],
     committed: &[u8],
+    reason: &str,
     limiting: Option<&str>,
 ) -> Vec<AttributionRange> {
     let lines = derive::derive_lines(
@@ -2144,6 +2168,8 @@ fn excluded_attributions(
                 operation: None,
                 algorithm_profile: "deterministic-v1".into(),
                 score_profile: "score-v1".into(),
+                exclusion_classifier: Some(crate::exclusion::CLASSIFIER_ID.into()),
+                exclusion_reason: Some(reason.into()),
             },
         );
     }
@@ -2222,6 +2248,8 @@ fn push_attribution_range(ranges: &mut Vec<AttributionRange>, next: AttributionR
             && previous.operation == next.operation
             && previous.algorithm_profile == next.algorithm_profile
             && previous.score_profile == next.score_profile
+            && previous.exclusion_classifier == next.exclusion_classifier
+            && previous.exclusion_reason == next.exclusion_reason
         {
             previous.end_line = next.end_line;
             previous.end_line_exclusive = next.end_line_exclusive;

@@ -1,5 +1,6 @@
 pub mod commit;
 pub mod derive;
+pub mod exclusion;
 pub mod rewrite;
 
 use fd_lock::RwLock;
@@ -118,17 +119,6 @@ const LOCK_BUDGET: Duration = Duration::from_millis(500);
 const MAX_DIRTY_PATHS: usize = 500;
 const MAX_RECENT_KEYS: usize = 1000;
 const MAX_WINDOW_AGE_NS: u128 = 60 * 60 * 1_000_000_000;
-const EXCLUSIONS: &[&str] = &[
-    ".env*",
-    "*.pem",
-    "*.key",
-    "*.pfx",
-    "id_rsa*",
-    "id_ed25519*",
-    "*credentials*",
-    "*secret*",
-];
-
 #[derive(Debug, Deserialize)]
 struct HookInput {
     hook_event_name: Option<String>,
@@ -1917,18 +1907,7 @@ fn append_incomplete(path: &Path, repo: &str, hook: &str, session: &str, tool: O
     append_line(path, &e);
 }
 fn is_excluded(path: &str) -> bool {
-    let base = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-    EXCLUSIONS.iter().any(|p| match *p {
-        ".env*" => base.starts_with(".env"),
-        "*.pem" => base.ends_with(".pem"),
-        "*.key" => base.ends_with(".key"),
-        "*.pfx" => base.ends_with(".pfx"),
-        "id_rsa*" => base.starts_with("id_rsa"),
-        "id_ed25519*" => base.starts_with("id_ed25519"),
-        "*credentials*" => base.contains("credentials"),
-        "*secret*" => base.contains("secret"),
-        _ => false,
-    })
+    exclusion::classify_path(path).is_some()
 }
 fn expire_state(state: &mut RepoState) {
     let now = now_ns();

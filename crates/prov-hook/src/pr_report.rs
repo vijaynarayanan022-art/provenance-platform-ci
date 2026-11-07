@@ -487,6 +487,7 @@ pub(crate) fn versions() -> Value {
         "min_mixed_overlap": prov_capture::derive::MIN_MIXED_OVERLAP,
         "formula": FORMULA_VERSION,
         "eligibility": ELIGIBILITY_VERSION,
+        "exclusion_classifier": prov_capture::exclusion::CLASSIFIER_ID,
         "coverage": COVERAGE_VERSION,
     })
 }
