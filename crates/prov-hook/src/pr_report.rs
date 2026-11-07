@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_COMMITS: usize = 500;
 const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ALGORITHM_VERSION: &str = "derive-v1";
+const LINE_SURVIVAL_VERSION: &str = "unobserved-mixed-v1";
 const FORMULA_VERSION: &str = "strict-v1";
 const ELIGIBILITY_VERSION: &str = "non-blank-added-v1";
 const COVERAGE_VERSION: &str = "coverage-v1";
@@ -482,6 +483,8 @@ pub(crate) fn versions() -> Value {
     json!({
         "engine": ENGINE_VERSION,
         "algorithm": ALGORITHM_VERSION,
+        "line_survival": LINE_SURVIVAL_VERSION,
+        "min_mixed_overlap": prov_capture::derive::MIN_MIXED_OVERLAP,
         "formula": FORMULA_VERSION,
         "eligibility": ELIGIBILITY_VERSION,
         "coverage": COVERAGE_VERSION,
@@ -674,7 +677,7 @@ mod tests {
     use super::{
         analysis_coverage, content_coverage, coverage_dimensions, history_coverage,
         source_coverage, ALGORITHM_VERSION, COVERAGE_VERSION, ELIGIBILITY_VERSION, ENGINE_VERSION,
-        FORMULA_VERSION,
+        FORMULA_VERSION, LINE_SURVIVAL_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -682,6 +685,7 @@ mod tests {
     fn versions_are_named_and_use_the_hook_package_version() {
         assert_eq!(ENGINE_VERSION, env!("CARGO_PKG_VERSION"));
         assert_eq!(ALGORITHM_VERSION, "derive-v1");
+        assert_eq!(LINE_SURVIVAL_VERSION, "unobserved-mixed-v1");
         assert_eq!(FORMULA_VERSION, "strict-v1");
         assert_eq!(ELIGIBILITY_VERSION, "non-blank-added-v1");
         assert_eq!(COVERAGE_VERSION, "coverage-v1");
