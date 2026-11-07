@@ -1,6 +1,8 @@
 use similar::{capture_diff_slices, Algorithm, DiffTag};
 use std::collections::{HashMap, HashSet};
 
+pub const MIN_MIXED_OVERLAP: f64 = 0.5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepKind {
     Ai { degraded: bool },
@@ -81,6 +83,28 @@ pub struct AttributedLine {
     pub line: LineLabel,
     pub source_step: Option<usize>,
     pub ambiguous: bool,
+    pub unobserved_edit: Option<UnobservedEditKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnobservedEditKind {
+    ExactSurvivorInChangedFile,
+    MixedByTokenOverlap,
+    MixedBySimilarity,
+    UnmatchedUnknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnobservedAiLine {
+    pub text: Vec<u8>,
+    pub source_step: Option<usize>,
+    pub label: Label,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnobservedReplacementHunk {
+    pub removed_ai: Vec<UnobservedAiLine>,
+    pub added_line_indices: Vec<usize>,
 }
 
 pub fn derive_lines(ev: &Evidence, committed: &[u8]) -> Vec<LineLabel> {
@@ -153,9 +177,328 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
                 },
                 source_step: owned.source_step,
                 ambiguous,
+                unobserved_edit: None,
             }
         })
         .collect()
+}
+
+/// Reconcile an unobserved final edit against the last captured AI snapshot.
+/// The caller uses this only when no later observed non-AI step supersedes that snapshot.
+pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Vec<AttributedLine> {
+    let Some(last_ai_step) = ev
+        .steps
+        .iter()
+        .rposition(|step| matches!(step.kind, StepKind::Ai { .. }))
+    else {
+        return derive_lines_with_attribution(ev, committed);
+    };
+
+    let parent = split_lines(&ev.parent);
+    let mut previous = parent.clone();
+    let mut owners = vec![
+        OwnedLine {
+            owner: Owner::Base,
+            source_step: None,
+            ambiguous: false,
+        };
+        parent.len()
+    ];
+    for (step_index, step) in ev.steps.iter().enumerate().take(last_ai_step + 1) {
+        let next = split_lines(&step.after);
+        owners = replay(&previous, &owners, &next, step.kind, step_index);
+        previous = next;
+    }
+
+    let snapshot = split_lines(&ev.steps[last_ai_step].after);
+    let committed_lines = split_lines(committed);
+    let ops = capture_diff_slices(Algorithm::Myers, &snapshot, &committed_lines);
+    let has_unmatched_changes = ops.iter().any(|op| op.tag() != DiffTag::Equal);
+    let added = added_lines(&parent, &committed_lines);
+    let mut snapshot_counts = HashMap::<Vec<u8>, usize>::new();
+    for line in &snapshot {
+        *snapshot_counts.entry(line.clone()).or_default() += 1;
+    }
+    let mut committed_owners = vec![
+        OwnedLine {
+            owner: Owner::Gap,
+            source_step: None,
+            ambiguous: false,
+        };
+        committed_lines.len()
+    ];
+    let mut unobserved_edits = vec![None; committed_lines.len()];
+    let mut cursor = 0;
+    while cursor < ops.len() {
+        if ops[cursor].tag() == DiffTag::Equal {
+            for (old_index, new_index) in ops[cursor].old_range().zip(ops[cursor].new_range()) {
+                let mut owner = owners[old_index];
+                if is_ai_ancestry(owner.owner) {
+                    if has_unmatched_changes {
+                        unobserved_edits[new_index] =
+                            Some(UnobservedEditKind::ExactSurvivorInChangedFile);
+                    }
+                    if snapshot_counts
+                        .get(&snapshot[old_index])
+                        .copied()
+                        .unwrap_or_default()
+                        > 1
+                    {
+                        owner.ambiguous = true;
+                    }
+                }
+                committed_owners[new_index] = owner;
+            }
+            cursor += 1;
+            continue;
+        }
+
+        let start = cursor;
+        while cursor < ops.len() && ops[cursor].tag() != DiffTag::Equal {
+            cursor += 1;
+        }
+        let old_indices: Vec<_> = ops[start..cursor]
+            .iter()
+            .flat_map(|op| op.old_range())
+            .filter(|index| is_ai_ancestry(owners[*index].owner))
+            .collect();
+        let new_indices: Vec<_> = ops[start..cursor]
+            .iter()
+            .flat_map(|op| op.new_range())
+            .collect();
+        for &new_index in &new_indices {
+            unobserved_edits[new_index] = Some(UnobservedEditKind::UnmatchedUnknown);
+        }
+        for (old_index, new_index) in old_indices.into_iter().zip(new_indices) {
+            let old_line = &snapshot[old_index];
+            let new_line = &committed_lines[new_index];
+            if sufficiently_informative(old_line)
+                && sufficiently_informative(new_line)
+                && token_overlap(old_line, new_line) >= MIN_MIXED_OVERLAP
+            {
+                let source = owners[old_index];
+                committed_owners[new_index] = OwnedLine {
+                    owner: Owner::AiEdited,
+                    source_step: source.source_step,
+                    ambiguous: source.ambiguous,
+                };
+                unobserved_edits[new_index] = Some(UnobservedEditKind::MixedByTokenOverlap);
+            }
+        }
+    }
+
+    let mut committed_counts = HashMap::<Vec<u8>, usize>::new();
+    for line in &committed_lines {
+        *committed_counts.entry(line.clone()).or_default() += 1;
+    }
+    for (line, count) in committed_counts {
+        let captured = snapshot_counts.get(&line).copied().unwrap_or_default();
+        if count <= captured || !snapshot_counts.contains_key(&line) {
+            continue;
+        }
+        for (index, committed_line) in committed_lines.iter().enumerate() {
+            if *committed_line == line {
+                committed_owners[index] = OwnedLine {
+                    owner: Owner::Gap,
+                    source_step: None,
+                    ambiguous: false,
+                };
+                unobserved_edits[index] = Some(UnobservedEditKind::UnmatchedUnknown);
+            }
+        }
+    }
+
+    let mut seen: HashMap<&[u8], (Owner, bool)> = HashMap::new();
+    for (index, line) in committed_lines.iter().enumerate() {
+        let owner = committed_owners[index].owner;
+        let entry = seen.entry(line.as_slice()).or_insert((owner, false));
+        if entry.0 != owner {
+            entry.1 = true;
+        }
+    }
+
+    committed_lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let owned = committed_owners[index];
+            let ambiguous = owned.ambiguous || seen[line.as_slice()].1;
+            let label = if !added[index] {
+                Label::Unknown
+            } else {
+                match owned.owner {
+                    Owner::Ai if !ambiguous => Label::AiStrong,
+                    Owner::Ai | Owner::AiWeak => Label::AiProbable,
+                    Owner::AiEdited => Label::Mixed,
+                    Owner::Base | Owner::External | Owner::Gap => Label::Unknown,
+                }
+            };
+            AttributedLine {
+                line: LineLabel {
+                    line: index + 1,
+                    label,
+                    added: added[index],
+                    blank: line.iter().all(u8::is_ascii_whitespace),
+                },
+                source_step: owned.source_step,
+                ambiguous,
+                unobserved_edit: unobserved_edits[index],
+            }
+        })
+        .collect()
+}
+
+/// Return AI-owned snapshot lines removed in each changed hunk, with nonblank additions
+/// from the committed file. Callers pair these with the shared deterministic matcher.
+pub fn unobserved_replacement_hunks(
+    ev: &Evidence,
+    committed: &[u8],
+) -> Vec<UnobservedReplacementHunk> {
+    let Some(last_ai_step) = ev
+        .steps
+        .iter()
+        .rposition(|step| matches!(step.kind, StepKind::Ai { .. }))
+    else {
+        return Vec::new();
+    };
+    let snapshot = &ev.steps[last_ai_step].after;
+    let snapshot_attribution = derive_lines_with_attribution(
+        &Evidence {
+            parent: ev.parent.clone(),
+            steps: ev.steps[..=last_ai_step].to_vec(),
+        },
+        snapshot,
+    );
+    let snapshot_lines = split_lines(snapshot);
+    let committed_lines = split_lines(committed);
+    let operations = capture_diff_slices(Algorithm::Myers, &snapshot_lines, &committed_lines);
+    let mut hunks = Vec::new();
+    let mut cursor = 0;
+    while cursor < operations.len() {
+        if operations[cursor].tag() == DiffTag::Equal {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor < operations.len() && operations[cursor].tag() != DiffTag::Equal {
+            cursor += 1;
+        }
+        let removed_ai = operations[start..cursor]
+            .iter()
+            .flat_map(|operation| operation.old_range())
+            .filter_map(|line_index| {
+                let attributed = snapshot_attribution.get(line_index)?;
+                matches!(
+                    attributed.line.label,
+                    Label::AiStrong | Label::AiProbable | Label::Mixed
+                )
+                .then(|| UnobservedAiLine {
+                    text: snapshot_lines[line_index].clone(),
+                    source_step: attributed.source_step,
+                    label: attributed.line.label,
+                })
+            })
+            .collect::<Vec<_>>();
+        let added_line_indices = operations[start..cursor]
+            .iter()
+            .flat_map(|operation| operation.new_range())
+            .filter(|&line_index| {
+                !committed_lines[line_index]
+                    .iter()
+                    .all(u8::is_ascii_whitespace)
+            })
+            .collect::<Vec<_>>();
+        if !removed_ai.is_empty() && !added_line_indices.is_empty() {
+            hunks.push(UnobservedReplacementHunk {
+                removed_ai,
+                added_line_indices,
+            });
+        }
+    }
+    hunks
+}
+
+fn is_ai_ancestry(owner: Owner) -> bool {
+    matches!(owner, Owner::Ai | Owner::AiWeak | Owner::AiEdited)
+}
+
+fn sufficiently_informative(line: &[u8]) -> bool {
+    String::from_utf8_lossy(line).trim().chars().count() >= 8
+}
+
+fn token_overlap(left: &[u8], right: &[u8]) -> f64 {
+    let left_tokens = lexical_tokens(left);
+    let right_tokens = lexical_tokens(right);
+    if left_tokens.is_empty() || right_tokens.is_empty() {
+        return 0.0;
+    }
+    let mut counts = HashMap::<Vec<u8>, usize>::new();
+    for token in &left_tokens {
+        *counts.entry(token.clone()).or_default() += 1;
+    }
+    let shared: usize = {
+        let mut remaining = counts;
+        let mut shared = 0;
+        for token in &right_tokens {
+            if let Some(count) = remaining.get_mut(token) {
+                if *count > 0 {
+                    *count -= 1;
+                    shared += 1;
+                }
+            }
+        }
+        shared
+    };
+    shared as f64 / left_tokens.len().max(right_tokens.len()) as f64
+}
+
+fn lexical_tokens(line: &[u8]) -> Vec<Vec<u8>> {
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < line.len() {
+        let byte = line[index];
+        if byte.is_ascii_whitespace() {
+            index += 1;
+        } else if byte.is_ascii_alphanumeric() || byte == b'_' {
+            let start = index;
+            index += 1;
+            while index < line.len() && (line[index].is_ascii_alphanumeric() || line[index] == b'_')
+            {
+                index += 1;
+            }
+            tokens.push(line[start..index].to_vec());
+        } else if is_operator(byte) {
+            let start = index;
+            index += 1;
+            while index < line.len() && is_operator(line[index]) {
+                index += 1;
+            }
+            tokens.push(line[start..index].to_vec());
+        } else {
+            index += 1;
+        }
+    }
+    tokens
+}
+
+fn is_operator(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'%'
+            | b'&'
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'/'
+            | b':'
+            | b'<'
+            | b'='
+            | b'>'
+            | b'?'
+            | b'^'
+            | b'|'
+            | b'~'
+    )
 }
 
 pub fn count(labels: &[LineLabel]) -> Counts {
@@ -559,6 +902,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unobserved_survival_derivation_is_deterministic() {
+        let ev = evidence(
+            b"base\n",
+            vec![step(
+                StepKind::Ai { degraded: false },
+                b"base\nlet product = a * b;\n",
+            )],
+        );
+        let committed = b"base\nlet product = a * c;\n";
+        assert_eq!(
+            derive_lines_with_unobserved_edits(&ev, committed),
+            derive_lines_with_unobserved_edits(&ev, committed)
+        );
+    }
+
     #[derive(Clone, Copy)]
     struct XorShift(u64);
 
@@ -592,20 +951,20 @@ mod tests {
         }
     }
 
-    fn bytes_of(file: &[(Vec<u8>, Author)]) -> Vec<u8> {
+    fn bytes_of(file: &[(Vec<u8>, Author, bool)]) -> Vec<u8> {
         let mut bytes = Vec::new();
-        for (text, _) in file {
+        for (text, _, _) in file {
             bytes.extend_from_slice(text);
             bytes.push(b'\n');
         }
         bytes
     }
 
-    fn fuzz_case(seed: u64, case: usize, tiny: bool) {
+    fn fuzz_case(seed: u64, case: usize, tiny: bool, enforce_no_ai_ancestry: bool) {
         let mut rng = XorShift(seed | 1);
         let initial_count = rng.below(5);
-        let mut file: Vec<(Vec<u8>, Author)> = (0..initial_count)
-            .map(|edit| (random_text(&mut rng, case, edit, tiny), Author::Base))
+        let mut file: Vec<(Vec<u8>, Author, bool)> = (0..initial_count)
+            .map(|edit| (random_text(&mut rng, case, edit, tiny), Author::Base, false))
             .collect();
         let parent = bytes_of(&file);
         let mut steps = Vec::new();
@@ -621,7 +980,7 @@ mod tests {
             if file.is_empty() || action == 0 {
                 let text = random_text(&mut rng, case, edit, tiny);
                 let index = rng.below(file.len() + 1);
-                file.insert(index, (text, actor));
+                file.insert(index, (text, actor, matches!(actor, Author::Ai)));
             } else if action == 1 {
                 file.remove(rng.below(file.len()));
             } else {
@@ -631,7 +990,8 @@ mod tests {
                 while text == old_text {
                     text = random_text(&mut rng, case, edit, tiny);
                 }
-                file[index] = (text, actor);
+                let ai_ancestry = file[index].2 || matches!(actor, Author::Ai);
+                file[index] = (text, actor, ai_ancestry);
             }
             steps.push(step(
                 match actor {
@@ -645,13 +1005,26 @@ mod tests {
 
         let committed = bytes_of(&file);
         let labels = derive_lines(&evidence(&parent, steps), &committed);
-        for ((_, author), label) in file.iter().zip(labels.iter()) {
+        for ((_, author, ai_ancestry), label) in file.iter().zip(labels.iter()) {
             assert!(
                 !matches!(author, Author::Human) || label.label != Label::AiStrong,
                 "human line labeled strong in tiny={tiny}, case={case}, line={}: {:?}",
                 label.line,
                 label
             );
+            if enforce_no_ai_ancestry {
+                assert!(
+                    *ai_ancestry
+                        || !matches!(
+                            label.label,
+                            Label::AiStrong | Label::AiProbable | Label::Mixed
+                        ),
+                    "line without AI ancestry received {:?} in tiny={tiny}, case={case}, line={}: {:?}",
+                    label.label,
+                    label.line,
+                    label
+                );
+            }
         }
     }
 
@@ -659,7 +1032,17 @@ mod tests {
     fn fixed_seed_fuzz_never_labels_human_lines_ai_strong() {
         for tiny in [false, true] {
             for case in 0..3000 {
-                fuzz_case(0x9e37_79b9_7f4a_7c15 ^ case as u64, case, tiny);
+                fuzz_case(0x9e37_79b9_7f4a_7c15 ^ case as u64, case, tiny, false);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "known gap: duplicate identical lines make replay owner mapping ambiguous; planned r18"]
+    fn fixed_seed_fuzz_no_ai_category_on_lines_without_ai_ancestry() {
+        for tiny in [false, true] {
+            for case in 0..3000 {
+                fuzz_case(0x9e37_79b9_7f4a_7c15 ^ case as u64, case, tiny, true);
             }
         }
     }
@@ -681,6 +1064,74 @@ mod tests {
     }
 
     #[test]
+    fn unobserved_replacements_need_minimum_overlap_and_ai_ancestry() {
+        let ev = evidence(
+            b"base\n",
+            vec![step(
+                StepKind::Ai { degraded: false },
+                b"base\nreturn a * b;\nstable_value = 12;\n",
+            )],
+        );
+        let lines = derive_lines_with_unobserved_edits(
+            &ev,
+            b"base\nreturn a * c;\nstable_value = 12;\nnew unrelated value\n",
+        );
+        assert_eq!(lines[1].line.label, Label::Mixed);
+        assert_eq!(
+            lines[1].unobserved_edit,
+            Some(UnobservedEditKind::MixedByTokenOverlap)
+        );
+        assert_eq!(lines[2].line.label, Label::AiStrong);
+        assert_eq!(
+            lines[2].unobserved_edit,
+            Some(UnobservedEditKind::ExactSurvivorInChangedFile)
+        );
+        assert_eq!(lines[3].line.label, Label::Unknown);
+        assert_eq!(
+            lines[3].unobserved_edit,
+            Some(UnobservedEditKind::UnmatchedUnknown)
+        );
+        assert!(token_overlap(b"return a * b;", b"return a * c;") >= MIN_MIXED_OVERLAP);
+        assert!(sufficiently_informative(b"return a * b;"));
+        assert!(!sufficiently_informative(b"v4"));
+    }
+
+    #[test]
+    fn duplicate_ai_snapshot_lines_are_probable_after_unobserved_alignment() {
+        let ev = evidence(
+            b"base\n",
+            vec![step(
+                StepKind::Ai { degraded: false },
+                b"base\nrepeat_call();\nrepeat_call();\n",
+            )],
+        );
+        let lines = derive_lines_with_unobserved_edits(
+            &ev,
+            b"base\nrepeat_call();\nrepeat_call();\nlate_value();\n",
+        );
+        assert_eq!(lines[1].line.label, Label::AiProbable);
+        assert_eq!(lines[2].line.label, Label::AiProbable);
+        assert_eq!(lines[3].line.label, Label::Unknown);
+    }
+
+    #[test]
+    fn copied_ai_text_with_ambiguous_survival_is_unknown() {
+        let ev = evidence(
+            b"base\n",
+            vec![step(
+                StepKind::Ai { degraded: false },
+                b"base\ncalculate_total = left_value + right_value;\n",
+            )],
+        );
+        let lines = derive_lines_with_unobserved_edits(
+            &ev,
+            b"base\ncalculate_total = left_value + right_value;\ncalculate_total = left_value + right_value;\n",
+        );
+        assert_eq!(lines[1].line.label, Label::Unknown);
+        assert_eq!(lines[2].line.label, Label::Unknown);
+    }
+
+    #[test]
     fn ai_function_next_to_existing_braces_stays_mostly_strong() {
         let parent = b"fn a() {\n}\n";
         let after = b"fn a() {\n}\n\nfn b() {\n    let x = 1;\n}\n";
@@ -693,8 +1144,8 @@ mod tests {
         );
     }
 
-    fn stress_run(vocab: usize, cases: u64) -> (u64, u64) {
-        let (mut leaks, mut strong) = (0u64, 0u64);
+    fn stress_run(vocab: usize, cases: u64) -> (u64, u64, u64) {
+        let (mut strong_leaks, mut linked_leaks, mut strong) = (0u64, 0u64, 0u64);
         for case in 0..cases {
             let mut rng = XorShift((0x00C0_FFEE ^ case.wrapping_mul(0x9e37_79b9_7f4a_7c15)) | 1);
             let mut counter = 0u64;
@@ -707,8 +1158,8 @@ mod tests {
                 }
             };
             let initial = rng.below(6);
-            let mut file: Vec<(Vec<u8>, Author)> = (0..initial)
-                .map(|_| (text(&mut rng), Author::Base))
+            let mut file: Vec<(Vec<u8>, Author, bool)> = (0..initial)
+                .map(|_| (text(&mut rng), Author::Base, false))
                 .collect();
             let parent = bytes_of(&file);
             let mut steps = Vec::new();
@@ -722,7 +1173,7 @@ mod tests {
                     0 | 1 => {
                         let t = text(&mut rng);
                         let at = rng.below(file.len() + 1);
-                        file.insert(at, (t, actor));
+                        file.insert(at, (t, actor, matches!(actor, Author::Ai)));
                     }
                     2 => {
                         if !file.is_empty() {
@@ -740,7 +1191,8 @@ mod tests {
                                 guard += 1;
                             }
                             if t != file[at].0 {
-                                file[at] = (t, actor);
+                                let ai_ancestry = file[at].2 || matches!(actor, Author::Ai);
+                                file[at] = (t, actor, ai_ancestry);
                             }
                         }
                     }
@@ -748,7 +1200,7 @@ mod tests {
                         let at = rng.below(file.len() + 1);
                         for k in 0..(2 + rng.below(3)) {
                             let t = text(&mut rng);
-                            file.insert(at + k, (t, actor));
+                            file.insert(at + k, (t, actor, matches!(actor, Author::Ai)));
                         }
                     }
                 }
@@ -760,29 +1212,48 @@ mod tests {
             }
             let committed = bytes_of(&file);
             let labels = derive_lines(&evidence(&parent, steps), &committed);
-            for ((_, author), label) in file.iter().zip(labels.iter()) {
+            for ((_, author, ai_ancestry), label) in file.iter().zip(labels.iter()) {
+                if matches!(
+                    label.label,
+                    Label::AiStrong | Label::AiProbable | Label::Mixed
+                ) && !ai_ancestry
+                {
+                    linked_leaks += 1;
+                }
                 if label.label == Label::AiStrong {
                     strong += 1;
                     if !matches!(author, Author::Ai) {
-                        leaks += 1;
+                        strong_leaks += 1;
                     }
                 }
             }
         }
-        (leaks, strong)
+        (strong_leaks, linked_leaks, strong)
     }
 
     #[test]
     fn stress_never_labels_non_ai_lines_strong_across_vocabularies() {
         for vocab in [0usize, 2, 3, 6, 12] {
-            let (leaks, strong) = stress_run(vocab, 12_000);
+            let (strong_leaks, _, strong) = stress_run(vocab, 12_000);
             assert_eq!(
-                leaks, 0,
-                "vocab={vocab}: {leaks} non-AI lines labelled strong"
+                strong_leaks, 0,
+                "vocab={vocab}: {strong_leaks} non-AI lines labelled strong"
             );
             if vocab == 0 {
                 assert!(strong > 0);
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "known gap: duplicate identical lines make replay owner mapping ambiguous; planned r18"]
+    fn stress_no_ai_category_on_lines_without_ai_ancestry() {
+        for vocab in [0usize, 2, 3, 6, 12] {
+            let (_, linked_leaks, _) = stress_run(vocab, 12_000);
+            assert_eq!(
+                linked_leaks, 0,
+                "vocab={vocab}: {linked_leaks} lines without AI ancestry received an AI category"
+            );
         }
     }
 }

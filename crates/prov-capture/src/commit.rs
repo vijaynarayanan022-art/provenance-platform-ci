@@ -1,5 +1,6 @@
 use crate::derive::{self, Evidence, Step, StepKind};
 use serde::{Deserialize, Serialize};
+use similar::{capture_diff_slices, Algorithm, DiffTag};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -14,6 +15,26 @@ const MAX_PENDING_PER_RUN: usize = 50;
 const PENDING_BUDGET: Duration = Duration::from_secs(20);
 const ATTEMPT_MARKER_AGE: Duration = Duration::from_secs(60);
 const DERIVE_LOCK_AGE: Duration = Duration::from_secs(120);
+const MIN_PARENT_EDIT_SIMILARITY: f64 = 0.5;
+const MAX_PARENT_MATCH_CELLS: usize = 1_000_000;
+
+#[derive(Clone, Default)]
+struct StoredParentLine {
+    category: String,
+    score: Option<f64>,
+    supporting_basis: Vec<String>,
+    source: Option<AttributionSource>,
+    operation: Option<String>,
+}
+
+impl StoredParentLine {
+    fn is_ai(&self) -> bool {
+        matches!(
+            self.category.as_str(),
+            "ai_direct" | "ai_strong" | "ai_probable" | "mixed"
+        )
+    }
+}
 
 #[derive(Serialize)]
 struct CommitOutput {
@@ -614,6 +635,10 @@ fn derive_resolved_commit(
     }
 
     let parent = parents.first().map(|value| (*value).to_owned());
+    let parent_line_labels = parent
+        .as_deref()
+        .map(|parent| read_parent_line_labels(store, parent))
+        .unwrap_or_default();
     let (files, has_changes) = commit_files(&repo.root, parent.as_deref(), &commit)?;
     if !has_changes {
         return write_empty_commit(store, repo_id, commit, parent);
@@ -655,6 +680,7 @@ fn derive_resolved_commit(
     let mut output_files = Vec::with_capacity(files.len());
     let mut line_files = BTreeMap::new();
     let mut attributions = Vec::new();
+    let mut parent_fallback_lines = HashMap::<String, usize>::new();
     let mut unreadable_files = 0;
     for file in files {
         let old_size = file
@@ -762,14 +788,21 @@ fn derive_resolved_commit(
         let (mut steps, mut evidence) =
             steps_for_events(store, &selected_events, &normalized_committed, commit_time);
         if evidence == "missing_blob" {
-            unreadable_files += 1;
-            attributions.extend(unknown_attributions(
-                &file.path,
-                &normalized_parent,
-                &normalized_committed,
-            ));
-            output_files.push(unknown_file(file.path, evidence, added_count));
-            continue;
+            if let Some(fallback) =
+                missing_snapshot_time_cut_fallback(store, &selected_events, &normalized_committed)
+            {
+                steps = vec![fallback];
+                evidence = "time_cut";
+            } else {
+                unreadable_files += 1;
+                attributions.extend(unknown_attributions(
+                    &file.path,
+                    &normalized_parent,
+                    &normalized_committed,
+                ));
+                output_files.push(unknown_file(file.path, evidence, added_count));
+                continue;
+            }
         }
 
         if (reconstruct_all || reconstruct_paths.contains(file.path.as_str()))
@@ -793,23 +826,154 @@ fn derive_resolved_commit(
             });
             evidence = "reconstructed";
         }
-        let evidence_input = Evidence {
-            parent: normalized_parent,
-            steps,
+        let survival_steps = if evidence == "time_cut" {
+            prepare_unobserved_survival_steps(&steps)
+        } else {
+            None
         };
-        let attributed_lines =
-            derive::derive_lines_with_attribution(&evidence_input, &normalized_committed);
+        let use_unobserved_survival = survival_steps.is_some();
+        let mut evidence_input = Evidence {
+            parent: normalized_parent.clone(),
+            steps: survival_steps.unwrap_or(steps),
+        };
+        let mut attributed_lines = if use_unobserved_survival {
+            derive::derive_lines_with_unobserved_edits(&evidence_input, &normalized_committed)
+        } else {
+            derive::derive_lines_with_attribution(&evidence_input, &normalized_committed)
+        };
+        let committed_line_bytes = split_normalized_lines(&normalized_committed);
+        let parent_lines = parent_line_labels.get(&file.path);
+        let fallback_matches = parent_lines
+            .map(|labels| {
+                parent_lineage_fallback_matches(&normalized_parent, &normalized_committed, labels)
+            })
+            .unwrap_or_default();
+        if !fallback_matches.is_empty() {
+            for line in &mut attributed_lines {
+                if line.line.label == derive::Label::Unknown {
+                    line.source_step = None;
+                }
+            }
+        }
+        let mut fallback_count = 0;
+        for (line_index, parent_line) in fallback_matches {
+            let Some(attributed) = attributed_lines.get_mut(line_index) else {
+                continue;
+            };
+            if !attributed.line.added
+                || attributed.line.blank
+                || attributed.line.label != derive::Label::Unknown
+            {
+                continue;
+            }
+
+            let score_milli = parent_line.score.map_or_else(
+                || default_parent_score_milli(&parent_line.category),
+                |score| (score.clamp(0.0, 1.0) * 1000.0).round() as u16,
+            );
+            let step_index = evidence_input.steps.len();
+            evidence_input.steps.push(Step {
+                kind: StepKind::Unknown,
+                after: Vec::new(),
+                attribution: Some(derive::StepAttribution {
+                    adapter_id: parent_line
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.adapter_id.clone()),
+                    tool_id: parent_line
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.tool_id.clone()),
+                    run_id: parent_line
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.session_ref.clone()),
+                    operation: parent_line.operation,
+                    primary_basis: Some("CONFLICTING_EVIDENCE".into()),
+                    score_milli,
+                    penalties_milli: Vec::new(),
+                    supporting_basis: parent_line.supporting_basis,
+                    limiting_basis: vec!["X_UNOBSERVED_EDIT_IN_FILE".into()],
+                }),
+            });
+            attributed.line.label = derive::Label::Mixed;
+            attributed.source_step = Some(step_index);
+            attributed.ambiguous = false;
+            fallback_count += 1;
+        }
+        if use_unobserved_survival {
+            for hunk in derive::unobserved_replacement_hunks(&evidence_input, &normalized_committed)
+            {
+                let old_text = hunk
+                    .removed_ai
+                    .iter()
+                    .map(|line| line.text.as_slice())
+                    .collect::<Vec<_>>();
+                let new_indices = hunk
+                    .added_line_indices
+                    .into_iter()
+                    .filter(|&index| {
+                        attributed_lines.get(index).is_some_and(|line| {
+                            line.line.added
+                                && !line.line.blank
+                                && line.line.label == derive::Label::Unknown
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let new_text = new_indices
+                    .iter()
+                    .map(|&index| committed_line_bytes[index])
+                    .collect::<Vec<_>>();
+                for (old_match, new_match) in
+                    order_preserving_similarity_matches(&old_text, &new_text)
+                {
+                    let Some(source_index) = hunk.removed_ai[old_match].source_step else {
+                        continue;
+                    };
+                    let Some(source_attribution) = evidence_input
+                        .steps
+                        .get(source_index)
+                        .and_then(|step| step.attribution.as_ref())
+                    else {
+                        continue;
+                    };
+                    let mut attribution = source_attribution.clone();
+                    attribution.score_milli =
+                        default_parent_score_milli(category_name(hunk.removed_ai[old_match].label));
+                    attribution.penalties_milli.clear();
+                    attribution
+                        .limiting_basis
+                        .retain(|basis| basis != "CONFLICTING_EVIDENCE");
+                    push_basis(&mut attribution.limiting_basis, "X_UNOBSERVED_EDIT_IN_FILE");
+                    let mixed_step = evidence_input.steps.len();
+                    evidence_input.steps.push(Step {
+                        kind: StepKind::Unknown,
+                        after: Vec::new(),
+                        attribution: Some(attribution),
+                    });
+                    let attributed = &mut attributed_lines[new_indices[new_match]];
+                    attributed.line.label = derive::Label::Mixed;
+                    attributed.source_step = Some(mixed_step);
+                    attributed.ambiguous = false;
+                    attributed.unobserved_edit =
+                        Some(derive::UnobservedEditKind::MixedBySimilarity);
+                    fallback_count += 1;
+                }
+            }
+        }
+        if fallback_count > 0 {
+            parent_fallback_lines.insert(file.path.clone(), fallback_count);
+        }
         let labels: Vec<_> = attributed_lines
             .iter()
             .map(|line| line.line.clone())
             .collect();
         let counts = derive::count(&labels);
-        let committed_lines = split_normalized_lines(&normalized_committed);
         let lines = attributed_lines
             .iter()
             .filter(|line| line.line.added && !line.line.blank)
             .filter_map(|line| {
-                let text = committed_lines.get(line.line.line.checked_sub(1)?)?;
+                let text = committed_line_bytes.get(line.line.line.checked_sub(1)?)?;
                 let digest = crate::hash(text);
                 Some(LineOutput {
                     line: line.line.line,
@@ -858,7 +1022,12 @@ fn derive_resolved_commit(
         totals.unknown += file.unknown;
         totals.excluded += file.excluded;
         if file.evidence != "none" && file.evidence != "missing_blob" {
-            covered += file.e;
+            covered += file.e.saturating_sub(
+                parent_fallback_lines
+                    .get(&file.path)
+                    .copied()
+                    .unwrap_or_default(),
+            );
         }
     }
     totals.unreadable_files = unreadable_files;
@@ -867,7 +1036,10 @@ fn derive_resolved_commit(
         totals.ai_direct + totals.ai_strong + totals.ai_probable + totals.mixed,
         totals.e,
     );
-    let coverage = coverage_band(covered, totals.e);
+    let mut coverage = coverage_band(covered, totals.e);
+    if !parent_fallback_lines.is_empty() && coverage == "high" {
+        coverage = "medium";
+    }
     let patch_id = if has_changes {
         parent
             .as_deref()
@@ -1494,10 +1666,43 @@ fn attribution_ranges(
         if label != derive::Label::Unknown && attributed.ambiguous {
             push_basis(&mut limiting_basis, "CONFLICTING_EVIDENCE");
         }
-        if label == derive::Label::Mixed {
+        if label == derive::Label::Mixed
+            && !matches!(
+                attributed.unobserved_edit,
+                Some(
+                    derive::UnobservedEditKind::MixedByTokenOverlap
+                        | derive::UnobservedEditKind::MixedBySimilarity
+                )
+            )
+        {
             push_basis(&mut limiting_basis, "CONFLICTING_EVIDENCE");
         }
-        let score = score_for_label(label, step, &limiting_basis);
+        match attributed.unobserved_edit {
+            Some(derive::UnobservedEditKind::ExactSurvivorInChangedFile) => {
+                push_basis(&mut limiting_basis, "X_UNOBSERVED_EDIT_IN_FILE");
+            }
+            Some(derive::UnobservedEditKind::MixedByTokenOverlap)
+            | Some(derive::UnobservedEditKind::UnmatchedUnknown) => {
+                push_basis(&mut limiting_basis, "X_UNOBSERVED_EDIT");
+            }
+            Some(derive::UnobservedEditKind::MixedBySimilarity) => {
+                push_basis(&mut limiting_basis, "X_UNOBSERVED_EDIT_IN_FILE");
+            }
+            None => {}
+        }
+        let mut score_step = step.cloned();
+        if matches!(
+            attributed.unobserved_edit,
+            Some(
+                derive::UnobservedEditKind::MixedByTokenOverlap
+                    | derive::UnobservedEditKind::MixedBySimilarity
+            )
+        ) {
+            if let Some(score_step) = score_step.as_mut() {
+                score_step.penalties_milli.push(80);
+            }
+        }
+        let score = score_for_label(label, score_step.as_ref(), &limiting_basis);
         let confidence_band = match label {
             derive::Label::Unknown => "none",
             derive::Label::AiStrong | derive::Label::AiProbable | derive::Label::Mixed => {
@@ -1512,11 +1717,22 @@ fn attribution_ranges(
             category: category.into(),
             score,
             confidence_band: confidence_band.into(),
-            primary_basis: (label != derive::Label::Unknown)
-                .then(|| step.and_then(|step| step.primary_basis.clone()))
-                .flatten(),
+            primary_basis: if label == derive::Label::Unknown {
+                None
+            } else if attributed.unobserved_edit
+                == Some(derive::UnobservedEditKind::MixedByTokenOverlap)
+                || attributed.unobserved_edit == Some(derive::UnobservedEditKind::MixedBySimilarity)
+            {
+                Some("CONFLICTING_EVIDENCE".into())
+            } else {
+                step.and_then(|step| step.primary_basis.clone())
+            },
             supporting_basis: if label == derive::Label::Unknown {
                 Vec::new()
+            } else if attributed.unobserved_edit
+                == Some(derive::UnobservedEditKind::MixedByTokenOverlap)
+            {
+                vec!["EXACT_FRAGMENT_MATCH".into()]
             } else {
                 step.map(|step| step.supporting_basis.clone())
                     .unwrap_or_default()
@@ -1536,6 +1752,352 @@ fn attribution_ranges(
         push_attribution_range(&mut ranges, attribution);
     }
     ranges
+}
+
+fn prepare_unobserved_survival_steps(steps: &[Step]) -> Option<Vec<Step>> {
+    let last_ai = steps
+        .iter()
+        .rposition(|step| matches!(step.kind, StepKind::Ai { .. }))?;
+    if steps
+        .iter()
+        .any(|step| !matches!(step.kind, StepKind::Ai { .. }))
+    {
+        return None;
+    }
+    let last_attribution = steps[last_ai].attribution.as_ref()?;
+    if last_attribution
+        .limiting_basis
+        .iter()
+        .any(|basis| matches!(basis.as_str(), "X_DEGRADED" | "X_OVERLAPPING_SESSIONS"))
+        || last_attribution.primary_basis.as_deref() == Some("INCOMPLETE_SOURCE")
+    {
+        return None;
+    }
+
+    let mut prepared = steps.to_vec();
+    for step in &mut prepared {
+        let StepKind::Ai { degraded: true } = step.kind else {
+            continue;
+        };
+        let Some(attribution) = step.attribution.as_mut() else {
+            continue;
+        };
+        if !attribution
+            .limiting_basis
+            .iter()
+            .any(|basis| basis == "X_TIME_CUT")
+            || attribution
+                .limiting_basis
+                .iter()
+                .any(|basis| matches!(basis.as_str(), "X_DEGRADED" | "X_OVERLAPPING_SESSIONS"))
+        {
+            continue;
+        }
+        attribution
+            .limiting_basis
+            .retain(|basis| basis != "X_TIME_CUT");
+        if let Some(penalty) = attribution
+            .penalties_milli
+            .iter()
+            .position(|value| *value == 120)
+        {
+            attribution.penalties_milli.remove(penalty);
+        }
+        step.kind = StepKind::Ai { degraded: false };
+    }
+    Some(prepared)
+}
+
+fn missing_snapshot_time_cut_fallback(
+    store: &Path,
+    events: &[&EventRecord],
+    committed: &[u8],
+) -> Option<Step> {
+    let committed_sha = crate::hash(committed);
+    let event = events.iter().find(|event| {
+        if event.event != "ai_change" {
+            return false;
+        }
+        let Some(sha) = event.after_sha.as_deref() else {
+            return false;
+        };
+        is_sha256(sha)
+            && sha != committed_sha
+            && crate::read_blob(&store.join("blobs").join(sha), sha).is_none()
+    })?;
+    Some(Step {
+        kind: StepKind::Ai { degraded: true },
+        after: committed.to_vec(),
+        attribution: Some(derive::StepAttribution {
+            adapter_id: event.tool.clone(),
+            tool_id: event.tool.clone(),
+            run_id: event.tool_use_id.clone(),
+            operation: event.operation.clone(),
+            primary_basis: Some("INCOMPLETE_SOURCE".into()),
+            score_milli: 920,
+            penalties_milli: vec![120],
+            supporting_basis: Vec::new(),
+            limiting_basis: vec!["X_TIME_CUT".into(), "INCOMPLETE_SOURCE".into()],
+        }),
+    })
+}
+
+fn read_parent_line_labels(
+    store: &Path,
+    parent: &str,
+) -> HashMap<String, HashMap<usize, StoredParentLine>> {
+    let path = store.join("commits").join(format!("{parent}.lines.json"));
+    let Ok(bytes) = fs::read(path) else {
+        return HashMap::new();
+    };
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return HashMap::new();
+    };
+    let mut files = HashMap::<String, HashMap<usize, StoredParentLine>>::new();
+    if let Some(entries) = document.get("files").and_then(serde_json::Value::as_array) {
+        for file in entries {
+            let Some(path) = file.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(lines) = file.get("lines").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            let line_map = files.entry(path.to_owned()).or_default();
+            for line in lines {
+                let (Some(number), Some(code)) = (
+                    line.get("line").and_then(serde_json::Value::as_u64),
+                    line.get("label").and_then(serde_json::Value::as_str),
+                ) else {
+                    continue;
+                };
+                let Some(category) = category_for_line_code(code) else {
+                    continue;
+                };
+                line_map.entry(number as usize).or_default().category = category.into();
+            }
+        }
+    }
+    if let Some(ranges) = document
+        .get("attributions")
+        .and_then(serde_json::Value::as_array)
+    {
+        for range in ranges {
+            let (Some(path), Some(start), Some(end), Some(category)) = (
+                range.get("path").and_then(serde_json::Value::as_str),
+                range.get("startLine").and_then(serde_json::Value::as_u64),
+                range.get("endLine").and_then(serde_json::Value::as_u64),
+                range.get("category").and_then(serde_json::Value::as_str),
+            ) else {
+                continue;
+            };
+            let source = range
+                .get("source")
+                .and_then(serde_json::Value::as_object)
+                .map(|source| AttributionSource {
+                    adapter_id: source
+                        .get("adapterId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    tool_id: source
+                        .get("toolId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    session_ref: source
+                        .get("sessionRef")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                });
+            let supporting_basis: Vec<String> = range
+                .get("supportingBasis")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            let score = range.get("score").and_then(serde_json::Value::as_f64);
+            let operation = range
+                .get("operation")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let line_map = files.entry(path.to_owned()).or_default();
+            for line in start..=end {
+                let stored = line_map.entry(line as usize).or_default();
+                stored.category = category.to_owned();
+                stored.score = score;
+                stored.source = source.clone();
+                stored.operation = operation.clone();
+                stored.supporting_basis = supporting_basis.clone();
+            }
+        }
+    }
+    files
+}
+
+fn category_for_line_code(code: &str) -> Option<&'static str> {
+    match code {
+        "d" => Some("ai_direct"),
+        "s" => Some("ai_strong"),
+        "p" => Some("ai_probable"),
+        "m" => Some("mixed"),
+        "u" => Some("unknown"),
+        _ => None,
+    }
+}
+
+fn default_parent_score_milli(category: &str) -> u16 {
+    match category {
+        "ai_direct" => 990,
+        "ai_strong" => 920,
+        "ai_probable" => 790,
+        "mixed" => 840,
+        _ => 0,
+    }
+}
+
+fn parent_lineage_fallback_matches(
+    parent: &[u8],
+    committed: &[u8],
+    stored_lines: &HashMap<usize, StoredParentLine>,
+) -> Vec<(usize, StoredParentLine)> {
+    let parent_lines = split_normalized_lines(parent);
+    let committed_lines = split_normalized_lines(committed);
+    let operations = capture_diff_slices(Algorithm::Myers, &parent_lines, &committed_lines);
+    let mut matches = Vec::new();
+    let mut cursor = 0;
+    while cursor < operations.len() {
+        if operations[cursor].tag() == DiffTag::Equal {
+            cursor += 1;
+            continue;
+        }
+        let hunk_start = cursor;
+        while cursor < operations.len() && operations[cursor].tag() != DiffTag::Equal {
+            cursor += 1;
+        }
+        let removed_ai: Vec<_> = operations[hunk_start..cursor]
+            .iter()
+            .flat_map(|operation| operation.old_range())
+            .filter_map(|line_index| {
+                stored_lines
+                    .get(&(line_index + 1))
+                    .filter(|line| line.is_ai())
+                    .map(|line| (line_index, line))
+            })
+            .collect();
+        let added: Vec<_> = operations[hunk_start..cursor]
+            .iter()
+            .flat_map(|operation| operation.new_range())
+            .filter(|&line_index| {
+                !committed_lines[line_index]
+                    .iter()
+                    .all(u8::is_ascii_whitespace)
+            })
+            .collect();
+        if removed_ai.is_empty() || added.is_empty() {
+            continue;
+        }
+        let old_text: Vec<_> = removed_ai
+            .iter()
+            .map(|(line_index, _)| parent_lines[*line_index])
+            .collect();
+        let new_text: Vec<_> = added
+            .iter()
+            .map(|&line_index| committed_lines[line_index])
+            .collect();
+        for (old_match, new_match) in order_preserving_similarity_matches(&old_text, &new_text) {
+            matches.push((added[new_match], removed_ai[old_match].1.clone()));
+        }
+    }
+    matches
+}
+
+#[derive(Clone, Copy, Default)]
+struct MatchQuality {
+    pairs: usize,
+    similarity: u64,
+}
+
+fn order_preserving_similarity_matches(old: &[&[u8]], new: &[&[u8]]) -> Vec<(usize, usize)> {
+    if old.is_empty()
+        || new.is_empty()
+        || old.len().saturating_mul(new.len()) > MAX_PARENT_MATCH_CELLS
+    {
+        return Vec::new();
+    }
+    const SKIP_OLD: u8 = 1;
+    const SKIP_NEW: u8 = 2;
+    const PAIR: u8 = 3;
+    let width = new.len() + 1;
+    let mut choices = vec![0u8; (old.len() + 1) * width];
+    let mut next = vec![MatchQuality::default(); width];
+    for old_index in (0..old.len()).rev() {
+        let mut current = vec![MatchQuality::default(); width];
+        for new_index in (0..new.len()).rev() {
+            let mut best = next[new_index];
+            let mut choice = SKIP_OLD;
+            if better_match_quality(current[new_index + 1], best) {
+                best = current[new_index + 1];
+                choice = SKIP_NEW;
+            }
+            let similarity = normalized_line_similarity(old[old_index], new[new_index]);
+            if similarity >= MIN_PARENT_EDIT_SIMILARITY {
+                let mut paired = next[new_index + 1];
+                paired.pairs += 1;
+                paired.similarity += (similarity * 1_000_000.0).round() as u64;
+                if better_match_quality(paired, best) {
+                    best = paired;
+                    choice = PAIR;
+                }
+            }
+            current[new_index] = best;
+            choices[old_index * width + new_index] = choice;
+        }
+        next = current;
+    }
+    let mut pairs = Vec::new();
+    let (mut old_index, mut new_index) = (0, 0);
+    while old_index < old.len() && new_index < new.len() {
+        match choices[old_index * width + new_index] {
+            PAIR => {
+                pairs.push((old_index, new_index));
+                old_index += 1;
+                new_index += 1;
+            }
+            SKIP_NEW => new_index += 1,
+            _ => old_index += 1,
+        }
+    }
+    pairs
+}
+
+fn better_match_quality(candidate: MatchQuality, current: MatchQuality) -> bool {
+    candidate.pairs > current.pairs
+        || (candidate.pairs == current.pairs && candidate.similarity > current.similarity)
+}
+
+/// Similarity is 1 - normalized bytewise Levenshtein distance; pairs below 0.5 stay unknown.
+fn normalized_line_similarity(left: &[u8], right: &[u8]) -> f64 {
+    let denominator = left.len().max(right.len());
+    if denominator == 0 {
+        return 1.0;
+    }
+    let distance = levenshtein_distance(left, right);
+    1.0 - distance as f64 / denominator as f64
+}
+
+fn levenshtein_distance(left: &[u8], right: &[u8]) -> usize {
+    let mut previous: Vec<_> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_byte) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_byte) in right.iter().enumerate() {
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + usize::from(left_byte != right_byte));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 fn unknown_attributions(path: &str, parent: &[u8], committed: &[u8]) -> Vec<AttributionRange> {

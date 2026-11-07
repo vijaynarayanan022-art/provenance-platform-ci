@@ -561,6 +561,96 @@ fn ai_commit(fixture: &Fixture, contents: &str, message: &str) -> String {
     commit
 }
 
+const S_PY_AI_PARENT: &str =
+    "def add(a,b):\n    return a + b\ndef sub(a,b):\n    return a - b\ndef neg(a):\n    return -a\n";
+
+const PALINDROME_AI_SNAPSHOT: &str = "def is_palindrome(number):\n    \"\"\"Return whether the number reads the same backward.\"\"\"\n    if number < 0:\n        return False\n\n    digits = str(number)\n    return digits == digits[::-1]\n\n\nnumber = int(input(\"Enter a number: \"))\n\nif is_palindrome(number):\n    print(\"Palindrome\")\nelse:\n    print(\"Not a palindrome\")\n";
+
+fn time_cut_new_file(fixture: &Fixture, final_contents: &str, message: &str) -> String {
+    fixture.hook("PreToolUse", "new-file-codex");
+    fs::write(fixture.repo.join("final.py"), PALINDROME_AI_SNAPSHOT).unwrap();
+    fixture.hook("PostToolUse", "new-file-codex");
+    fs::write(fixture.repo.join("final.py"), final_contents).unwrap();
+    let commit = fixture.commit(message);
+    let result = derive(fixture, &commit);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    commit
+}
+
+fn attribution_at_line<'a>(sidecar: &'a Value, path: &str, line: usize) -> &'a Value {
+    sidecar["attributions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|range| {
+            range["path"] == path
+                && range["startLine"].as_u64().unwrap() <= line as u64
+                && range["endLine"].as_u64().unwrap() >= line as u64
+        })
+        .unwrap_or_else(|| panic!("missing attribution for {path}:{line}"))
+}
+
+fn ai_s_python_parent(fixture: &Fixture) -> String {
+    fixture.hook("PreToolUse", "ai-s-python");
+    fs::write(fixture.repo.join("s.py"), S_PY_AI_PARENT).unwrap();
+    fixture.hook("PostToolUse", "ai-s-python");
+    let parent = fixture.commit("AI creates s.py");
+    assert!(derive(fixture, &parent).status.success());
+    let sidecar = fixture.sidecar_value(&parent);
+    let lines = sidecar["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "s.py")
+        .unwrap()["lines"]
+        .as_array()
+        .unwrap();
+    assert_eq!(lines.len(), 6);
+    assert!(lines.iter().all(|line| line["label"] == "s"));
+    parent
+}
+
+fn silent_s_python_child(fixture: &Fixture, parent: &str, contents: &str, message: &str) -> String {
+    git(&fixture.repo, &["checkout", parent]);
+    fixture.clear_events();
+    fs::write(fixture.repo.join("s.py"), contents).unwrap();
+    let commit = fixture.commit(message);
+    let result = derive(fixture, &commit);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    commit
+}
+
+fn mark_parent_s_python_ranges_probable(fixture: &Fixture, parent: &str) {
+    let mut sidecar = fixture.sidecar_value(parent);
+    for file in sidecar["files"].as_array_mut().unwrap() {
+        if file["path"] == "s.py" {
+            for line in file["lines"].as_array_mut().unwrap() {
+                line["label"] = json!("p");
+            }
+        }
+    }
+    for range in sidecar["attributions"].as_array_mut().unwrap() {
+        if range["path"] == "s.py" {
+            range["category"] = json!("ai_probable");
+            range["score"] = json!(0.79);
+            range["confidenceBand"] = json!("medium");
+        }
+    }
+    fs::write(
+        fixture.lines_path(parent),
+        serde_json::to_vec(&sidecar).unwrap(),
+    )
+    .unwrap();
+}
+
 fn line_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))[..16].to_owned()
 }
@@ -591,6 +681,259 @@ fn ai_and_human_commits_are_classified_with_evidence() {
     assert_eq!(tracked["evidence"], "none");
     assert!(matches!(value["coverage"].as_str(), Some("none" | "low")));
     human.drop_root();
+}
+
+#[test]
+fn no_event_parent_lineage_fallback_handles_the_s_python_repro() {
+    let fixture = Fixture::new("parent-lineage-s-python");
+    let parent = ai_s_python_parent(&fixture);
+    let child = silent_s_python_child(
+        &fixture,
+        &parent,
+        "def add(a,b):\n    return a + b\ndef sub(a,b):\n    return a - b-1\nprint(add(1,2))\n",
+        "manual s.py edits without events",
+    );
+
+    let report = fixture.derived_value(&child);
+    let s_python = file(&report, "s.py");
+    assert_eq!(s_python["evidence"], "none");
+    assert_eq!(s_python["e"], 2);
+    assert_eq!(s_python["mixed"], 1);
+    assert_eq!(s_python["unknown"], 1);
+    assert_eq!(s_python["ai_strong"], 0);
+    assert_eq!(report["coverage"], "none");
+
+    let sidecar = fixture.sidecar_value(&child);
+    let mixed = attribution_for(&sidecar, "s.py", "mixed");
+    assert_eq!(mixed["startLine"], 4);
+    assert_eq!(mixed["primaryBasis"], "CONFLICTING_EVIDENCE");
+    assert_eq!(mixed["source"]["toolId"], "codex");
+    assert_eq!(mixed["score"], 0.84);
+    assert!(mixed["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_UNOBSERVED_EDIT_IN_FILE")));
+    let unknown = attribution_for(&sidecar, "s.py", "unknown");
+    assert_eq!(unknown["startLine"], 5);
+    assert_eq!(unknown["primaryBasis"], Value::Null);
+    assert_eq!(unknown["score"], Value::Null);
+    let child_lines = sidecar["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "s.py")
+        .unwrap()["lines"]
+        .as_array()
+        .unwrap();
+    assert_eq!(child_lines.len(), 2);
+    assert_eq!(
+        child_lines
+            .iter()
+            .map(|line| line["label"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["m", "u"]
+    );
+
+    // The four unchanged lines remain strongly attributed in the parent record.
+    let parent_sidecar = fixture.sidecar_value(&parent);
+    let parent_lines = parent_sidecar["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "s.py")
+        .unwrap()["lines"]
+        .as_array()
+        .unwrap();
+    assert_eq!(parent_lines.len(), 6);
+    assert!(parent_lines.iter().all(|line| line["label"] == "s"));
+    fixture.drop_root();
+}
+
+#[test]
+fn no_event_parent_lineage_fallback_requires_a_similar_removed_ai_line() {
+    let addition = Fixture::new("parent-lineage-pure-addition");
+    let parent = ai_s_python_parent(&addition);
+    let child = silent_s_python_child(
+        &addition,
+        &parent,
+        &format!("{S_PY_AI_PARENT}print(add(1,2))\n"),
+        "pure manual addition",
+    );
+    let report = addition.derived_value(&child);
+    assert_eq!(file(&report, "s.py")["unknown"], 1);
+    assert_eq!(file(&report, "s.py")["mixed"], 0);
+    assert_eq!(report["coverage"], "none");
+    addition.drop_root();
+
+    let unrelated = Fixture::new("parent-lineage-unrelated-replacement");
+    let parent = ai_s_python_parent(&unrelated);
+    let child = silent_s_python_child(
+        &unrelated,
+        &parent,
+        "def add(a,b):\n    return a + b\ndef sub(a,b):\n    orchard mountain\ndef neg(a):\n    return -a\n",
+        "unrelated manual replacement",
+    );
+    let report = unrelated.derived_value(&child);
+    assert_eq!(file(&report, "s.py")["unknown"], 1);
+    assert_eq!(file(&report, "s.py")["mixed"], 0);
+    unrelated.drop_root();
+}
+
+#[test]
+fn no_event_parent_lineage_fallback_mixes_a_probable_parent_line() {
+    let fixture = Fixture::new("parent-lineage-probable");
+    let parent = ai_s_python_parent(&fixture);
+    mark_parent_s_python_ranges_probable(&fixture, &parent);
+    let child = silent_s_python_child(
+        &fixture,
+        &parent,
+        "def add(a,b):\n    return a + b\ndef sub(a,b):\n    return a - b-1\ndef neg(a):\n    return -a\n",
+        "replace probable parent line",
+    );
+    let report = fixture.derived_value(&child);
+    assert_eq!(file(&report, "s.py")["mixed"], 1);
+    assert_eq!(file(&report, "s.py")["unknown"], 0);
+    let sidecar = fixture.sidecar_value(&child);
+    let mixed = attribution_for(&sidecar, "s.py", "mixed");
+    assert_eq!(mixed["score"], 0.71);
+    assert_eq!(mixed["source"]["toolId"], "codex");
+    fixture.drop_root();
+}
+
+#[test]
+fn no_event_parent_lineage_without_parent_sidecar_stays_unknown() {
+    let fixture = Fixture::new("parent-lineage-no-sidecar");
+    let parent = ai_s_python_parent(&fixture);
+    fs::remove_file(fixture.lines_path(&parent)).unwrap();
+    let child = silent_s_python_child(
+        &fixture,
+        &parent,
+        "def add(a,b):\n    return a + b\ndef sub(a,b):\n    return a - b-1\ndef neg(a):\n    return -a\n",
+        "parent sidecar missing",
+    );
+    let report = fixture.derived_value(&child);
+    assert_eq!(file(&report, "s.py")["unknown"], 1);
+    assert_eq!(file(&report, "s.py")["mixed"], 0);
+    fixture.drop_root();
+}
+
+#[test]
+fn time_cut_new_file_similarity_replacement_is_mixed_but_new_line_is_unknown() {
+    let fixture = Fixture::new("time-cut-new-file-mixed-replacement");
+    let final_contents = PALINDROME_AI_SNAPSHOT.replace(
+        "    print(\"Not a palindrome\")\n",
+        "    print(\"Not a palindrome and also this is mixed\")\n    print(\"this line should be unknown\")\n",
+    );
+    let commit = time_cut_new_file(&fixture, &final_contents, "user edits new AI file");
+    let report = fixture.derived_value(&commit);
+    let final_file = file(&report, "final.py");
+    assert_eq!(final_file["evidence"], "time_cut");
+    assert_eq!(final_file["ai_strong"], 10);
+    assert_eq!(final_file["mixed"], 1);
+    assert_eq!(final_file["unknown"], 1);
+    assert_eq!(report["coverage"], "medium");
+
+    let sidecar = fixture.sidecar_value(&commit);
+    let mixed = attribution_at_line(&sidecar, "final.py", 15);
+    assert_eq!(mixed["category"], "mixed");
+    assert_eq!(mixed["source"]["toolId"], "codex");
+    assert_eq!(mixed["score"], 0.84);
+    assert!(mixed["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_UNOBSERVED_EDIT_IN_FILE")));
+    let unknown = attribution_at_line(&sidecar, "final.py", 16);
+    assert_eq!(unknown["category"], "unknown");
+    assert_eq!(unknown["primaryBasis"], Value::Null);
+    assert_eq!(unknown["score"], Value::Null);
+    assert!(unknown["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_UNOBSERVED_EDIT")));
+    for line in [1, 2, 3, 4, 6, 7, 10, 12, 13, 14] {
+        assert_eq!(
+            attribution_at_line(&sidecar, "final.py", line)["category"],
+            "ai_strong"
+        );
+    }
+    fixture.drop_root();
+}
+
+#[test]
+fn time_cut_new_file_similarity_can_mix_two_replaced_ai_lines() {
+    let fixture = Fixture::new("time-cut-new-file-two-mixed-replacements");
+    let final_contents = PALINDROME_AI_SNAPSHOT
+        .replace(
+            "    return digits == digits[::-1]\n",
+            "    return digits == digits[::-1] and True\n",
+        )
+        .replace(
+            "    print(\"Not a palindrome\")\n",
+            "    print(\"Not a palindrome and also this is mixed\")\n",
+        );
+    let commit = time_cut_new_file(&fixture, &final_contents, "user edits two AI lines");
+    let report = fixture.derived_value(&commit);
+    let final_file = file(&report, "final.py");
+    assert_eq!(final_file["mixed"], 2);
+    assert_eq!(final_file["unknown"], 0);
+    assert_eq!(final_file["ai_strong"], 9);
+    let sidecar = fixture.sidecar_value(&commit);
+    assert_eq!(
+        attribution_at_line(&sidecar, "final.py", 7)["category"],
+        "mixed"
+    );
+    assert_eq!(
+        attribution_at_line(&sidecar, "final.py", 15)["category"],
+        "mixed"
+    );
+    assert_eq!(
+        attribution_at_line(&sidecar, "final.py", 15)["source"]["toolId"],
+        "codex"
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn time_cut_new_file_unrelated_replacement_stays_unknown() {
+    let fixture = Fixture::new("time-cut-new-file-unrelated-replacement");
+    let final_contents = PALINDROME_AI_SNAPSHOT.replace(
+        "    print(\"Not a palindrome\")\n",
+        "    print(\"completely unrelated output\")\n",
+    );
+    let commit = time_cut_new_file(&fixture, &final_contents, "user replaces AI line");
+    let report = fixture.derived_value(&commit);
+    let final_file = file(&report, "final.py");
+    assert_eq!(final_file["unknown"], 1);
+    assert_eq!(final_file["mixed"], 0);
+    assert_eq!(final_file["ai_strong"], 10);
+    let sidecar = fixture.sidecar_value(&commit);
+    let replacement = attribution_at_line(&sidecar, "final.py", 15);
+    assert_eq!(replacement["category"], "unknown");
+    assert_eq!(replacement["primaryBasis"], Value::Null);
+    assert_eq!(replacement["score"], Value::Null);
+    fixture.drop_root();
+}
+
+#[test]
+fn time_cut_new_file_pure_addition_stays_unknown_and_snapshot_lines_stay_strong() {
+    let fixture = Fixture::new("time-cut-new-file-pure-addition");
+    let final_contents = format!("{PALINDROME_AI_SNAPSHOT}    print(\"new user line\")\n");
+    let commit = time_cut_new_file(&fixture, &final_contents, "user adds a line");
+    let report = fixture.derived_value(&commit);
+    let final_file = file(&report, "final.py");
+    assert_eq!(final_file["ai_strong"], 11);
+    assert_eq!(final_file["mixed"], 0);
+    assert_eq!(final_file["unknown"], 1);
+    let sidecar = fixture.sidecar_value(&commit);
+    assert_eq!(
+        attribution_at_line(&sidecar, "final.py", 16)["category"],
+        "unknown"
+    );
+    assert_eq!(
+        attribution_at_line(&sidecar, "final.py", 15)["category"],
+        "ai_strong"
+    );
+    fixture.drop_root();
 }
 
 #[test]
@@ -714,18 +1057,14 @@ fn score_metadata_covers_evidence_limitations_and_no_score_categories() {
     fs::write(time_cut.repo.join("tracked.txt"), b"one\nai line\nlate\n").unwrap();
     let time_cut_commit = time_cut.commit("time cut");
     assert!(derive(&time_cut, &time_cut_commit).status.success());
-    let time_cut_range = attribution_for(
-        &sidecar_value(&time_cut, &time_cut_commit),
-        "tracked.txt",
-        "ai_probable",
-    )
-    .clone();
-    assert_eq!(time_cut_range["score"], 0.79);
-    assert_eq!(time_cut_range["confidenceBand"], "medium");
+    let time_cut_sidecar = sidecar_value(&time_cut, &time_cut_commit);
+    let time_cut_range = attribution_for(&time_cut_sidecar, "tracked.txt", "ai_strong");
+    assert_eq!(time_cut_range["score"], 0.92);
+    assert_eq!(time_cut_range["confidenceBand"], "high");
     assert!(time_cut_range["limitingBasis"]
         .as_array()
         .unwrap()
-        .contains(&json!("X_TIME_CUT")));
+        .contains(&json!("X_UNOBSERVED_EDIT_IN_FILE")));
     time_cut.drop_root();
 
     for (name, field, expected_basis, expected_category, expected_score) in [
@@ -878,6 +1217,41 @@ fn score_metadata_covers_evidence_limitations_and_no_score_categories() {
 }
 
 #[test]
+fn time_cut_without_survival_eligibility_keeps_probable_fallback() {
+    let fixture = Fixture::new("time-cut-survival-fallback");
+    fixture.hook("PreToolUse", "ai-tool");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"one\ntwo\nlet stable_value = 12;\n",
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "ai-tool");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"one\ntwo\nlet stable_value = 12;\nlet human_value = 4;\n",
+    )
+    .unwrap();
+    fixture.hook("PreToolUse", "human-tool");
+    fixture.hook("PostToolUse", "human-tool");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"one\ntwo\nlet stable_value = 12;\nlet human_value = 4;\nlate_value();\n",
+    )
+    .unwrap();
+    let commit = fixture.commit("late edit after observed external step");
+    assert!(derive(&fixture, &commit).status.success());
+    let sidecar = sidecar_value(&fixture, &commit);
+    let probable = attribution_for(&sidecar, "tracked.txt", "ai_probable");
+    assert_eq!(probable["score"], 0.79);
+    assert_eq!(probable["confidenceBand"], "medium");
+    assert!(probable["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_TIME_CUT")));
+    fixture.drop_root();
+}
+
+#[test]
 fn edits_after_last_hook_use_time_cut_and_degrade_ai() {
     let fixture = Fixture::new("time-cut");
     fixture.hook("PreToolUse", "ai-tool");
@@ -894,9 +1268,113 @@ fn edits_after_last_hook_use_time_cut_and_degrade_ai() {
     let value = fixture.derived_value(&commit);
     let tracked = file(&value, "tracked.txt");
     assert_eq!(tracked["evidence"], "time_cut");
-    assert!(tracked["ai_probable"].as_u64().unwrap() >= 1);
-    assert_eq!(tracked["ai_strong"], 0);
+    // Before survival alignment, the file-wide time-cut cap made this AI line probable.
+    // Now its exact surviving snapshot line stays strong and only the appended line is unknown.
+    assert_eq!(tracked["ai_strong"], 1);
+    assert_eq!(tracked["ai_probable"], 0);
+    assert_eq!(tracked["mixed"], 0);
+    assert_eq!(tracked["unknown"], 1);
+    let sidecar = sidecar_value(&fixture, &commit);
+    let survived = attribution_for(&sidecar, "tracked.txt", "ai_strong");
+    assert!(survived["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_UNOBSERVED_EDIT_IN_FILE")));
+    let late = attribution_for(&sidecar, "tracked.txt", "unknown");
+    assert!(late["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_UNOBSERVED_EDIT")));
     fixture.drop_root();
+}
+
+#[test]
+fn time_cut_material_edits_are_mixed_and_unrelated_replacements_unknown() {
+    let fixture = Fixture::new("time-cut-material-mixed");
+    fixture.hook("PreToolUse", "ai-tool");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"one\ntwo\nlet product = a * b;\nreturn a * b;\nlet stable_value = 12;\nfinish_task();\n",
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "ai-tool");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"one\ntwo\nlet product = a * b;\nreturn a * c;\nlet stable_value = 12;\nfinish_task();\nnew_task();\n",
+    )
+    .unwrap();
+    let commit = fixture.commit("human edits after AI capture");
+    assert!(derive(&fixture, &commit).status.success());
+    let report = fixture.derived_value(&commit);
+    let tracked = file(&report, "tracked.txt");
+    assert_eq!(tracked["ai_strong"], 3);
+    assert_eq!(tracked["ai_probable"], 0);
+    assert_eq!(tracked["mixed"], 1);
+    assert_eq!(tracked["unknown"], 1);
+    assert_eq!(tracked["e"], 5);
+    let sidecar = sidecar_value(&fixture, &commit);
+    let mixed = attribution_for(&sidecar, "tracked.txt", "mixed");
+    assert_eq!(mixed["primaryBasis"], "CONFLICTING_EVIDENCE");
+    assert_eq!(mixed["supportingBasis"], json!(["EXACT_FRAGMENT_MATCH"]));
+    assert_eq!(mixed["score"], 0.84);
+    assert!(mixed["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_UNOBSERVED_EDIT")));
+    fixture.drop_root();
+
+    let unrelated = Fixture::new("time-cut-unrelated-replacement");
+    unrelated.hook("PreToolUse", "ai-tool");
+    fs::write(
+        unrelated.repo.join("tracked.txt"),
+        b"one\ntwo\ncalculate_total = left_value + right_value;\n",
+    )
+    .unwrap();
+    unrelated.hook("PostToolUse", "ai-tool");
+    fs::write(
+        unrelated.repo.join("tracked.txt"),
+        b"one\ntwo\nzebra orchard mountain window\n",
+    )
+    .unwrap();
+    let unrelated_commit = unrelated.commit("unrelated replacement");
+    assert!(derive(&unrelated, &unrelated_commit).status.success());
+    let report = unrelated.derived_value(&unrelated_commit);
+    let tracked = file(&report, "tracked.txt");
+    assert_eq!(tracked["ai_strong"], 0);
+    assert_eq!(tracked["mixed"], 0);
+    assert_eq!(tracked["unknown"], 1);
+    unrelated.drop_root();
+
+    let deleted = Fixture::new("time-cut-deleted-ai");
+    deleted.hook("PreToolUse", "ai-tool");
+    fs::write(
+        deleted.repo.join("tracked.txt"),
+        b"one\ntwo\nfirst_ai_action();\nsecond_ai_action();\n",
+    )
+    .unwrap();
+    deleted.hook("PostToolUse", "ai-tool");
+    fs::write(
+        deleted.repo.join("tracked.txt"),
+        b"one\ntwo\nhuman_note();\n",
+    )
+    .unwrap();
+    let deleted_commit = deleted.commit("delete AI lines");
+    assert!(derive(&deleted, &deleted_commit).status.success());
+    let report = deleted.derived_value(&deleted_commit);
+    let tracked = file(&report, "tracked.txt");
+    assert_eq!(tracked["ai_strong"], 0);
+    assert_eq!(tracked["ai_probable"], 0);
+    assert_eq!(tracked["mixed"], 0);
+    assert_eq!(tracked["unknown"], 1);
+    assert_eq!(tracked["e"], 1);
+    assert_eq!(
+        tracked["e"],
+        tracked["ai_strong"].as_u64().unwrap()
+            + tracked["ai_probable"].as_u64().unwrap()
+            + tracked["mixed"].as_u64().unwrap()
+            + tracked["unknown"].as_u64().unwrap()
+    );
+    deleted.drop_root();
 }
 
 #[test]
@@ -1045,6 +1523,59 @@ fn missing_events_and_missing_snapshot_blobs_are_unknown() {
     assert_eq!(tracked["unknown"], 1);
     assert_eq!(tracked["evidence"], "missing_blob");
     missing.drop_root();
+}
+
+#[test]
+fn missing_ai_snapshot_with_late_committed_edits_uses_time_cut_fallback() {
+    let fixture = Fixture::new("missing-time-cut-snapshot");
+    fixture.hook("PreToolUse", "ai-tool");
+    fs::write(fixture.repo.join("tracked.txt"), b"one\nai line\n").unwrap();
+    fixture.hook("PostToolUse", "ai-tool");
+    fs::write(fixture.repo.join("tracked.txt"), b"one\nai line\nlate\n").unwrap();
+    let event_path = fs::read_dir(
+        fixture
+            .home
+            .join("repos")
+            .join(fixture.repo_id())
+            .join("events"),
+    )
+    .unwrap()
+    .next()
+    .unwrap()
+    .unwrap()
+    .path();
+    let ai_event = fs::read(&event_path)
+        .unwrap()
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .find(|event| event["event"] == "ai_change" && event["path"] == "tracked.txt")
+        .unwrap();
+    let snapshot = ai_event["after_sha"].as_str().unwrap();
+    fs::remove_file(
+        fixture
+            .home
+            .join("repos")
+            .join(fixture.repo_id())
+            .join("blobs")
+            .join(snapshot),
+    )
+    .unwrap();
+
+    let commit = fixture.commit("late edit with missing AI snapshot");
+    assert!(derive(&fixture, &commit).status.success());
+    let report = fixture.derived_value(&commit);
+    let tracked = file(&report, "tracked.txt");
+    assert_eq!(tracked["evidence"], "time_cut");
+    assert_eq!(tracked["ai_probable"], 2);
+    assert_eq!(tracked["ai_strong"], 0);
+    let sidecar = sidecar_value(&fixture, &commit);
+    let probable = attribution_for(&sidecar, "tracked.txt", "ai_probable");
+    assert_eq!(probable["score"], 0.79);
+    assert!(probable["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_TIME_CUT")));
+    fixture.drop_root();
 }
 
 #[test]
