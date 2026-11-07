@@ -1684,7 +1684,7 @@ fn attribution_ranges(
             step.map(|step| step.limiting_basis.clone())
                 .unwrap_or_default()
         };
-        if label != derive::Label::Unknown && attributed.ambiguous {
+        if attributed.ambiguous {
             push_basis(&mut limiting_basis, "CONFLICTING_EVIDENCE");
         }
         if label == derive::Label::Mixed

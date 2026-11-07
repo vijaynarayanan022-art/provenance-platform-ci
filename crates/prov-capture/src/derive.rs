@@ -74,8 +74,28 @@ enum Owner {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OwnedLine {
     owner: Owner,
+    candidates: u8,
     source_step: Option<usize>,
     ambiguous: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DuplicateOwners {
+    owner: Owner,
+    source_step: Option<usize>,
+    candidates: u8,
+    ambiguous: bool,
+}
+
+const fn owner_candidate(owner: Owner) -> u8 {
+    1 << owner as u8
+}
+
+const AI_ANCESTRY_CANDIDATES: u8 =
+    owner_candidate(Owner::Ai) | owner_candidate(Owner::AiWeak) | owner_candidate(Owner::AiEdited);
+
+fn all_candidates_have_ai_ancestry(candidates: u8) -> bool {
+    candidates != 0 && candidates & !AI_ANCESTRY_CANDIDATES == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +140,7 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
     let mut owners = vec![
         OwnedLine {
             owner: Owner::Base,
+            candidates: owner_candidate(Owner::Base),
             source_step: None,
             ambiguous: false,
         };
@@ -141,24 +162,17 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
         ev.steps.len(),
     );
     let added = added_lines(&parent, &committed_lines);
-    // A strong label needs an unambiguous copy: if an identical committed line has a different
-    // owner, the diff may have paired the wrong copy, so the line is downgraded.
-    let mut seen: HashMap<&[u8], (Owner, bool)> = HashMap::new();
-    for (index, line) in committed_lines.iter().enumerate() {
-        let owner = committed_owners[index].owner;
-        let entry = seen.entry(line.as_slice()).or_insert((owner, false));
-        if entry.0 != owner {
-            entry.1 = true;
-        }
-    }
+    let duplicate_owners = duplicate_owners(&committed_lines, &committed_owners);
 
     committed_lines
         .iter()
         .enumerate()
         .map(|(index, line)| {
             let owned = committed_owners[index];
-            let ambiguous = owned.ambiguous || seen[line.as_slice()].1;
-            let label = if !added[index] {
+            let duplicates = duplicate_owners[line.as_slice()];
+            let candidates = owned.candidates | duplicates.candidates;
+            let ambiguous = owned.ambiguous || duplicates.ambiguous;
+            let label = if !added[index] || !all_candidates_have_ai_ancestry(candidates) {
                 Label::Unknown
             } else {
                 match owned.owner {
@@ -199,6 +213,7 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
     let mut owners = vec![
         OwnedLine {
             owner: Owner::Base,
+            candidates: owner_candidate(Owner::Base),
             source_step: None,
             ambiguous: false,
         };
@@ -222,6 +237,7 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
     let mut committed_owners = vec![
         OwnedLine {
             owner: Owner::Gap,
+            candidates: owner_candidate(Owner::Gap),
             source_step: None,
             ambiguous: false,
         };
@@ -279,6 +295,7 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
                 let source = owners[old_index];
                 committed_owners[new_index] = OwnedLine {
                     owner: Owner::AiEdited,
+                    candidates: source.candidates | owner_candidate(Owner::AiEdited),
                     source_step: source.source_step,
                     ambiguous: source.ambiguous,
                 };
@@ -300,6 +317,7 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
             if *committed_line == line {
                 committed_owners[index] = OwnedLine {
                     owner: Owner::Gap,
+                    candidates: owner_candidate(Owner::Gap),
                     source_step: None,
                     ambiguous: false,
                 };
@@ -308,22 +326,17 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
         }
     }
 
-    let mut seen: HashMap<&[u8], (Owner, bool)> = HashMap::new();
-    for (index, line) in committed_lines.iter().enumerate() {
-        let owner = committed_owners[index].owner;
-        let entry = seen.entry(line.as_slice()).or_insert((owner, false));
-        if entry.0 != owner {
-            entry.1 = true;
-        }
-    }
+    let duplicate_owners = duplicate_owners(&committed_lines, &committed_owners);
 
     committed_lines
         .iter()
         .enumerate()
         .map(|(index, line)| {
             let owned = committed_owners[index];
-            let ambiguous = owned.ambiguous || seen[line.as_slice()].1;
-            let label = if !added[index] {
+            let duplicates = duplicate_owners[line.as_slice()];
+            let candidates = owned.candidates | duplicates.candidates;
+            let ambiguous = owned.ambiguous || duplicates.ambiguous;
+            let label = if !added[index] || !all_candidates_have_ai_ancestry(candidates) {
                 Label::Unknown
             } else {
                 match owned.owner {
@@ -540,6 +553,7 @@ fn replay(
     let mut next_owners = vec![
         OwnedLine {
             owner: Owner::Gap,
+            candidates: owner_candidate(Owner::Gap),
             source_step: None,
             ambiguous: false,
         };
@@ -564,9 +578,13 @@ fn replay(
         }
         let mut deleted_ai_sources = HashSet::new();
         let mut deleted_ai = false;
+        let mut deleted_candidates = 0;
+        let mut deleted_count = 0;
         for op in &ops[start..cursor] {
             for old_index in op.old_range() {
+                deleted_count += 1;
                 let old_owner = owners[old_index];
+                deleted_candidates |= old_owner.candidates;
                 if matches!(old_owner.owner, Owner::Ai | Owner::AiWeak | Owner::AiEdited) {
                     deleted_ai = true;
                     if let Some(step) = old_owner.source_step {
@@ -575,30 +593,45 @@ fn replay(
                 }
             }
         }
+        let inserted_count = ops[start..cursor]
+            .iter()
+            .map(|op| op.new_range().len())
+            .sum::<usize>();
         let inserted_owner = match kind {
             StepKind::Ai { degraded: false } => OwnedLine {
                 owner: Owner::Ai,
+                candidates: owner_candidate(Owner::Ai),
                 source_step: Some(source_step),
                 ambiguous: false,
             },
             StepKind::Ai { degraded: true } => OwnedLine {
                 owner: Owner::AiWeak,
+                candidates: owner_candidate(Owner::AiWeak),
                 source_step: Some(source_step),
                 ambiguous: false,
             },
             StepKind::External if deleted_ai => OwnedLine {
                 owner: Owner::AiEdited,
+                candidates: owner_candidate(Owner::AiEdited)
+                    | deleted_candidates
+                    | if deleted_count != inserted_count {
+                        owner_candidate(Owner::External)
+                    } else {
+                        0
+                    },
                 source_step: (deleted_ai_sources.len() == 1)
                     .then(|| *deleted_ai_sources.iter().next().unwrap()),
                 ambiguous: deleted_ai_sources.len() > 1,
             },
             StepKind::External => OwnedLine {
                 owner: Owner::External,
+                candidates: owner_candidate(Owner::External),
                 source_step: Some(source_step),
                 ambiguous: false,
             },
             StepKind::Unknown => OwnedLine {
                 owner: Owner::Gap,
+                candidates: owner_candidate(Owner::Gap),
                 source_step: Some(source_step),
                 ambiguous: false,
             },
@@ -611,23 +644,69 @@ fn replay(
     }
     // A step that inserts or deletes text identical to a carried AI line makes the match
     // ambiguous (the diff may have paired the wrong copy), so that carried line is downgraded.
-    let mut touched: HashSet<&[u8]> = HashSet::new();
+    let mut touched = HashSet::<&[u8]>::new();
+    let mut inserted = Vec::<&[u8]>::new();
     for op in ops.iter().filter(|op| op.tag() != DiffTag::Equal) {
         touched.extend(old[op.old_range()].iter().map(Vec::as_slice));
-        touched.extend(new[op.new_range()].iter().map(Vec::as_slice));
+        for line in &new[op.new_range()] {
+            touched.insert(line.as_slice());
+            inserted.push(line.as_slice());
+        }
     }
     if !touched.is_empty() {
         for op in ops.iter().filter(|op| op.tag() == DiffTag::Equal) {
-            for index in op.new_range() {
-                if next_owners[index].owner == Owner::Ai && touched.contains(new[index].as_slice())
-                {
-                    next_owners[index].owner = Owner::AiWeak;
-                    next_owners[index].ambiguous = true;
+            for (old_index, new_index) in op.old_range().zip(op.new_range()) {
+                let line = old[old_index].as_slice();
+                if !touched.remove(line) {
+                    continue;
                 }
+                let mut candidates = 0;
+                for (old_line, owner) in old.iter().zip(owners) {
+                    if old_line.as_slice() == line {
+                        candidates |= owner.candidates;
+                    }
+                }
+                if inserted.contains(&line) {
+                    candidates |= match kind {
+                        StepKind::Ai { .. } => owner_candidate(Owner::Ai),
+                        StepKind::External => owner_candidate(Owner::External),
+                        StepKind::Unknown => owner_candidate(Owner::Gap),
+                    };
+                }
+                for (index, new_line) in new.iter().enumerate() {
+                    if new_line.as_slice() == line {
+                        next_owners[index].candidates |= candidates;
+                        next_owners[index].ambiguous = true;
+                    }
+                }
+                next_owners[new_index].candidates |= candidates;
             }
         }
     }
     next_owners
+}
+
+fn duplicate_owners<'a>(
+    lines: &'a [Vec<u8>],
+    owners: &[OwnedLine],
+) -> HashMap<&'a [u8], DuplicateOwners> {
+    let mut groups = HashMap::<&[u8], DuplicateOwners>::new();
+    for (line, owner) in lines.iter().zip(owners.iter()) {
+        let group = groups.entry(line.as_slice()).or_insert(DuplicateOwners {
+            owner: owner.owner,
+            source_step: owner.source_step,
+            candidates: 0,
+            ambiguous: false,
+        });
+        if group.owner != owner.owner
+            || group.source_step != owner.source_step
+            || group.candidates != 0 && group.candidates != owner.candidates
+        {
+            group.ambiguous = true;
+        }
+        group.candidates |= owner.candidates;
+    }
+    groups
 }
 
 fn added_lines(parent: &[Vec<u8>], committed: &[Vec<u8>]) -> Vec<bool> {
@@ -752,8 +831,19 @@ mod tests {
         );
         assert_eq!(
             only_label(&touched_duplicate, b"same\nsame\n"),
-            Label::AiProbable
+            Label::Unknown
         );
+
+        let ai_only_duplicate = evidence(
+            b"",
+            vec![
+                step(StepKind::Ai { degraded: false }, b"same\n"),
+                step(StepKind::Ai { degraded: false }, b"same\nsame\n"),
+            ],
+        );
+        let labels = derive_lines(&ai_only_duplicate, b"same\nsame\n");
+        assert_eq!(labels[0].label, Label::AiProbable);
+        assert_eq!(labels[1].label, Label::AiProbable);
 
         let conflicting_committed_owners = evidence(
             b"base\n",
@@ -763,8 +853,21 @@ mod tests {
             ],
         );
         let labels = derive_lines(&conflicting_committed_owners, b"base\nsame\nsame\n");
-        assert_eq!(labels[1].label, Label::AiProbable);
+        assert_eq!(labels[1].label, Label::Unknown);
         assert_eq!(labels[2].label, Label::Unknown);
+
+        let base_and_ai_candidates = evidence(
+            b"same\nsame\n",
+            vec![step(
+                StepKind::Ai { degraded: false },
+                b"same\nsame\nsame\n",
+            )],
+        );
+        let labels = derive_lines(&base_and_ai_candidates, b"same\nsame\nsame\n");
+        assert!(labels
+            .iter()
+            .filter(|line| line.added)
+            .all(|line| { line.label == Label::Unknown }));
     }
 
     #[test]
@@ -1038,7 +1141,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known gap: duplicate identical lines make replay owner mapping ambiguous; planned r18"]
     fn fixed_seed_fuzz_no_ai_category_on_lines_without_ai_ancestry() {
         for tiny in [false, true] {
             for case in 0..3000 {
@@ -1246,7 +1348,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known gap: duplicate identical lines make replay owner mapping ambiguous; planned r18"]
     fn stress_no_ai_category_on_lines_without_ai_ancestry() {
         for vocab in [0usize, 2, 3, 6, 12] {
             let (_, linked_leaks, _) = stress_run(vocab, 12_000);

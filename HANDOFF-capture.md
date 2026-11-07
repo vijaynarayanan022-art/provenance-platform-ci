@@ -173,9 +173,9 @@ When a file has a captured AI snapshot but no later observed external step, time
 
 The `prov.summary` and `prov.dashboard` `versions` objects add `line_survival: unobserved-mixed-v1` and `min_mixed_overlap: 0.5`. The per-range profile remains `deterministic-v1`; the new survival behavior is separately versioned to keep existing range profile consumers compatible. `X_UNOBSERVED_EDIT` and `X_UNOBSERVED_EDIT_IN_FILE` are spec gaps because §9.1 does not yet define standard limitation codes for unobserved post-snapshot edits.
 
-## Known limitation: duplicate-line ownership ambiguity
+## Round 18: duplicate-line ownership ambiguity fixed
 
-When identical lines have different owners across snapshots, replay's occurrence mapping can assign a human occurrence `ai_probable`; it does not assign that occurrence `ai_strong` or `ai_direct`. Replay currently stores one owner per matched occurrence, so an ambiguous diff between duplicate lines can attach the AI occurrence's owner to the human occurrence. The planned r18 fix is to retain candidate-owner sets through replay and allow `ai_probable` only when all candidates have AI ancestry.
+Replay now carries candidate-owner sets for repeated identical lines touched by a diff. Occurrence order from the diff retains unambiguous matches; when repeated-line alignment has multiple plausible owners, replay unions their candidate lineages. A line receives an AI category only when every candidate has AI ancestry, and ambiguous AI-owned lines are capped at probable. Any candidate from base, external, or unknown ownership makes the line unknown. Fixed-seed fuzz and stress tests now run without ignores and enforce that lines without AI ancestry receive no AI category.
 
 ## Parent-sidecar fallback for unobserved edits
 

@@ -1250,8 +1250,8 @@ fn score_metadata_covers_evidence_limitations_and_no_score_categories() {
     let duplicate_commit = duplicate.commit("duplicate line copy");
     assert!(derive(&duplicate, &duplicate_commit).status.success());
     let duplicate_sidecar = sidecar_value(&duplicate, &duplicate_commit);
-    let ambiguous = attribution_for(&duplicate_sidecar, "tracked.txt", "ai_probable");
-    assert_eq!(ambiguous["score"], 0.79);
+    let ambiguous = attribution_for(&duplicate_sidecar, "tracked.txt", "unknown");
+    assert!(ambiguous["score"].is_null());
     assert!(ambiguous["limitingBasis"]
         .as_array()
         .unwrap()
