@@ -654,9 +654,21 @@ fn over_five_hundred_dirty_paths_emit_one_bulk_event_without_snapshots() {
     let bulk = select(&events, "bulk_change");
     assert_eq!(bulk.len(), 1);
     assert_eq!(bulk[0]["dirty_count"], 501);
+    assert_eq!(bulk[0]["remaining"], 1);
     assert_eq!(bulk[0]["reason"], "bulk_change");
+    assert_eq!(bulk[0]["degraded"], true);
+    assert_eq!(bulk[0]["bulk_partial"], true);
     assert_eq!(select(&events, "ai_change").len(), 0);
-    assert_eq!(select(&events, "window_open")[0]["reason"], "bulk_change");
+    let opened = select(&events, "window_open");
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0]["reason"], "bulk_change");
+    assert_eq!(opened[0]["degraded"], true);
+    assert_eq!(opened[0]["bulk_partial"], true);
+    let closed = select(&events, "window_close");
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0]["reason"], "bulk_change");
+    assert_eq!(closed[0]["degraded"], true);
+    assert_eq!(closed[0]["bulk_partial"], true);
     let store = fs::read_dir(f.home.join("repos"))
         .unwrap()
         .next()
@@ -1308,7 +1320,14 @@ fn bulk_cap_processes_candidates_incrementally_and_resumes_normal_scans() {
     let events1 = f.events();
     let bulk1 = select(&events1, "bulk_change");
     assert_eq!(bulk1.len(), 1);
+    assert_eq!(bulk1[0]["dirty_count"], 1050);
     assert_eq!(bulk1[0]["remaining"], 550);
+    assert_eq!(bulk1[0]["degraded"], true);
+    assert_eq!(bulk1[0]["bulk_partial"], true);
+    let opened1 = select(&events1, "window_open");
+    assert_eq!(opened1.len(), 1);
+    assert_eq!(opened1[0]["degraded"], true);
+    assert_eq!(opened1[0]["bulk_partial"], true);
 
     f.hook("PostToolUse", "s", "tool-1", None);
     let events2 = f.events();
@@ -1317,6 +1336,7 @@ fn bulk_cap_processes_candidates_incrementally_and_resumes_normal_scans() {
     assert_eq!(close1.len(), 1);
     assert_eq!(close1[0]["reason"], "bulk_change");
     assert_eq!(close1[0]["degraded"], true);
+    assert_eq!(close1[0]["bulk_partial"], true);
 
     // Only 50 candidates remain: scans are normal again, no new bulk event.
     f.hook("PreToolUse", "s", "tool-2", None);

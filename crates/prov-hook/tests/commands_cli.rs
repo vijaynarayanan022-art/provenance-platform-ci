@@ -447,20 +447,47 @@ fn summary_range_matches_pr_report_and_expands_full_category_names() {
         summary["totals"]["tools"],
         json!(["codex", "vscode-copilot"])
     );
-    let file_lines = summary["file_lines"].as_array().unwrap();
-    assert!(file_lines
+    let file_ranges = summary["file_ranges"].as_array().unwrap();
+    assert!(file_ranges
         .iter()
         .any(|line| line["category"] == "ai_strong"));
-    assert!(file_lines.iter().any(|line| line["category"] == "unknown"));
-    assert!(file_lines.iter().all(|line| {
+    assert!(file_ranges.iter().any(|line| line["category"] == "unknown"));
+    assert!(file_ranges.iter().all(|line| {
         matches!(
             line["category"].as_str(),
             Some("ai_direct" | "ai_strong" | "ai_probable" | "mixed" | "unknown" | "excluded")
         )
     }));
-    assert!(file_lines
+    assert!(file_ranges
         .iter()
         .all(|line| line["category"].as_str().unwrap().len() > 1));
+    let codex_range = file_ranges
+        .iter()
+        .find(|range| range["source"]["adapterId"] == "codex")
+        .unwrap();
+    let vscode_range = file_ranges
+        .iter()
+        .find(|range| range["source"]["adapterId"] == "vscode-copilot")
+        .unwrap();
+    assert_eq!(codex_range["category"], "ai_strong");
+    assert_eq!(codex_range["score"], 0.92);
+    assert_eq!(codex_range["confidenceBand"], "high");
+    assert_eq!(codex_range["primaryBasis"], "EXACT_FRAGMENT_MATCH");
+    assert_eq!(codex_range["source"]["toolId"], "codex");
+    assert_eq!(codex_range["source"]["sessionRef"], "codex-one");
+    assert_eq!(codex_range["lines"], 1);
+    assert_eq!(vscode_range["source"]["toolId"], "vscode-copilot");
+    assert_eq!(vscode_range["source"]["sessionRef"], "vscode-one");
+    assert_eq!(vscode_range["operation"], "create_file");
+    assert_eq!(codex_range["sourceTool"], "codex");
+    assert!(codex_range["supportingBasis"].is_array());
+    assert!(codex_range["limitingBasis"].is_array());
+    assert_eq!(codex_range["algorithmProfile"], "deterministic-v1");
+    assert_eq!(codex_range["scoreProfile"], "score-v1");
+    assert_eq!(
+        codex_range["endLineExclusive"],
+        codex_range["endLine"].as_u64().unwrap() + 1
+    );
 
     let table = fixture.cli(&[
         "summary",
@@ -480,6 +507,7 @@ fn summary_range_matches_pr_report_and_expands_full_category_names() {
         "commit\tfiles\teligible\tai_direct\tai_strong\tai_probable\tmixed\tunknown\texcluded\tdeterministic_pct\tlinked_pct\tcoverage\ttools"
     );
     assert!(table.contains("\tai_strong\t"));
+    assert!(table.contains("primaryBasis\tsupportingBasis\tlimitingBasis\tsourceTool\toperation"));
     assert!(!table.contains("\ts\t"));
     fixture.drop_root();
 }

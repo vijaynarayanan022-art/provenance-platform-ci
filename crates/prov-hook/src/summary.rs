@@ -46,12 +46,23 @@ struct Totals {
     tools: Option<Vec<String>>,
 }
 
-struct FileLine {
+struct FileRange {
     commit: String,
     file: String,
-    line: usize,
-    hash: String,
-    category: &'static str,
+    start_line: usize,
+    end_line: usize,
+    supporting_basis: Vec<String>,
+    limiting_basis: Vec<String>,
+    algorithm_profile: String,
+    score_profile: String,
+    category: String,
+    score: Option<f64>,
+    confidence_band: String,
+    primary_basis: Option<String>,
+    adapter_id: Option<String>,
+    tool_id: Option<String>,
+    session_ref: Option<String>,
+    operation: Option<String>,
 }
 
 pub fn command(args: impl Iterator<Item = String>) -> Result<String, String> {
@@ -118,8 +129,8 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<String, String> {
     } else {
         (totals_from_rows(&rows), false)
     };
-    let file_lines = match options.file.as_deref() {
-        Some(file) => collect_file_lines(&repo, &commit_ids, file)?,
+    let file_ranges = match options.file.as_deref() {
+        Some(file) => collect_file_ranges(&repo, &commit_ids, file)?,
         None => Vec::new(),
     };
     if options.format == "json" {
@@ -132,11 +143,11 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<String, String> {
             "commits": rows.iter().map(row_json).collect::<Vec<_>>(),
             "totals": totals_json(&totals),
             "truncated": truncated,
-            "file_lines": file_lines.iter().map(file_line_json).collect::<Vec<_>>(),
+            "file_ranges": file_ranges.iter().map(file_range_json).collect::<Vec<_>>(),
         });
         return serde_json::to_string(&output).map_err(|error| error.to_string());
     }
-    Ok(render_table(&rows, &totals, &file_lines))
+    Ok(render_table(&rows, &totals, &file_ranges))
 }
 
 fn parse_options(args: impl Iterator<Item = String>) -> Result<Options, String> {
@@ -525,7 +536,7 @@ fn totals_json(totals: &Totals) -> Value {
     })
 }
 
-fn render_table(rows: &[Row], totals: &Totals, file_lines: &[FileLine]) -> String {
+fn render_table(rows: &[Row], totals: &Totals, file_ranges: &[FileRange]) -> String {
     const HEADERS: [&str; 13] = [
         "commit",
         "files",
@@ -575,12 +586,28 @@ fn render_table(rows: &[Row], totals: &Totals, file_lines: &[FileLine]) -> Strin
         totals.coverage.as_deref().unwrap_or(totals.status),
         tools_cell(totals.tools.as_deref(), totals.status),
     ));
-    if !file_lines.is_empty() {
-        output.push_str("\ncommit\tfile\tline\tcategory\thash\n");
-        for line in file_lines {
+    if !file_ranges.is_empty() {
+        output.push_str(
+            "\ncommit\tfile\tlines\tcategory\tscore\tband\tprimaryBasis\tsupportingBasis\tlimitingBasis\tsourceTool\toperation\talgorithmProfile\tscoreProfile\n",
+        );
+        for range in file_ranges {
             output.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\n",
-                line.commit, line.file, line.line, line.category, line.hash
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                range.commit,
+                range.file,
+                range_line_span(range.start_line, range.end_line),
+                range.category,
+                range
+                    .score
+                    .map_or_else(|| "n/a".into(), |score| format!("{score:.2}")),
+                range.confidence_band,
+                range.primary_basis.as_deref().unwrap_or("none"),
+                range.supporting_basis.join(","),
+                range.limiting_basis.join(","),
+                source_tool(range),
+                range.operation.as_deref().unwrap_or("none"),
+                range.algorithm_profile,
+                range.score_profile,
             ));
         }
     }
@@ -617,53 +644,123 @@ fn tools_cell(tools: Option<&[String]>, status: &str) -> String {
     )
 }
 
-fn collect_file_lines(
+fn collect_file_ranges(
     repo: &Path,
     commits: &[String],
     requested: &str,
-) -> Result<Vec<FileLine>, String> {
+) -> Result<Vec<FileRange>, String> {
     let Some(path) = repo_relative_file(repo, requested) else {
         return Ok(Vec::new());
     };
     let sidecars = prov_capture::commit::lines_for_commits(repo, commits)?;
-    let mut lines = Vec::new();
+    let mut ranges = Vec::new();
     for (commit, bytes) in commits.iter().zip(sidecars) {
         let Some(bytes) = bytes else { continue };
         let Ok(document) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
-        let Some(file_rows) = document["files"].as_array() else {
-            continue;
-        };
-        let Some(file) = file_rows
-            .iter()
-            .find(|file| file["path"].as_str() == Some(&path))
-        else {
-            continue;
-        };
-        if let Some(file_lines) = file["lines"].as_array() {
-            for line in file_lines {
-                let Some(number) = line["line"].as_u64() else {
+        if let Some(file_attributions) = document["attributions"].as_array() {
+            for attribution in file_attributions
+                .iter()
+                .filter(|range| range["path"].as_str() == Some(&path))
+            {
+                let Some(start_line) = attribution["startLine"].as_u64() else {
                     continue;
                 };
-                let Some(hash) = line["hash"].as_str() else {
+                let Some(end_line) = attribution["endLine"].as_u64() else {
                     continue;
                 };
-                let label = line["label"]
-                    .as_str()
-                    .and_then(|label| label.chars().next())
-                    .or_else(|| line["label"].as_u64().map(|value| value as u8 as char));
-                lines.push(FileLine {
+                ranges.push(FileRange {
                     commit: commit.clone(),
                     file: path.clone(),
-                    line: number as usize,
-                    hash: hash.into(),
-                    category: full_category(label.unwrap_or('u')),
+                    start_line: start_line as usize,
+                    end_line: end_line as usize,
+                    supporting_basis: attribution["supportingBasis"]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    limiting_basis: attribution["limitingBasis"]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    algorithm_profile: attribution["algorithmProfile"]
+                        .as_str()
+                        .unwrap_or("deterministic-v1")
+                        .to_owned(),
+                    score_profile: attribution["scoreProfile"]
+                        .as_str()
+                        .unwrap_or("score-v1")
+                        .to_owned(),
+                    category: attribution["category"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    score: attribution["score"].as_f64(),
+                    confidence_band: attribution["confidenceBand"]
+                        .as_str()
+                        .unwrap_or("none")
+                        .to_owned(),
+                    primary_basis: attribution["primaryBasis"].as_str().map(str::to_owned),
+                    adapter_id: attribution["source"]["adapterId"]
+                        .as_str()
+                        .map(str::to_owned),
+                    tool_id: attribution["source"]["toolId"].as_str().map(str::to_owned),
+                    session_ref: attribution["source"]["sessionRef"]
+                        .as_str()
+                        .map(str::to_owned),
+                    operation: attribution["operation"].as_str().map(str::to_owned),
                 });
+            }
+        } else if let Some(file_rows) = document["files"].as_array() {
+            if let Some(file) = file_rows
+                .iter()
+                .find(|file| file["path"].as_str() == Some(&path))
+            {
+                if let Some(file_lines) = file["lines"].as_array() {
+                    for line in file_lines {
+                        let Some(number) = line["line"].as_u64() else {
+                            continue;
+                        };
+                        let label = line["label"]
+                            .as_str()
+                            .and_then(|label| label.chars().next())
+                            .or_else(|| line["label"].as_u64().map(|value| value as u8 as char));
+                        ranges.push(FileRange {
+                            commit: commit.clone(),
+                            file: path.clone(),
+                            start_line: number as usize,
+                            end_line: number as usize,
+                            category: full_category(label.unwrap_or('u')).into(),
+                            score: None,
+                            confidence_band: "none".into(),
+                            primary_basis: None,
+                            supporting_basis: Vec::new(),
+                            limiting_basis: Vec::new(),
+                            algorithm_profile: "deterministic-v1".into(),
+                            score_profile: "score-v1".into(),
+                            adapter_id: None,
+                            tool_id: None,
+                            session_ref: None,
+                            operation: None,
+                        });
+                    }
+                }
             }
         }
     }
-    Ok(lines)
+    Ok(ranges)
 }
 
 fn full_category(label: char) -> &'static str {
@@ -677,14 +774,47 @@ fn full_category(label: char) -> &'static str {
     }
 }
 
-fn file_line_json(line: &FileLine) -> Value {
+fn file_range_json(range: &FileRange) -> Value {
     json!({
-        "commit": line.commit,
-        "file": line.file,
-        "line": line.line,
-        "category": line.category,
-        "hash": line.hash,
+        "commit": range.commit,
+        "file": range.file,
+        "startLine": range.start_line,
+        "endLine": range.end_line,
+        "endLineExclusive": range.end_line + 1,
+        "lines": range.end_line.saturating_sub(range.start_line) + 1,
+        "category": range.category,
+        "score": range.score,
+        "confidenceBand": range.confidence_band,
+        "primaryBasis": range.primary_basis,
+        "supportingBasis": range.supporting_basis,
+        "limitingBasis": range.limiting_basis,
+        "source": {
+            "adapterId": range.adapter_id,
+            "toolId": range.tool_id,
+            "sessionRef": range.session_ref,
+        },
+        "sourceTool": source_tool(range),
+        "operation": range.operation,
+        "algorithmProfile": range.algorithm_profile,
+        "scoreProfile": range.score_profile,
     })
+}
+
+fn range_line_span(start: usize, end: usize) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
+}
+
+fn source_tool(range: &FileRange) -> String {
+    range
+        .tool_id
+        .as_deref()
+        .or(range.adapter_id.as_deref())
+        .unwrap_or("none")
+        .into()
 }
 
 fn repo_relative_file(repo: &Path, requested: &str) -> Option<String> {
