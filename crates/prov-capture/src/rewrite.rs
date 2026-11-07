@@ -875,36 +875,6 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Output, String> {
     command.output().map_err(|error| error.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::LinesSidecar;
-
-    #[test]
-    fn old_format_sidecar_loads_without_attribution_ranges() {
-        let bytes = br#"{"schema":"prov.lines/0.1","repo_id":"repo","commit":"commit","totals":{"e":1,"ai_strong":0,"ai_probable":0,"mixed":0,"unknown":1},"files":[{"path":"file.txt","lines":[{"line":2,"hash":"0123456789abcdef","label":"u"}]}]}"#;
-        let sidecar: LinesSidecar = serde_json::from_slice(bytes).unwrap();
-        assert!(sidecar.attributions.is_empty());
-        let round_trip = serde_json::to_value(sidecar).unwrap();
-        assert!(round_trip.get("attributions").is_none());
-    }
-
-    #[test]
-    fn missing_optional_range_fields_default_safely() {
-        let bytes = br#"{"path":"file.txt","startLine":2,"endLine":2}"#;
-        let range: crate::commit::AttributionRange = serde_json::from_slice(bytes).unwrap();
-        assert_eq!(range.category, "unknown");
-        assert!(range.score.is_none());
-        assert_eq!(range.confidence_band, "none");
-        assert!(range.primary_basis.is_none());
-        assert!(range.supporting_basis.is_empty());
-        assert!(range.limiting_basis.is_empty());
-        assert!(range.source.is_none());
-        assert!(range.operation.is_none());
-        assert_eq!(range.algorithm_profile, "deterministic-v1");
-        assert_eq!(range.score_profile, "score-v1");
-    }
-}
-
 fn load_commit_file(root: &Path, commit: &str, path: &str) -> Result<Vec<u8>, String> {
     let object = format!("{commit}:{path}");
     let output = git_output(root, &["cat-file", "blob", &object])?;
@@ -935,4 +905,34 @@ fn check_budget(started: Instant) -> Result<(), String> {
 
 fn system_time_seconds(time: SystemTime) -> Option<i64> {
     i64::try_from(time.duration_since(UNIX_EPOCH).ok()?.as_secs()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LinesSidecar;
+
+    #[test]
+    fn old_format_sidecar_loads_without_attribution_ranges() {
+        let bytes = br#"{"schema":"prov.lines/0.1","repo_id":"repo","commit":"commit","totals":{"e":1,"ai_strong":0,"ai_probable":0,"mixed":0,"unknown":1},"files":[{"path":"file.txt","lines":[{"line":2,"hash":"0123456789abcdef","label":"u"}]}]}"#;
+        let sidecar: LinesSidecar = serde_json::from_slice(bytes).unwrap();
+        assert!(sidecar.attributions.is_empty());
+        let round_trip = serde_json::to_value(sidecar).unwrap();
+        assert!(round_trip.get("attributions").is_none());
+    }
+
+    #[test]
+    fn missing_optional_range_fields_default_safely() {
+        let bytes = br#"{"path":"file.txt","startLine":2,"endLine":2}"#;
+        let range: crate::commit::AttributionRange = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(range.category, "unknown");
+        assert!(range.score.is_none());
+        assert_eq!(range.confidence_band, "none");
+        assert!(range.primary_basis.is_none());
+        assert!(range.supporting_basis.is_empty());
+        assert!(range.limiting_basis.is_empty());
+        assert!(range.source.is_none());
+        assert!(range.operation.is_none());
+        assert_eq!(range.algorithm_profile, "deterministic-v1");
+        assert_eq!(range.score_profile, "score-v1");
+    }
 }
