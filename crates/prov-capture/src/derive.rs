@@ -28,6 +28,7 @@ pub struct StepAttribution {
     pub penalties_milli: Vec<u16>,
     pub supporting_basis: Vec<String>,
     pub limiting_basis: Vec<String>,
+    pub direct_lines: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +39,7 @@ pub struct Evidence {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Label {
+    AiDirect,
     AiStrong,
     AiProbable,
     Mixed,
@@ -54,6 +56,7 @@ pub struct LineLabel {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
+    pub d: usize,
     pub s: usize,
     pub p: usize,
     pub m: usize,
@@ -67,6 +70,7 @@ enum Owner {
     External,
     Gap,
     Ai,
+    Direct,
     AiWeak,
     AiEdited,
 }
@@ -91,8 +95,10 @@ const fn owner_candidate(owner: Owner) -> u8 {
     1 << owner as u8
 }
 
-const AI_ANCESTRY_CANDIDATES: u8 =
-    owner_candidate(Owner::Ai) | owner_candidate(Owner::AiWeak) | owner_candidate(Owner::AiEdited);
+const AI_ANCESTRY_CANDIDATES: u8 = owner_candidate(Owner::Ai)
+    | owner_candidate(Owner::Direct)
+    | owner_candidate(Owner::AiWeak)
+    | owner_candidate(Owner::AiEdited);
 
 fn all_candidates_have_ai_ancestry(candidates: u8) -> bool {
     candidates != 0 && candidates & !AI_ANCESTRY_CANDIDATES == 0
@@ -149,7 +155,19 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
 
     for (step_index, step) in ev.steps.iter().enumerate() {
         let next = split_lines(&step.after);
-        owners = replay(&previous, &owners, &next, step.kind, step_index);
+        let direct_lines = step
+            .attribution
+            .as_ref()
+            .map(|attribution| attribution.direct_lines.as_slice())
+            .unwrap_or_default();
+        owners = replay(
+            &previous,
+            &owners,
+            &next,
+            step.kind,
+            step_index,
+            direct_lines,
+        );
         previous = next;
     }
 
@@ -160,6 +178,7 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
         &committed_lines,
         StepKind::Unknown,
         ev.steps.len(),
+        &[],
     );
     let added = added_lines(&parent, &committed_lines);
     let duplicate_owners = duplicate_owners(&committed_lines, &committed_owners);
@@ -176,6 +195,8 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
                 Label::Unknown
             } else {
                 match owned.owner {
+                    Owner::Direct if !ambiguous => Label::AiDirect,
+                    Owner::Direct => Label::AiProbable,
                     Owner::Ai if !ambiguous => Label::AiStrong,
                     Owner::Ai | Owner::AiWeak => Label::AiProbable,
                     Owner::AiEdited => Label::Mixed,
@@ -221,7 +242,19 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
     ];
     for (step_index, step) in ev.steps.iter().enumerate().take(last_ai_step + 1) {
         let next = split_lines(&step.after);
-        owners = replay(&previous, &owners, &next, step.kind, step_index);
+        let direct_lines = step
+            .attribution
+            .as_ref()
+            .map(|attribution| attribution.direct_lines.as_slice())
+            .unwrap_or_default();
+        owners = replay(
+            &previous,
+            &owners,
+            &next,
+            step.kind,
+            step_index,
+            direct_lines,
+        );
         previous = next;
     }
 
@@ -340,6 +373,8 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
                 Label::Unknown
             } else {
                 match owned.owner {
+                    Owner::Direct if !ambiguous => Label::AiDirect,
+                    Owner::Direct => Label::AiProbable,
                     Owner::Ai if !ambiguous => Label::AiStrong,
                     Owner::Ai | Owner::AiWeak => Label::AiProbable,
                     Owner::AiEdited => Label::Mixed,
@@ -519,6 +554,7 @@ pub fn count(labels: &[LineLabel]) -> Counts {
     for line in labels.iter().filter(|line| line.added && !line.blank) {
         counts.e += 1;
         match line.label {
+            Label::AiDirect => counts.d += 1,
             Label::AiStrong => counts.s += 1,
             Label::AiProbable => counts.p += 1,
             Label::Mixed => counts.m += 1,
@@ -548,6 +584,7 @@ fn replay(
     new: &[Vec<u8>],
     kind: StepKind,
     source_step: usize,
+    direct_lines: &[Vec<u8>],
 ) -> Vec<OwnedLine> {
     let ops = capture_diff_slices(Algorithm::Myers, old, new);
     let mut next_owners = vec![
@@ -599,8 +636,16 @@ fn replay(
             .sum::<usize>();
         let inserted_owner = match kind {
             StepKind::Ai { degraded: false } => OwnedLine {
-                owner: Owner::Ai,
-                candidates: owner_candidate(Owner::Ai),
+                owner: if direct_lines.is_empty() {
+                    Owner::Ai
+                } else {
+                    Owner::Direct
+                },
+                candidates: if direct_lines.is_empty() {
+                    owner_candidate(Owner::Ai)
+                } else {
+                    owner_candidate(Owner::Direct)
+                },
                 source_step: Some(source_step),
                 ambiguous: false,
             },
@@ -668,7 +713,9 @@ fn replay(
                 }
                 if inserted.contains(&line) {
                     candidates |= match kind {
-                        StepKind::Ai { .. } => owner_candidate(Owner::Ai),
+                        StepKind::Ai { .. } => {
+                            owner_candidate(Owner::Ai) | owner_candidate(Owner::Direct)
+                        }
                         StepKind::External => owner_candidate(Owner::External),
                         StepKind::Unknown => owner_candidate(Owner::Gap),
                     };
@@ -927,6 +974,7 @@ mod tests {
         assert_eq!(
             count(&labels),
             Counts {
+                d: 0,
                 s: 1,
                 p: 0,
                 m: 0,

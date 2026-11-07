@@ -72,6 +72,7 @@ struct LinesOutput {
 #[derive(Serialize)]
 struct LineTotals {
     e: usize,
+    ai_direct: usize,
     ai_strong: usize,
     ai_probable: usize,
     mixed: usize,
@@ -170,6 +171,7 @@ struct Totals {
 struct FileOutput {
     path: String,
     e: usize,
+    ai_direct: usize,
     ai_strong: usize,
     ai_probable: usize,
     mixed: usize,
@@ -207,6 +209,14 @@ struct EventRecord {
     tool_use_id: Option<String>,
     #[serde(default)]
     operation: Option<String>,
+    #[serde(default)]
+    structured_edit: Option<bool>,
+    #[serde(default)]
+    structured_added_lines: Vec<String>,
+    #[serde(default)]
+    structured_input_sha256: Option<String>,
+    #[serde(default)]
+    before_sha: Option<String>,
     #[serde(default)]
     after_sha: Option<String>,
     #[serde(default)]
@@ -608,6 +618,7 @@ fn derive_resolved_commit(
             commit: commit.clone(),
             totals: LineTotals {
                 e: 0,
+                ai_direct: 0,
                 ai_strong: 0,
                 ai_probable: 0,
                 mixed: 0,
@@ -806,8 +817,13 @@ fn derive_resolved_commit(
             parent_time,
             &normalized_parent,
         );
-        let (mut steps, mut evidence) =
-            steps_for_events(store, &selected_events, &normalized_committed, commit_time);
+        let (mut steps, mut evidence) = steps_for_events(
+            store,
+            &selected_events,
+            &normalized_parent,
+            &normalized_committed,
+            commit_time,
+        );
         if evidence == "missing_blob" {
             if let Some(fallback) =
                 missing_snapshot_time_cut_fallback(store, &selected_events, &normalized_committed)
@@ -843,6 +859,7 @@ fn derive_resolved_commit(
                     penalties_milli: Vec::new(),
                     supporting_basis: Vec::new(),
                     limiting_basis: vec!["X_RECONSTRUCTED_WINDOW".into()],
+                    direct_lines: Vec::new(),
                 }),
             });
             evidence = "reconstructed";
@@ -915,6 +932,7 @@ fn derive_resolved_commit(
                     penalties_milli: Vec::new(),
                     supporting_basis: parent_line.supporting_basis,
                     limiting_basis: vec!["X_UNOBSERVED_EDIT_IN_FILE".into()],
+                    direct_lines: Vec::new(),
                 }),
             });
             attributed.line.label = derive::Label::Mixed;
@@ -1000,6 +1018,7 @@ fn derive_resolved_commit(
                     line: line.line.line,
                     hash: digest[..16].to_owned(),
                     label: match line.line.label {
+                        derive::Label::AiDirect => 'd',
                         derive::Label::AiStrong => 's',
                         derive::Label::AiProbable => 'p',
                         derive::Label::Mixed => 'm',
@@ -1017,6 +1036,7 @@ fn derive_resolved_commit(
         output_files.push(FileOutput {
             path: file.path,
             e: counts.e,
+            ai_direct: counts.d,
             ai_strong: counts.s,
             ai_probable: counts.p,
             mixed: counts.m,
@@ -1037,6 +1057,7 @@ fn derive_resolved_commit(
     let mut covered = 0usize;
     for file in &output_files {
         totals.e += file.e;
+        totals.ai_direct += file.ai_direct;
         totals.ai_strong += file.ai_strong;
         totals.ai_probable += file.ai_probable;
         totals.mixed += file.mixed;
@@ -1081,6 +1102,7 @@ fn derive_resolved_commit(
         commit: commit.clone(),
         totals: LineTotals {
             e: totals.e,
+            ai_direct: totals.ai_direct,
             ai_strong: totals.ai_strong,
             ai_probable: totals.ai_probable,
             mixed: totals.mixed,
@@ -1132,6 +1154,7 @@ fn write_empty_commit(
         commit: commit.clone(),
         totals: LineTotals {
             e: 0,
+            ai_direct: 0,
             ai_strong: 0,
             ai_probable: 0,
             mixed: 0,
@@ -1510,6 +1533,7 @@ fn events_for_path<'a>(
 fn steps_for_events(
     store: &Path,
     events: &[&EventRecord],
+    parent: &[u8],
     committed: &[u8],
     commit_time: u128,
 ) -> (Vec<Step>, &'static str) {
@@ -1544,6 +1568,7 @@ fn steps_for_events(
     };
 
     let mut steps = Vec::with_capacity(selected.len());
+    let mut previous_snapshot = parent.to_vec();
     for event in selected {
         let after = if event.event == "deletion" || event.after_sha.is_none() {
             Vec::new()
@@ -1598,31 +1623,113 @@ fn steps_for_events(
             penalties_milli.push(80);
         }
         let is_ai = matches!(kind, StepKind::Ai { .. });
+        let direct_lines = if is_ai
+            && evidence == "exact"
+            && !event.degraded.unwrap_or(false)
+            && !event.overlap.unwrap_or(false)
+            && event.structured_edit == Some(true)
+        {
+            verified_structured_lines(event, &previous_snapshot, &after)
+        } else {
+            Vec::new()
+        };
         let attribution = Some(derive::StepAttribution {
             adapter_id: event.tool.clone(),
             tool_id: event.tool.clone(),
             run_id: event.tool_use_id.clone(),
             operation: event.operation.clone(),
             primary_basis: Some(
-                if is_ai {
+                if !direct_lines.is_empty() {
+                    if event.operation.as_deref() == Some("apply_patch") {
+                        "DIRECT_AGENT_PATCH"
+                    } else {
+                        "DIRECT_ACCEPTED_EDIT"
+                    }
+                } else if is_ai {
                     "EXACT_FRAGMENT_MATCH"
                 } else {
                     "INCOMPLETE_SOURCE"
                 }
                 .into(),
             ),
-            score_milli: if is_ai { 920 } else { 0 },
+            score_milli: if !direct_lines.is_empty() {
+                if event.operation.as_deref() == Some("apply_patch") {
+                    990
+                } else {
+                    1000
+                }
+            } else if is_ai {
+                920
+            } else {
+                0
+            },
             penalties_milli,
             supporting_basis: Vec::new(),
             limiting_basis,
+            direct_lines,
         });
         steps.push(Step {
             kind,
-            after,
+            after: after.clone(),
             attribution,
         });
+        previous_snapshot = after;
     }
     (steps, evidence)
+}
+
+fn verified_structured_lines(event: &EventRecord, before: &[u8], after: &[u8]) -> Vec<Vec<u8>> {
+    let before_sha_matches = if before.is_empty() {
+        event.before_sha.is_none()
+    } else {
+        event.before_sha.as_deref() == Some(crate::hash(before).as_str())
+    };
+    if !before_sha_matches || event.after_sha.as_deref() != Some(crate::hash(after).as_str()) {
+        return Vec::new();
+    }
+    let old = commit_split_lines(&normalize_eol(before));
+    let new = commit_split_lines(&normalize_eol(after));
+    let added = capture_diff_slices(Algorithm::Myers, &old, &new)
+        .iter()
+        .filter(|op| op.tag() != DiffTag::Equal)
+        .flat_map(|op| op.new_range().map(|index| new[index].clone()))
+        .collect::<Vec<_>>();
+    if event.operation.as_deref() == Some("create_file") {
+        let Some(input_sha256) = event.structured_input_sha256.as_deref() else {
+            return Vec::new();
+        };
+        if crate::hash(&normalize_eol(after)) == input_sha256 {
+            return added;
+        }
+        return Vec::new();
+    }
+    let mut payload = event
+        .structured_added_lines
+        .iter()
+        .map(|line| line.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    payload.sort();
+    let mut actual = added.clone();
+    actual.sort();
+    if payload == actual {
+        added
+    } else {
+        Vec::new()
+    }
+}
+
+fn commit_split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = bytes
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    if bytes.last() == Some(&b'\n') {
+        lines.pop();
+    }
+    lines
 }
 
 fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
@@ -1726,9 +1833,10 @@ fn attribution_ranges(
         let score = score_for_label(label, score_step.as_ref(), &limiting_basis);
         let confidence_band = match label {
             derive::Label::Unknown => "none",
-            derive::Label::AiStrong | derive::Label::AiProbable | derive::Label::Mixed => {
-                score.map(confidence_band).unwrap_or("none")
-            }
+            derive::Label::AiDirect
+            | derive::Label::AiStrong
+            | derive::Label::AiProbable
+            | derive::Label::Mixed => score.map(confidence_band).unwrap_or("none"),
         };
         let attribution = AttributionRange {
             path: path.into(),
@@ -1861,6 +1969,7 @@ fn missing_snapshot_time_cut_fallback(
             penalties_milli: vec![120],
             supporting_basis: Vec::new(),
             limiting_basis: vec!["X_TIME_CUT".into(), "INCOMPLETE_SOURCE".into()],
+            direct_lines: Vec::new(),
         }),
     })
 }
@@ -2178,6 +2287,7 @@ fn excluded_attributions(
 
 fn category_name(label: derive::Label) -> &'static str {
     match label {
+        derive::Label::AiDirect => "ai_direct",
         derive::Label::AiStrong => "ai_strong",
         derive::Label::AiProbable => "ai_probable",
         derive::Label::Mixed => "mixed",
@@ -2210,6 +2320,7 @@ fn score_for_label(
         score -= 80;
     }
     score = match label {
+        derive::Label::AiDirect => score.clamp(980, 1000),
         derive::Label::AiStrong => score.clamp(800, 970),
         derive::Label::AiProbable => score.clamp(500, 790),
         derive::Label::Mixed => score.clamp(0, 1000),
@@ -2268,6 +2379,7 @@ fn skipped_file(
     FileOutput {
         path,
         e: 0,
+        ai_direct: 0,
         ai_strong: 0,
         ai_probable: 0,
         mixed: 0,
@@ -2282,6 +2394,7 @@ fn skipped_file_added(path: String, added_lines: usize, evidence: &'static str) 
     FileOutput {
         path,
         e: 0,
+        ai_direct: 0,
         ai_strong: 0,
         ai_probable: 0,
         mixed: 0,
@@ -2296,6 +2409,7 @@ fn unknown_file(path: String, evidence: &'static str, added: usize) -> FileOutpu
     FileOutput {
         path,
         e: added,
+        ai_direct: 0,
         ai_strong: 0,
         ai_probable: 0,
         mixed: 0,
@@ -2384,6 +2498,10 @@ mod tests {
             tool: Some("codex".into()),
             tool_use_id: Some("tool-1".into()),
             operation: Some("apply_patch".into()),
+            structured_edit: None,
+            structured_added_lines: Vec::new(),
+            structured_input_sha256: None,
+            before_sha: None,
             after_sha,
             degraded: Some(degraded),
             overlap: Some(false),
@@ -2423,21 +2541,21 @@ mod tests {
         let exact_bytes = b"base\nai\n";
         let exact_sha = put_blob(&store, exact_bytes);
         let exact = event(Some(exact_sha.clone()), "ai_change", false, None);
-        let (steps, evidence) = steps_for_events(&store, &[&exact], exact_bytes, 20);
+        let (steps, evidence) = steps_for_events(&store, &[&exact], b"", exact_bytes, 20);
         assert_eq!(evidence, "exact");
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].kind, StepKind::Ai { degraded: false });
 
-        let (steps, evidence) = steps_for_events(&store, &[&exact], b"base\nai\nlate\n", 20);
+        let (steps, evidence) = steps_for_events(&store, &[&exact], b"", b"base\nai\nlate\n", 20);
         assert_eq!(evidence, "time_cut");
         assert_eq!(steps[0].kind, StepKind::Ai { degraded: true });
 
-        let (steps, evidence) = steps_for_events(&store, &[], b"base\n", 20);
+        let (steps, evidence) = steps_for_events(&store, &[], b"", b"base\n", 20);
         assert_eq!(evidence, "none");
         assert!(steps.is_empty());
 
         let missing = event(Some("a".repeat(64)), "ai_change", false, None);
-        let (steps, evidence) = steps_for_events(&store, &[&missing], b"different\n", 20);
+        let (steps, evidence) = steps_for_events(&store, &[&missing], b"", b"different\n", 20);
         assert_eq!(evidence, "missing_blob");
         assert!(steps.is_empty());
 
@@ -2447,7 +2565,7 @@ mod tests {
             true,
             Some("before_unavailable"),
         );
-        let (steps, evidence) = steps_for_events(&store, &[&unavailable], exact_bytes, 20);
+        let (steps, evidence) = steps_for_events(&store, &[&unavailable], b"", exact_bytes, 20);
         assert_eq!(evidence, "exact");
         assert_eq!(steps[0].kind, StepKind::Unknown);
         let _ = fs::remove_dir_all(store);
@@ -2465,6 +2583,7 @@ mod tests {
             penalties_milli: Vec::new(),
             supporting_basis: Vec::new(),
             limiting_basis: Vec::new(),
+            direct_lines: Vec::new(),
         };
         assert_eq!(
             score_for_label(derive::Label::AiStrong, Some(&exact), &[]),

@@ -128,11 +128,7 @@ struct HookInput {
     model: Option<String>,
     tool_name: Option<String>,
     tool_use_id: Option<String>,
-    tool_input: Option<ToolInput>,
-}
-#[derive(Debug, Deserialize)]
-struct ToolInput {
-    command: Option<String>,
+    tool_input: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -205,6 +201,12 @@ struct Event {
     tool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_edit: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    structured_added_lines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured_input_sha256: Option<String>,
     command_sha256: Option<String>,
     command_length: Option<usize>,
     window_open: Option<u128>,
@@ -254,6 +256,9 @@ impl Event {
             model: None,
             tool: None,
             operation: None,
+            structured_edit: None,
+            structured_added_lines: Vec::new(),
+            structured_input_sha256: None,
             command_sha256: None,
             command_length: None,
             window_open: None,
@@ -346,7 +351,6 @@ pub fn process_vscode_json(input: &[u8]) {
     }
     let tool_name = payload.get("tool_name").and_then(|v| v.as_str());
     let mut target_paths = None;
-    let mut command = None;
     let require_window = match (event_name, tool_name) {
         ("Stop", _) => false,
         ("PreToolUse" | "PostToolUse", Some("create_file")) => {
@@ -371,14 +375,7 @@ pub fn process_vscode_json(input: &[u8]) {
             );
             true
         }
-        ("PreToolUse" | "PostToolUse", Some("run_in_terminal")) => {
-            command = payload
-                .get("tool_input")
-                .and_then(|v| v.get("command"))
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
-            false
-        }
+        ("PreToolUse" | "PostToolUse", Some("run_in_terminal")) => false,
         ("PreToolUse" | "PostToolUse", Some(name)) if is_read_only_vscode_tool(name) => return,
         ("PreToolUse" | "PostToolUse", Some(name)) => {
             append_vscode_diagnostic(
@@ -410,9 +407,7 @@ pub fn process_vscode_json(input: &[u8]) {
             .get("tool_use_id")
             .and_then(|v| v.as_str())
             .map(str::to_owned),
-        tool_input: command.map(|command| ToolInput {
-            command: Some(command),
-        }),
+        tool_input: payload.get("tool_input").cloned(),
     };
     process_hook(hook, "vscode-copilot", target_paths, require_window);
 }
@@ -443,6 +438,78 @@ fn parse_apply_patch_paths(patch: &str) -> Vec<String> {
         .filter(|path| !path.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn structured_edit_allowed(adapter: &str, operation: Option<&str>) -> bool {
+    matches!(
+        (adapter, operation),
+        ("codex", Some("apply_patch"))
+            | (
+                "vscode-copilot",
+                Some(
+                    "create_file"
+                        | "apply_patch"
+                        | "insert_edit_into_file"
+                        | "replace_string_in_file",
+                ),
+            )
+    )
+}
+
+fn structured_added_lines(
+    adapter: &str,
+    operation: Option<&str>,
+    input: &serde_json::Value,
+) -> Option<Vec<String>> {
+    let operation = operation?;
+    let content = match (adapter, operation) {
+        ("vscode-copilot", "create_file") => input.get("content")?.as_str()?,
+        (_, "apply_patch") => input
+            .get("input")
+            .or_else(|| input.get("patch"))
+            .and_then(serde_json::Value::as_str)?,
+        ("vscode-copilot", "insert_edit_into_file") => input
+            .get("code")
+            .or_else(|| input.get("text"))
+            .and_then(serde_json::Value::as_str)?,
+        ("vscode-copilot", "replace_string_in_file") => input.get("newString")?.as_str()?,
+        _ => return None,
+    };
+    let lines = if operation == "create_file" {
+        Vec::new()
+    } else if operation == "apply_patch" {
+        content
+            .lines()
+            .filter_map(|line| line.strip_prefix('+'))
+            .filter(|line| !line.starts_with("++"))
+            .map(str::to_owned)
+            .collect()
+    } else {
+        content.lines().map(str::to_owned).collect()
+    };
+    Some(lines)
+}
+
+fn structured_input(
+    adapter: &str,
+    operation: Option<&str>,
+    input: &serde_json::Value,
+) -> Option<String> {
+    let operation = operation?;
+    let field = match (adapter, operation) {
+        ("vscode-copilot", "create_file") => "content",
+        (_, "apply_patch") => {
+            return input
+                .get("input")
+                .or_else(|| input.get("patch"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+        }
+        ("vscode-copilot", "insert_edit_into_file") => "code",
+        ("vscode-copilot", "replace_string_in_file") => "newString",
+        _ => return None,
+    };
+    input.get(field)?.as_str().map(str::to_owned)
 }
 
 fn append_vscode_diagnostic(cwd: Option<&Path>, tool_name: &str, pre_event: bool) {
@@ -778,12 +845,14 @@ fn process_hook(
             let command_sha = hook
                 .tool_input
                 .as_ref()
-                .and_then(|v| v.command.as_deref())
+                .and_then(|v| v.get("command"))
+                .and_then(serde_json::Value::as_str)
                 .map(|v| hash(v.as_bytes()));
             let command_length = hook
                 .tool_input
                 .as_ref()
-                .and_then(|v| v.command.as_deref())
+                .and_then(|v| v.get("command"))
+                .and_then(serde_json::Value::as_str)
                 .map(str::len);
             let now = now_ns();
             let mut event_batch = Vec::with_capacity(changes.len());
@@ -818,6 +887,24 @@ fn process_hook(
                 e.model = hook.model.clone();
                 e.tool = Some(tool_label.into());
                 e.operation = hook.tool_name.clone();
+                e.structured_edit = Some(structured_edit_allowed(
+                    tool_label,
+                    hook.tool_name.as_deref(),
+                ));
+                e.structured_added_lines = hook
+                    .tool_input
+                    .as_ref()
+                    .and_then(|input| {
+                        structured_added_lines(tool_label, hook.tool_name.as_deref(), input)
+                    })
+                    .unwrap_or_default();
+                e.structured_input_sha256 = hook
+                    .tool_input
+                    .as_ref()
+                    .and_then(|input| {
+                        structured_input(tool_label, hook.tool_name.as_deref(), input)
+                    })
+                    .map(|payload| hash(payload.replace("\r\n", "\n").as_bytes()));
                 e.command_sha256 = command_sha.clone();
                 e.command_length = command_length;
                 e.window_open = opened;

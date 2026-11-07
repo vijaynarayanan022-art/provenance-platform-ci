@@ -202,6 +202,19 @@ fn parsed(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn commit_report(fixture: &Fixture, commit: &str) -> Value {
+    let repo_store = fs::read_dir(fixture.store.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    serde_json::from_slice(
+        &fs::read(repo_store.join("commits").join(format!("{commit}.json"))).unwrap(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn enable_disable_are_idempotent_and_leave_capture_data_untouched() {
     let fixture = Fixture::new("enable-disable");
@@ -481,6 +494,9 @@ fn summary_range_matches_pr_report_and_expands_full_category_names() {
     assert_eq!(vscode_range["source"]["toolId"], "vscode-copilot");
     assert_eq!(vscode_range["source"]["sessionRef"], "vscode-one");
     assert_eq!(vscode_range["operation"], "create_file");
+    assert_eq!(vscode_range["category"], "ai_direct");
+    assert_eq!(vscode_range["score"], 1.0);
+    assert_eq!(vscode_range["primaryBasis"], "DIRECT_ACCEPTED_EDIT");
     assert_eq!(codex_range["sourceTool"], "codex");
     assert!(codex_range["supportingBasis"].is_array());
     assert!(codex_range["limitingBasis"].is_array());
@@ -512,6 +528,163 @@ fn summary_range_matches_pr_report_and_expands_full_category_names() {
     assert!(table.contains("primaryBasis\tsupportingBasis\tlimitingBasis\tsourceTool\toperation"));
     assert!(!table.contains("\ts\t"));
     fixture.drop_root();
+}
+
+#[test]
+fn structured_codex_patch_is_direct_but_legacy_events_remain_strong() {
+    let fixture = Fixture::new("structured-direct");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n base\n+calculate_total = left + right\n*** End Patch",
+        fixture.repo.join("tracked.txt").display()
+    );
+    let pre = json!({
+        "hook_event_name":"PreToolUse", "session_id":"structured-session",
+        "cwd":fixture.repo, "tool_name":"apply_patch", "tool_use_id":"patch-1",
+        "tool_input":{"input":patch}
+    });
+    fixture.hook("codex", &pre);
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        "base\ncalculate_total = left + right\n",
+    )
+    .unwrap();
+    let mut post = pre.clone();
+    post["hook_event_name"] = json!("PostToolUse");
+    fixture.hook("codex", &post);
+    let event_path = fs::read_dir(fixture.store.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("events")
+        .join("structured-session.jsonl");
+    let event_text = fs::read_to_string(&event_path).unwrap();
+    let change = event_text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["event"] == "ai_change")
+        .unwrap();
+    assert_eq!(change["structured_edit"], true);
+    assert_eq!(
+        change["structured_added_lines"],
+        json!(["calculate_total = left + right"])
+    );
+    let commit = fixture.commit("structured patch");
+    fixture.derive(&commit);
+    let report = commit_report(&fixture, &commit);
+    assert_eq!(report["totals"]["ai_direct"], 1);
+    assert_eq!(report["totals"]["ai_strong"], 0);
+
+    fixture.drop_root();
+
+    // Removing the additive marker simulates a stored pre-r16 event; it must use scan attribution.
+    let legacy_fixture = Fixture::new("legacy-scan-event");
+    let legacy_patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n base\n+calculate_total = left + right\n*** End Patch",
+        legacy_fixture.repo.join("tracked.txt").display()
+    );
+    let legacy_pre = json!({"hook_event_name":"PreToolUse","session_id":"legacy-session",
+        "cwd":legacy_fixture.repo,"tool_name":"apply_patch","tool_use_id":"legacy-patch",
+        "tool_input":{"input":legacy_patch}});
+    legacy_fixture.hook("codex", &legacy_pre);
+    fs::write(
+        legacy_fixture.repo.join("tracked.txt"),
+        "base\ncalculate_total = left + right\n",
+    )
+    .unwrap();
+    let mut legacy_post = legacy_pre.clone();
+    legacy_post["hook_event_name"] = json!("PostToolUse");
+    legacy_fixture.hook("codex", &legacy_post);
+    let legacy_event_path = fs::read_dir(legacy_fixture.store.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("events")
+        .join("legacy-session.jsonl");
+    let legacy_text = fs::read_to_string(&legacy_event_path).unwrap();
+    let mut legacy_lines = legacy_text
+        .lines()
+        .map(|line| {
+            let mut value: Value = serde_json::from_str(line).unwrap();
+            value.as_object_mut().unwrap().remove("structured_edit");
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("structured_added_lines");
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("structured_input_sha256");
+            serde_json::to_string(&value).unwrap()
+        })
+        .collect::<Vec<_>>();
+    legacy_lines.push(String::new());
+    fs::write(&legacy_event_path, legacy_lines.join("\n")).unwrap();
+    let legacy_commit = legacy_fixture.commit("legacy event replay");
+    legacy_fixture.derive(&legacy_commit);
+    let legacy = commit_report(&legacy_fixture, &legacy_commit);
+    assert_eq!(legacy["totals"]["ai_direct"], 0);
+    assert_eq!(legacy["totals"]["ai_strong"], 1);
+    legacy_fixture.drop_root();
+}
+
+#[test]
+fn direct_line_human_edit_becomes_mixed_and_overlap_is_capped() {
+    let human = Fixture::new("direct-human-edit");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n base\n+calculate_total = left + right\n*** End Patch",
+        human.repo.join("tracked.txt").display()
+    );
+    let pre = json!({"hook_event_name":"PreToolUse","session_id":"s","cwd":human.repo,
+        "tool_name":"apply_patch","tool_use_id":"p","tool_input":{"input":patch}});
+    human.hook("codex", &pre);
+    fs::write(
+        human.repo.join("tracked.txt"),
+        "base\ncalculate_total = left + right\n",
+    )
+    .unwrap();
+    let mut post = pre.clone();
+    post["hook_event_name"] = json!("PostToolUse");
+    human.hook("codex", &post);
+    fs::write(
+        human.repo.join("tracked.txt"),
+        "base\ncalculate_total = left + right + offset\n",
+    )
+    .unwrap();
+    let commit = human.commit("human follow-up");
+    human.derive(&commit);
+    let report = commit_report(&human, &commit);
+    assert_eq!(report["totals"]["mixed"], 1);
+    human.drop_root();
+
+    let overlap = Fixture::new("direct-overlap");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n base\n+overlap line\n*** End Patch",
+        overlap.repo.join("tracked.txt").display()
+    );
+    let first = json!({"hook_event_name":"PreToolUse","session_id":"first","cwd":overlap.repo,
+        "tool_name":"apply_patch","tool_use_id":"first","tool_input":{"input":patch}});
+    overlap.hook("codex", &first);
+    let second = json!({"hook_event_name":"PreToolUse","session_id":"second","cwd":overlap.repo,
+        "tool_name":"apply_patch","tool_use_id":"second","tool_input":{"input":patch}});
+    overlap.hook("codex", &second);
+    fs::write(overlap.repo.join("tracked.txt"), "base\noverlap line\n").unwrap();
+    let mut second_post = second.clone();
+    second_post["hook_event_name"] = json!("PostToolUse");
+    overlap.hook("codex", &second_post);
+    let mut first_post = first.clone();
+    first_post["hook_event_name"] = json!("PostToolUse");
+    overlap.hook("codex", &first_post);
+    let commit = overlap.commit("overlapping edit");
+    overlap.derive(&commit);
+    let report = commit_report(&overlap, &commit);
+    assert_eq!(report["totals"]["ai_direct"], 0);
+    assert_eq!(report["totals"]["ai_strong"], 0);
+    assert_eq!(report["totals"]["ai_probable"], 1);
+    overlap.drop_root();
 }
 
 #[test]
