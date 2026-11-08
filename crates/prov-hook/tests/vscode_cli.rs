@@ -431,7 +431,8 @@ fn create_file_and_patch_replay_derive_exact_vscode_labels_and_report_tool() {
         .unwrap();
     let diagnostics = failure_diagnostics(&fixture, &target_path, &report);
     assert_eq!(hello_report["evidence"], "exact", "{diagnostics}");
-    assert_eq!(hello_report["ai_strong"], 4, "{diagnostics}");
+    assert_eq!(hello_report["ai_direct"], 4, "{diagnostics}");
+    assert_eq!(hello_report["ai_strong"], 0, "{diagnostics}");
     assert_eq!(hello_report["ai_probable"], 0, "{diagnostics}");
     assert_eq!(hello_report["unknown"], 0, "{diagnostics}");
 
@@ -539,6 +540,14 @@ fn terminal_changes_match_codex_shell_path_evidence() {
         vscode_event["tool"], "vscode-copilot",
         "{vscode_diagnostics}"
     );
+    let vscode_file = vscode_report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "tracked.txt")
+        .unwrap();
+    assert_eq!(vscode_file["ai_direct"], 0);
+    assert!(vscode_file["ai_strong"].as_u64().unwrap() > 0);
 
     let codex = Fixture::new("terminal-codex");
     let codex_initial_blob = git_text(&codex.repo, &["rev-parse", "HEAD:tracked.txt"]);
@@ -580,6 +589,8 @@ fn terminal_changes_match_codex_shell_path_evidence() {
         .iter()
         .find(|file| file["path"] == "tracked.txt")
         .unwrap_or_else(|| panic!("{codex_diagnostics}"));
+    assert_eq!(codex_file["ai_direct"], 0);
+    assert!(codex_file["ai_strong"].as_u64().unwrap() > 0);
     let vscode_file = file_report(&fixture, &commit)["files"]
         .as_array()
         .unwrap()

@@ -63,6 +63,8 @@ struct FileRange {
     tool_id: Option<String>,
     session_ref: Option<String>,
     operation: Option<String>,
+    exclusion_classifier: Option<String>,
+    exclusion_reason: Option<String>,
 }
 
 pub fn command(args: impl Iterator<Item = String>) -> Result<String, String> {
@@ -588,11 +590,11 @@ fn render_table(rows: &[Row], totals: &Totals, file_ranges: &[FileRange]) -> Str
     ));
     if !file_ranges.is_empty() {
         output.push_str(
-            "\ncommit\tfile\tlines\tcategory\tscore\tband\tprimaryBasis\tsupportingBasis\tlimitingBasis\tsourceTool\toperation\talgorithmProfile\tscoreProfile\n",
+            "\ncommit\tfile\tlines\tcategory\tscore\tband\tprimaryBasis\tsupportingBasis\tlimitingBasis\tsourceTool\toperation\talgorithmProfile\tscoreProfile\texclusionClassifier\texclusionReason\n",
         );
         for range in file_ranges {
             output.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 range.commit,
                 range.file,
                 range_line_span(range.start_line, range.end_line),
@@ -608,6 +610,8 @@ fn render_table(rows: &[Row], totals: &Totals, file_ranges: &[FileRange]) -> Str
                 range.operation.as_deref().unwrap_or("none"),
                 range.algorithm_profile,
                 range.score_profile,
+                range.exclusion_classifier.as_deref().unwrap_or("none"),
+                range.exclusion_reason.as_deref().unwrap_or("none"),
             ));
         }
     }
@@ -721,6 +725,10 @@ fn collect_file_ranges(
                         .as_str()
                         .map(str::to_owned),
                     operation: attribution["operation"].as_str().map(str::to_owned),
+                    exclusion_classifier: attribution["exclusionClassifier"]
+                        .as_str()
+                        .map(str::to_owned),
+                    exclusion_reason: attribution["exclusionReason"].as_str().map(str::to_owned),
                 });
             }
         } else if let Some(file_rows) = document["files"].as_array() {
@@ -754,6 +762,8 @@ fn collect_file_ranges(
                             tool_id: None,
                             session_ref: None,
                             operation: None,
+                            exclusion_classifier: None,
+                            exclusion_reason: None,
                         });
                     }
                 }
@@ -797,6 +807,8 @@ fn file_range_json(range: &FileRange) -> Value {
         "operation": range.operation,
         "algorithmProfile": range.algorithm_profile,
         "scoreProfile": range.score_profile,
+        "exclusionClassifier": range.exclusion_classifier,
+        "exclusionReason": range.exclusion_reason,
     })
 }
 

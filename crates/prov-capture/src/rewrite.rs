@@ -625,6 +625,12 @@ fn carried_attribution(
         operation: source.as_ref().and_then(|range| range.operation.clone()),
         algorithm_profile: "deterministic-v1".into(),
         score_profile: "score-v1".into(),
+        exclusion_classifier: source
+            .as_ref()
+            .and_then(|range| range.exclusion_classifier.clone()),
+        exclusion_reason: source
+            .as_ref()
+            .and_then(|range| range.exclusion_reason.clone()),
     }
 }
 
@@ -671,6 +677,8 @@ fn same_attribution(
         && left.operation == right.operation
         && left.algorithm_profile == right.algorithm_profile
         && left.score_profile == right.score_profile
+        && left.exclusion_classifier == right.exclusion_classifier
+        && left.exclusion_reason == right.exclusion_reason
 }
 
 fn recompute_totals(report: &mut CommitReport) {

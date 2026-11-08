@@ -72,6 +72,7 @@ struct LinesOutput {
 #[derive(Serialize)]
 struct LineTotals {
     e: usize,
+    ai_direct: usize,
     ai_strong: usize,
     ai_probable: usize,
     mixed: usize,
@@ -119,6 +120,10 @@ pub(crate) struct AttributionRange {
     pub algorithm_profile: String,
     #[serde(default = "default_score_profile")]
     pub score_profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusion_classifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusion_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -166,6 +171,7 @@ struct Totals {
 struct FileOutput {
     path: String,
     e: usize,
+    ai_direct: usize,
     ai_strong: usize,
     ai_probable: usize,
     mixed: usize,
@@ -203,6 +209,12 @@ struct EventRecord {
     tool_use_id: Option<String>,
     #[serde(default)]
     operation: Option<String>,
+    #[serde(default)]
+    structured_edit: Option<bool>,
+    #[serde(default)]
+    line_ranges: Option<Vec<[usize; 2]>>,
+    #[serde(default)]
+    before_sha: Option<String>,
     #[serde(default)]
     after_sha: Option<String>,
     #[serde(default)]
@@ -604,6 +616,7 @@ fn derive_resolved_commit(
             commit: commit.clone(),
             totals: LineTotals {
                 e: 0,
+                ai_direct: 0,
                 ai_strong: 0,
                 ai_probable: 0,
                 mixed: 0,
@@ -725,12 +738,15 @@ fn derive_resolved_commit(
         };
 
         let added_count = added_nonblank(&parent_content, &committed_content);
-        if crate::is_excluded(&file.path) {
+        let path_exclusion = crate::exclusion::classify_path(&file.path);
+        if path_exclusion.is_some_and(|exclusion| exclusion.reason_code != "BINARY_FILE") {
+            let exclusion = path_exclusion.expect("checked path exclusion");
             attributions.extend(excluded_attributions(
                 &file.path,
                 &parent_content,
                 &committed_content,
-                None,
+                exclusion.reason_code,
+                exclusion.limiting_basis,
             ));
             output_files.push(skipped_file(
                 file.path,
@@ -740,14 +756,23 @@ fn derive_resolved_commit(
             ));
             continue;
         }
-        if parent_content[..parent_content.len().min(8000)].contains(&0)
-            || committed_content[..committed_content.len().min(8000)].contains(&0)
+        let binary_content = parent_content[..parent_content.len().min(8192)].contains(&0)
+            || committed_content[..committed_content.len().min(8192)].contains(&0);
+        let content_exclusion = if binary_content {
+            crate::exclusion::classify_content(&committed_content)
+                .or_else(|| crate::exclusion::classify_content(&parent_content))
+        } else {
+            crate::exclusion::classify_content(&committed_content)
+        };
+        if let Some(exclusion) = content_exclusion
+            .or_else(|| path_exclusion.filter(|exclusion| exclusion.reason_code == "BINARY_FILE"))
         {
             attributions.extend(excluded_attributions(
                 &file.path,
                 &parent_content,
                 &committed_content,
-                Some("CONTENT_RESTRICTED"),
+                exclusion.reason_code,
+                exclusion.limiting_basis,
             ));
             output_files.push(skipped_file(
                 file.path,
@@ -760,11 +785,16 @@ fn derive_resolved_commit(
         if old_size.is_some_and(|size| size > MAX_FILE)
             || new_size.is_some_and(|size| size > MAX_FILE)
         {
+            let exclusion = crate::exclusion::Exclusion {
+                reason_code: crate::exclusion::FILE_SIZE_LIMIT_REASON,
+                limiting_basis: None,
+            };
             attributions.extend(excluded_attributions(
                 &file.path,
                 &parent_content,
                 &committed_content,
-                None,
+                exclusion.reason_code,
+                exclusion.limiting_basis,
             ));
             output_files.push(skipped_file(
                 file.path,
@@ -785,8 +815,13 @@ fn derive_resolved_commit(
             parent_time,
             &normalized_parent,
         );
-        let (mut steps, mut evidence) =
-            steps_for_events(store, &selected_events, &normalized_committed, commit_time);
+        let (mut steps, mut evidence) = steps_for_events(
+            store,
+            &selected_events,
+            &normalized_parent,
+            &normalized_committed,
+            commit_time,
+        );
         if evidence == "missing_blob" {
             if let Some(fallback) =
                 missing_snapshot_time_cut_fallback(store, &selected_events, &normalized_committed)
@@ -822,6 +857,7 @@ fn derive_resolved_commit(
                     penalties_milli: Vec::new(),
                     supporting_basis: Vec::new(),
                     limiting_basis: vec!["X_RECONSTRUCTED_WINDOW".into()],
+                    direct_lines: Vec::new(),
                 }),
             });
             evidence = "reconstructed";
@@ -894,6 +930,7 @@ fn derive_resolved_commit(
                     penalties_milli: Vec::new(),
                     supporting_basis: parent_line.supporting_basis,
                     limiting_basis: vec!["X_UNOBSERVED_EDIT_IN_FILE".into()],
+                    direct_lines: Vec::new(),
                 }),
             });
             attributed.line.label = derive::Label::Mixed;
@@ -979,6 +1016,7 @@ fn derive_resolved_commit(
                     line: line.line.line,
                     hash: digest[..16].to_owned(),
                     label: match line.line.label {
+                        derive::Label::AiDirect => 'd',
                         derive::Label::AiStrong => 's',
                         derive::Label::AiProbable => 'p',
                         derive::Label::Mixed => 'm',
@@ -996,6 +1034,7 @@ fn derive_resolved_commit(
         output_files.push(FileOutput {
             path: file.path,
             e: counts.e,
+            ai_direct: counts.d,
             ai_strong: counts.s,
             ai_probable: counts.p,
             mixed: counts.m,
@@ -1016,6 +1055,7 @@ fn derive_resolved_commit(
     let mut covered = 0usize;
     for file in &output_files {
         totals.e += file.e;
+        totals.ai_direct += file.ai_direct;
         totals.ai_strong += file.ai_strong;
         totals.ai_probable += file.ai_probable;
         totals.mixed += file.mixed;
@@ -1060,6 +1100,7 @@ fn derive_resolved_commit(
         commit: commit.clone(),
         totals: LineTotals {
             e: totals.e,
+            ai_direct: totals.ai_direct,
             ai_strong: totals.ai_strong,
             ai_probable: totals.ai_probable,
             mixed: totals.mixed,
@@ -1111,6 +1152,7 @@ fn write_empty_commit(
         commit: commit.clone(),
         totals: LineTotals {
             e: 0,
+            ai_direct: 0,
             ai_strong: 0,
             ai_probable: 0,
             mixed: 0,
@@ -1489,6 +1531,7 @@ fn events_for_path<'a>(
 fn steps_for_events(
     store: &Path,
     events: &[&EventRecord],
+    parent: &[u8],
     committed: &[u8],
     commit_time: u128,
 ) -> (Vec<Step>, &'static str) {
@@ -1523,6 +1566,7 @@ fn steps_for_events(
     };
 
     let mut steps = Vec::with_capacity(selected.len());
+    let mut previous_snapshot = parent.to_vec();
     for event in selected {
         let after = if event.event == "deletion" || event.after_sha.is_none() {
             Vec::new()
@@ -1577,31 +1621,100 @@ fn steps_for_events(
             penalties_milli.push(80);
         }
         let is_ai = matches!(kind, StepKind::Ai { .. });
+        let direct_lines = if is_ai
+            && evidence == "exact"
+            && !event.degraded.unwrap_or(false)
+            && !event.after_incomplete.unwrap_or(false)
+            && !event.overlap.unwrap_or(false)
+            && event.structured_edit == Some(true)
+        {
+            verified_structured_lines(event, &previous_snapshot, &after)
+        } else {
+            Vec::new()
+        };
         let attribution = Some(derive::StepAttribution {
             adapter_id: event.tool.clone(),
             tool_id: event.tool.clone(),
             run_id: event.tool_use_id.clone(),
             operation: event.operation.clone(),
             primary_basis: Some(
-                if is_ai {
+                if !direct_lines.is_empty() {
+                    if event.operation.as_deref() == Some("apply_patch") {
+                        "DIRECT_AGENT_PATCH"
+                    } else {
+                        "DIRECT_ACCEPTED_EDIT"
+                    }
+                } else if is_ai {
                     "EXACT_FRAGMENT_MATCH"
                 } else {
                     "INCOMPLETE_SOURCE"
                 }
                 .into(),
             ),
-            score_milli: if is_ai { 920 } else { 0 },
+            score_milli: if !direct_lines.is_empty() {
+                if event.operation.as_deref() == Some("apply_patch") {
+                    990
+                } else {
+                    1000
+                }
+            } else if is_ai {
+                920
+            } else {
+                0
+            },
             penalties_milli,
             supporting_basis: Vec::new(),
             limiting_basis,
+            direct_lines,
         });
         steps.push(Step {
             kind,
-            after,
+            after: after.clone(),
             attribution,
         });
+        previous_snapshot = after;
     }
     (steps, evidence)
+}
+
+fn verified_structured_lines(event: &EventRecord, before: &[u8], after: &[u8]) -> Vec<Vec<u8>> {
+    let before_sha_matches = if before.is_empty() {
+        event.before_sha.is_none()
+    } else {
+        event.before_sha.as_deref() == Some(crate::hash(before).as_str())
+    };
+    if !before_sha_matches || event.after_sha.as_deref() != Some(crate::hash(after).as_str()) {
+        return Vec::new();
+    }
+    let Some(recorded_ranges) = event.line_ranges.as_ref() else {
+        return Vec::new();
+    };
+    let actual_ranges = crate::changed_line_ranges(before, after);
+    if recorded_ranges != &actual_ranges {
+        return Vec::new();
+    }
+    let old = commit_split_lines(&normalize_eol(before));
+    let new = commit_split_lines(&normalize_eol(after));
+    let added = capture_diff_slices(Algorithm::Myers, &old, &new)
+        .iter()
+        .filter(|op| op.tag() != DiffTag::Equal)
+        .flat_map(|op| op.new_range().map(|index| new[index].clone()))
+        .collect::<Vec<_>>();
+    added
+}
+
+fn commit_split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = bytes
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    if bytes.last() == Some(&b'\n') {
+        lines.pop();
+    }
+    lines
 }
 
 fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
@@ -1663,7 +1776,7 @@ fn attribution_ranges(
             step.map(|step| step.limiting_basis.clone())
                 .unwrap_or_default()
         };
-        if label != derive::Label::Unknown && attributed.ambiguous {
+        if attributed.ambiguous {
             push_basis(&mut limiting_basis, "CONFLICTING_EVIDENCE");
         }
         if label == derive::Label::Mixed
@@ -1705,9 +1818,10 @@ fn attribution_ranges(
         let score = score_for_label(label, score_step.as_ref(), &limiting_basis);
         let confidence_band = match label {
             derive::Label::Unknown => "none",
-            derive::Label::AiStrong | derive::Label::AiProbable | derive::Label::Mixed => {
-                score.map(confidence_band).unwrap_or("none")
-            }
+            derive::Label::AiDirect
+            | derive::Label::AiStrong
+            | derive::Label::AiProbable
+            | derive::Label::Mixed => score.map(confidence_band).unwrap_or("none"),
         };
         let attribution = AttributionRange {
             path: path.into(),
@@ -1748,6 +1862,8 @@ fn attribution_ranges(
             operation: step.and_then(|step| step.operation.clone()),
             algorithm_profile: "deterministic-v1".into(),
             score_profile: "score-v1".into(),
+            exclusion_classifier: None,
+            exclusion_reason: None,
         };
         push_attribution_range(&mut ranges, attribution);
     }
@@ -1838,6 +1954,7 @@ fn missing_snapshot_time_cut_fallback(
             penalties_milli: vec![120],
             supporting_basis: Vec::new(),
             limiting_basis: vec!["X_TIME_CUT".into(), "INCOMPLETE_SOURCE".into()],
+            direct_lines: Vec::new(),
         }),
     })
 }
@@ -2116,6 +2233,7 @@ fn excluded_attributions(
     path: &str,
     parent: &[u8],
     committed: &[u8],
+    reason: &str,
     limiting: Option<&str>,
 ) -> Vec<AttributionRange> {
     let lines = derive::derive_lines(
@@ -2144,6 +2262,8 @@ fn excluded_attributions(
                 operation: None,
                 algorithm_profile: "deterministic-v1".into(),
                 score_profile: "score-v1".into(),
+                exclusion_classifier: Some(crate::exclusion::CLASSIFIER_ID.into()),
+                exclusion_reason: Some(reason.into()),
             },
         );
     }
@@ -2152,6 +2272,7 @@ fn excluded_attributions(
 
 fn category_name(label: derive::Label) -> &'static str {
     match label {
+        derive::Label::AiDirect => "ai_direct",
         derive::Label::AiStrong => "ai_strong",
         derive::Label::AiProbable => "ai_probable",
         derive::Label::Mixed => "mixed",
@@ -2184,6 +2305,7 @@ fn score_for_label(
         score -= 80;
     }
     score = match label {
+        derive::Label::AiDirect => score.clamp(980, 1000),
         derive::Label::AiStrong => score.clamp(800, 970),
         derive::Label::AiProbable => score.clamp(500, 790),
         derive::Label::Mixed => score.clamp(0, 1000),
@@ -2222,6 +2344,8 @@ fn push_attribution_range(ranges: &mut Vec<AttributionRange>, next: AttributionR
             && previous.operation == next.operation
             && previous.algorithm_profile == next.algorithm_profile
             && previous.score_profile == next.score_profile
+            && previous.exclusion_classifier == next.exclusion_classifier
+            && previous.exclusion_reason == next.exclusion_reason
         {
             previous.end_line = next.end_line;
             previous.end_line_exclusive = next.end_line_exclusive;
@@ -2240,6 +2364,7 @@ fn skipped_file(
     FileOutput {
         path,
         e: 0,
+        ai_direct: 0,
         ai_strong: 0,
         ai_probable: 0,
         mixed: 0,
@@ -2254,6 +2379,7 @@ fn skipped_file_added(path: String, added_lines: usize, evidence: &'static str) 
     FileOutput {
         path,
         e: 0,
+        ai_direct: 0,
         ai_strong: 0,
         ai_probable: 0,
         mixed: 0,
@@ -2268,6 +2394,7 @@ fn unknown_file(path: String, evidence: &'static str, added: usize) -> FileOutpu
     FileOutput {
         path,
         e: added,
+        ai_direct: 0,
         ai_strong: 0,
         ai_probable: 0,
         mixed: 0,
@@ -2356,6 +2483,9 @@ mod tests {
             tool: Some("codex".into()),
             tool_use_id: Some("tool-1".into()),
             operation: Some("apply_patch".into()),
+            structured_edit: None,
+            line_ranges: None,
+            before_sha: None,
             after_sha,
             degraded: Some(degraded),
             overlap: Some(false),
@@ -2395,21 +2525,21 @@ mod tests {
         let exact_bytes = b"base\nai\n";
         let exact_sha = put_blob(&store, exact_bytes);
         let exact = event(Some(exact_sha.clone()), "ai_change", false, None);
-        let (steps, evidence) = steps_for_events(&store, &[&exact], exact_bytes, 20);
+        let (steps, evidence) = steps_for_events(&store, &[&exact], b"", exact_bytes, 20);
         assert_eq!(evidence, "exact");
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].kind, StepKind::Ai { degraded: false });
 
-        let (steps, evidence) = steps_for_events(&store, &[&exact], b"base\nai\nlate\n", 20);
+        let (steps, evidence) = steps_for_events(&store, &[&exact], b"", b"base\nai\nlate\n", 20);
         assert_eq!(evidence, "time_cut");
         assert_eq!(steps[0].kind, StepKind::Ai { degraded: true });
 
-        let (steps, evidence) = steps_for_events(&store, &[], b"base\n", 20);
+        let (steps, evidence) = steps_for_events(&store, &[], b"", b"base\n", 20);
         assert_eq!(evidence, "none");
         assert!(steps.is_empty());
 
         let missing = event(Some("a".repeat(64)), "ai_change", false, None);
-        let (steps, evidence) = steps_for_events(&store, &[&missing], b"different\n", 20);
+        let (steps, evidence) = steps_for_events(&store, &[&missing], b"", b"different\n", 20);
         assert_eq!(evidence, "missing_blob");
         assert!(steps.is_empty());
 
@@ -2419,7 +2549,7 @@ mod tests {
             true,
             Some("before_unavailable"),
         );
-        let (steps, evidence) = steps_for_events(&store, &[&unavailable], exact_bytes, 20);
+        let (steps, evidence) = steps_for_events(&store, &[&unavailable], b"", exact_bytes, 20);
         assert_eq!(evidence, "exact");
         assert_eq!(steps[0].kind, StepKind::Unknown);
         let _ = fs::remove_dir_all(store);
@@ -2437,6 +2567,7 @@ mod tests {
             penalties_milli: Vec::new(),
             supporting_basis: Vec::new(),
             limiting_basis: Vec::new(),
+            direct_lines: Vec::new(),
         };
         assert_eq!(
             score_for_label(derive::Label::AiStrong, Some(&exact), &[]),

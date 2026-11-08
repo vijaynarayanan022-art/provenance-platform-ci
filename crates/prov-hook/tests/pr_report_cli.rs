@@ -407,6 +407,7 @@ fn prs_file_produces_dashboard_in_input_order() {
             "min_mixed_overlap": 0.5,
             "formula": "strict-v1",
             "eligibility": "non-blank-added-v1",
+            "exclusion_classifier": "exclusion-v1",
             "coverage": "coverage-v1",
         })
     );
