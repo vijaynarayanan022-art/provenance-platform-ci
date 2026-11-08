@@ -622,7 +622,10 @@ fn replay(
                 deleted_count += 1;
                 let old_owner = owners[old_index];
                 deleted_candidates |= old_owner.candidates;
-                if matches!(old_owner.owner, Owner::Ai | Owner::AiWeak | Owner::AiEdited) {
+                if matches!(
+                    old_owner.owner,
+                    Owner::Ai | Owner::Direct | Owner::AiWeak | Owner::AiEdited
+                ) {
                     deleted_ai = true;
                     if let Some(step) = old_owner.source_step {
                         deleted_ai_sources.insert(step);

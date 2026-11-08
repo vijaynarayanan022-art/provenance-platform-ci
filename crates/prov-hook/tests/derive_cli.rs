@@ -505,6 +505,83 @@ fn set_ai_change_field(fixture: &Fixture, field: &str, value: Value) {
     fs::write(event_path, output).unwrap();
 }
 
+fn configure_structured_apply_patch(
+    fixture: &Fixture,
+    path: &str,
+    structured_edit: Option<bool>,
+    overlap: bool,
+    line_ranges: Value,
+) {
+    let event_dir = fixture
+        .home
+        .join("repos")
+        .join(fixture.repo_id())
+        .join("events");
+    for entry in fs::read_dir(event_dir).unwrap().flatten() {
+        let event_path = entry.path();
+        let mut output = Vec::new();
+        for line in fs::read(&event_path).unwrap().split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut event: Value = serde_json::from_slice(line).unwrap();
+            if event["event"] == "ai_change" && event["path"] == path {
+                event["operation"] = if structured_edit == Some(false) {
+                    json!("Bash")
+                } else {
+                    json!("apply_patch")
+                };
+                if let Some(value) = structured_edit {
+                    event["structured_edit"] = json!(value);
+                } else {
+                    event.as_object_mut().unwrap().remove("structured_edit");
+                }
+                event["line_ranges"] = line_ranges.clone();
+                event["overlap"] = json!(overlap);
+                event["degraded"] = json!(false);
+                event["after_incomplete"] = json!(false);
+                event["command_sha256"] = json!("a".repeat(64));
+                event["command_length"] = json!(82);
+                event
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("structured_added_lines");
+                event
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("structured_input_sha256");
+            }
+            serde_json::to_writer(&mut output, &event).unwrap();
+            output.push(b'\n');
+        }
+        fs::write(event_path, output).unwrap();
+    }
+}
+
+fn mark_event_external(fixture: &Fixture, tool_use_id: &str) {
+    let event_dir = fixture
+        .home
+        .join("repos")
+        .join(fixture.repo_id())
+        .join("events");
+    for entry in fs::read_dir(event_dir).unwrap().flatten() {
+        let event_path = entry.path();
+        let mut output = Vec::new();
+        for line in fs::read(&event_path).unwrap().split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut event: Value = serde_json::from_slice(line).unwrap();
+            if event["event"] == "ai_change" && event["tool_use_id"] == tool_use_id {
+                event["event"] = json!("external_change");
+            }
+            serde_json::to_writer(&mut output, &event).unwrap();
+            output.push(b'\n');
+        }
+        fs::write(event_path, output).unwrap();
+    }
+}
+
 fn assert_counts_consistent(value: &Value) {
     for counts in value["files"].as_array().unwrap() {
         assert_eq!(
@@ -1103,6 +1180,177 @@ fn human_edit_after_ai_snapshot_is_mixed() {
     assert_eq!(tracked["mixed"], 1);
     assert_eq!(tracked["evidence"], "exact");
     fixture.drop_root();
+}
+
+#[test]
+fn codex_apply_patch_snapshot_ranges_receive_direct_labels() {
+    let new_file = Fixture::new("direct-new-file");
+    new_file.hook("PreToolUse", "patch-new-file");
+    fs::write(new_file.repo.join("d.py"), b"first line\nsecond line\n").unwrap();
+    new_file.hook("PostToolUse", "patch-new-file");
+    configure_structured_apply_patch(&new_file, "d.py", Some(true), false, json!([[1, 2]]));
+    let commit = new_file.commit("add structured file");
+    assert!(derive(&new_file, &commit).status.success());
+    let report = new_file.derived_value(&commit);
+    assert_eq!(file(&report, "d.py")["ai_direct"], 2);
+    assert_eq!(file(&report, "d.py")["ai_strong"], 0);
+    let sidecar = sidecar_value(&new_file, &commit);
+    let direct = attribution_for(&sidecar, "d.py", "ai_direct");
+    assert_eq!(direct["startLine"], 1);
+    assert_eq!(direct["endLine"], 2);
+    assert_eq!(direct["score"], 0.99);
+    assert_eq!(direct["primaryBasis"], "DIRECT_AGENT_PATCH");
+    assert_eq!(direct["limitingBasis"], json!([]));
+    new_file.drop_root();
+
+    let existing = Fixture::new("direct-existing-file");
+    existing.hook("PreToolUse", "patch-existing-file");
+    fs::write(
+        existing.repo.join("tracked.txt"),
+        b"one\nchanged by patch\n",
+    )
+    .unwrap();
+    existing.hook("PostToolUse", "patch-existing-file");
+    configure_structured_apply_patch(&existing, "tracked.txt", Some(true), false, json!([[2, 2]]));
+    let commit = existing.commit("edit structured file");
+    assert!(derive(&existing, &commit).status.success());
+    let report = existing.derived_value(&commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_direct"], 1);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 0);
+    let sidecar = sidecar_value(&existing, &commit);
+    let lines = sidecar["files"][0]["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["line"], 2);
+    assert_eq!(lines[0]["label"], "d");
+    existing.drop_root();
+}
+
+#[test]
+fn structured_direct_evidence_respects_human_edits_and_limits() {
+    let human_edit = Fixture::new("direct-human-edit");
+    human_edit.hook("PreToolUse", "patch-human-edit");
+    fs::write(human_edit.repo.join("d.py"), b"first line\nsecond line\n").unwrap();
+    human_edit.hook("PostToolUse", "patch-human-edit");
+    configure_structured_apply_patch(&human_edit, "d.py", Some(true), false, json!([[1, 2]]));
+    human_edit.hook("PreToolUse", "human-followup");
+    fs::write(
+        human_edit.repo.join("d.py"),
+        b"human replacement\nsecond line\n",
+    )
+    .unwrap();
+    human_edit.hook("PostToolUse", "human-followup");
+    mark_event_external(&human_edit, "human-followup");
+    let commit = human_edit.commit("human edits one patch line");
+    assert!(derive(&human_edit, &commit).status.success());
+    let sidecar = sidecar_value(&human_edit, &commit);
+    assert_eq!(attribution_for(&sidecar, "d.py", "mixed")["startLine"], 1);
+    assert_eq!(
+        attribution_for(&sidecar, "d.py", "ai_direct")["startLine"],
+        2
+    );
+    human_edit.drop_root();
+
+    let bash = Fixture::new("direct-bash-fallback");
+    bash.hook("PreToolUse", "bash-write");
+    fs::write(bash.repo.join("tracked.txt"), b"one\nbash line\n").unwrap();
+    bash.hook("PostToolUse", "bash-write");
+    configure_structured_apply_patch(&bash, "tracked.txt", Some(false), false, json!([[2, 2]]));
+    let commit = bash.commit("shell write fallback");
+    assert!(derive(&bash, &commit).status.success());
+    assert_eq!(
+        file(&bash.derived_value(&commit), "tracked.txt")["ai_strong"],
+        1
+    );
+    bash.drop_root();
+
+    let mismatch = Fixture::new("direct-range-mismatch");
+    mismatch.hook("PreToolUse", "mismatched-range");
+    fs::write(mismatch.repo.join("tracked.txt"), b"one\nchanged\n").unwrap();
+    mismatch.hook("PostToolUse", "mismatched-range");
+    configure_structured_apply_patch(&mismatch, "tracked.txt", Some(true), false, json!([[1, 1]]));
+    let commit = mismatch.commit("mismatched structured range");
+    assert!(derive(&mismatch, &commit).status.success());
+    assert_eq!(
+        file(&mismatch.derived_value(&commit), "tracked.txt")["ai_strong"],
+        1
+    );
+    mismatch.drop_root();
+
+    let incomplete = Fixture::new("direct-incomplete-evidence");
+    incomplete.hook("PreToolUse", "incomplete-patch");
+    fs::write(
+        incomplete.repo.join("tracked.txt"),
+        b"one\nincomplete evidence\n",
+    )
+    .unwrap();
+    incomplete.hook("PostToolUse", "incomplete-patch");
+    configure_structured_apply_patch(
+        &incomplete,
+        "tracked.txt",
+        Some(true),
+        false,
+        json!([[2, 2]]),
+    );
+    set_ai_change_field(&incomplete, "after_incomplete", json!(true));
+    let commit = incomplete.commit("incomplete structured evidence");
+    assert!(derive(&incomplete, &commit).status.success());
+    let sidecar = sidecar_value(&incomplete, &commit);
+    assert_eq!(sidecar["totals"]["ai_direct"], 0);
+    let strong = attribution_for(&sidecar, "tracked.txt", "ai_strong");
+    assert!(strong["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_DEGRADED")));
+    incomplete.drop_root();
+
+    let overlap = Fixture::new("direct-overlap-cap");
+    overlap.hook("PreToolUse", "overlapping-patch");
+    fs::write(overlap.repo.join("tracked.txt"), b"one\noverlap line\n").unwrap();
+    overlap.hook("PostToolUse", "overlapping-patch");
+    configure_structured_apply_patch(&overlap, "tracked.txt", Some(true), true, json!([[2, 2]]));
+    let commit = overlap.commit("overlap limits direct confidence");
+    assert!(derive(&overlap, &commit).status.success());
+    let sidecar = sidecar_value(&overlap, &commit);
+    let probable = attribution_for(&sidecar, "tracked.txt", "ai_probable");
+    assert!(probable["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_OVERLAPPING_SESSIONS")));
+    assert_eq!(sidecar["totals"]["ai_direct"], 0);
+    overlap.drop_root();
+
+    let legacy = Fixture::new("direct-legacy-event");
+    legacy.hook("PreToolUse", "legacy-event");
+    fs::write(legacy.repo.join("tracked.txt"), b"one\nlegacy line\n").unwrap();
+    legacy.hook("PostToolUse", "legacy-event");
+    configure_structured_apply_patch(&legacy, "tracked.txt", None, false, json!([[2, 2]]));
+    let commit = legacy.commit("legacy event without structured flag");
+    assert!(derive(&legacy, &commit).status.success());
+    assert_eq!(
+        file(&legacy.derived_value(&commit), "tracked.txt")["ai_strong"],
+        1
+    );
+    legacy.drop_root();
+
+    let duplicate = Fixture::new("direct-duplicate-lines");
+    duplicate.hook("PreToolUse", "duplicate-patch");
+    fs::write(duplicate.repo.join("d.py"), b"repeat call\n").unwrap();
+    duplicate.hook("PostToolUse", "duplicate-patch");
+    configure_structured_apply_patch(&duplicate, "d.py", Some(true), false, json!([[1, 1]]));
+    duplicate.hook("PreToolUse", "duplicate-copy");
+    fs::write(duplicate.repo.join("d.py"), b"repeat call\nrepeat call\n").unwrap();
+    duplicate.hook("PostToolUse", "duplicate-copy");
+    mark_event_external(&duplicate, "duplicate-copy");
+    let commit = duplicate.commit("ambiguous duplicate patch lines");
+    assert!(derive(&duplicate, &commit).status.success());
+    let duplicate_sidecar = sidecar_value(&duplicate, &commit);
+    assert_eq!(duplicate_sidecar["totals"]["ai_direct"], 0);
+    assert!(duplicate_sidecar["files"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|line| line["label"] != "d"));
+    duplicate.drop_root();
 }
 
 #[test]

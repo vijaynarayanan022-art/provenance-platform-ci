@@ -212,9 +212,7 @@ struct EventRecord {
     #[serde(default)]
     structured_edit: Option<bool>,
     #[serde(default)]
-    structured_added_lines: Vec<String>,
-    #[serde(default)]
-    structured_input_sha256: Option<String>,
+    line_ranges: Option<Vec<[usize; 2]>>,
     #[serde(default)]
     before_sha: Option<String>,
     #[serde(default)]
@@ -1626,6 +1624,7 @@ fn steps_for_events(
         let direct_lines = if is_ai
             && evidence == "exact"
             && !event.degraded.unwrap_or(false)
+            && !event.after_incomplete.unwrap_or(false)
             && !event.overlap.unwrap_or(false)
             && event.structured_edit == Some(true)
         {
@@ -1687,6 +1686,13 @@ fn verified_structured_lines(event: &EventRecord, before: &[u8], after: &[u8]) -
     if !before_sha_matches || event.after_sha.as_deref() != Some(crate::hash(after).as_str()) {
         return Vec::new();
     }
+    let Some(recorded_ranges) = event.line_ranges.as_ref() else {
+        return Vec::new();
+    };
+    let actual_ranges = crate::changed_line_ranges(before, after);
+    if recorded_ranges != &actual_ranges {
+        return Vec::new();
+    }
     let old = commit_split_lines(&normalize_eol(before));
     let new = commit_split_lines(&normalize_eol(after));
     let added = capture_diff_slices(Algorithm::Myers, &old, &new)
@@ -1694,28 +1700,7 @@ fn verified_structured_lines(event: &EventRecord, before: &[u8], after: &[u8]) -
         .filter(|op| op.tag() != DiffTag::Equal)
         .flat_map(|op| op.new_range().map(|index| new[index].clone()))
         .collect::<Vec<_>>();
-    if event.operation.as_deref() == Some("create_file") {
-        let Some(input_sha256) = event.structured_input_sha256.as_deref() else {
-            return Vec::new();
-        };
-        if crate::hash(&normalize_eol(after)) == input_sha256 {
-            return added;
-        }
-        return Vec::new();
-    }
-    let mut payload = event
-        .structured_added_lines
-        .iter()
-        .map(|line| line.as_bytes().to_vec())
-        .collect::<Vec<_>>();
-    payload.sort();
-    let mut actual = added.clone();
-    actual.sort();
-    if payload == actual {
-        added
-    } else {
-        Vec::new()
-    }
+    added
 }
 
 fn commit_split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -2499,8 +2484,7 @@ mod tests {
             tool_use_id: Some("tool-1".into()),
             operation: Some("apply_patch".into()),
             structured_edit: None,
-            structured_added_lines: Vec::new(),
-            structured_input_sha256: None,
+            line_ranges: None,
             before_sha: None,
             after_sha,
             degraded: Some(degraded),
