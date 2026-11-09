@@ -38,6 +38,10 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => cli_error(error),
         },
+        Some("explain") => match explain_command(args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => cli_error(error),
+        },
         Some("summary") => match summary::command(args) {
             Ok(output) => {
                 println!("{output}");
@@ -281,6 +285,45 @@ fn show_command(args: impl Iterator<Item = String>) -> Result<(), String> {
     } else {
         println!("{}", prov_capture::commit::summary(&bytes)?);
     }
+    Ok(())
+}
+
+fn explain_command(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut repo = std::env::current_dir().map_err(|error| error.to_string())?;
+    let mut commit = None;
+    let mut file = None;
+    let mut line = None;
+    let mut format = "table".to_owned();
+    let mut args = args;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--repo" => repo = PathBuf::from(args.next().ok_or("--repo needs a path")?),
+            "--commit" => commit = Some(args.next().ok_or("--commit needs a revision")?),
+            "--file" => file = Some(args.next().ok_or("--file needs a path")?),
+            "--line" => {
+                let value = args.next().ok_or("--line needs a number")?;
+                line = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "--line must be a positive line number")?,
+                );
+            }
+            "--format" => format = args.next().ok_or("--format needs a value")?,
+            _ => return Err(format!("unknown explain argument: {argument}")),
+        }
+    }
+    if !matches!(format.as_str(), "table" | "json") {
+        return Err("--format must be table or json".into());
+    }
+    let commit = commit.ok_or("explain requires --commit")?;
+    let file = file.ok_or("explain requires --file")?;
+    let value = prov_capture::commit::explain_commit(&repo, &commit, &file, line)?;
+    let output = if format == "json" {
+        serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
+    } else {
+        prov_capture::commit::explain_table(&value)?
+    };
+    println!("{output}");
     Ok(())
 }
 
