@@ -1119,7 +1119,7 @@ fn time_cut_new_file_similarity_replacement_is_mixed_but_new_line_is_unknown() {
     assert_eq!(final_file["ai_strong"], 10);
     assert_eq!(final_file["mixed"], 1);
     assert_eq!(final_file["unknown"], 1);
-    assert_eq!(report["coverage"], "medium");
+    assert_eq!(report["coverage"], "low");
 
     let sidecar = fixture.sidecar_value(&commit);
     let mixed = attribution_at_line(&sidecar, "final.py", 15);

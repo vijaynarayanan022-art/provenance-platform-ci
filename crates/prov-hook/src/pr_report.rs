@@ -12,7 +12,7 @@ const ALGORITHM_VERSION: &str = "derive-v1";
 const LINE_SURVIVAL_VERSION: &str = "unobserved-mixed-v1";
 const FORMULA_VERSION: &str = "strict-v1";
 const ELIGIBILITY_VERSION: &str = "non-blank-added-v1";
-const COVERAGE_VERSION: &str = "coverage-v1";
+const COVERAGE_VERSION: &str = "coverage-v2";
 
 #[derive(Default)]
 struct Options {
@@ -200,6 +200,7 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
             reports = prov_capture::commit::reports_for_commits(repo, &commits)?.reports;
         }
     }
+    let line_sidecars = prov_capture::commit::lines_for_commits(repo, &commits)?;
 
     let mut derived = 0usize;
     let mut files = BTreeMap::<String, FileTotals>::new();
@@ -217,11 +218,15 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
         ("none", 0usize),
     ]);
     let mut covered = 0usize;
+    let mut unobserved_lines = 0usize;
     let mut carried_lines = 0usize;
     let mut metrics_available = true;
     let mut tool_commits = BTreeSet::new();
 
-    for report_bytes in reports.into_iter().flatten() {
+    for ((_commit, report_bytes), sidecar) in commits.iter().zip(reports).zip(line_sidecars) {
+        let Some(report_bytes) = report_bytes else {
+            continue;
+        };
         let report: Value = match serde_json::from_slice::<Value>(&report_bytes) {
             Ok(value) if value["schema"] == "prov.commit/0.1" => value,
             _ => continue,
@@ -253,6 +258,15 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
             continue;
         };
         derived += 1;
+        unobserved_lines += report["coverage_unobserved_lines"]
+            .as_u64()
+            .map(|value| value as usize)
+            .or_else(|| {
+                sidecar
+                    .as_deref()
+                    .map(prov_capture::commit::unobserved_eligible_lines_from_sidecar)
+            })
+            .unwrap_or_default();
         if let Some(commit) = report["commit"].as_str() {
             tool_commits.insert(commit.to_owned());
         }
@@ -379,7 +393,11 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
         None
     };
     let coverage_band = if complete {
-        json!(prov_capture::commit::coverage_band(covered, eligible))
+        json!(prov_capture::commit::coverage_band_with_unobserved(
+            covered,
+            eligible,
+            unobserved_lines,
+        ))
     } else {
         Value::Null
     };
@@ -689,7 +707,7 @@ mod tests {
         assert_eq!(LINE_SURVIVAL_VERSION, "unobserved-mixed-v1");
         assert_eq!(FORMULA_VERSION, "strict-v1");
         assert_eq!(ELIGIBILITY_VERSION, "non-blank-added-v1");
-        assert_eq!(COVERAGE_VERSION, "coverage-v1");
+        assert_eq!(COVERAGE_VERSION, "coverage-v2");
     }
 
     #[test]

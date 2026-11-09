@@ -51,6 +51,8 @@ struct CommitReport {
     parent: Option<String>,
     totals: Totals,
     coverage: String,
+    #[serde(default)]
+    coverage_unobserved_lines: usize,
     files: Vec<ReportFile>,
     patch_id: Option<String>,
     rewrite: RewriteInfo,
@@ -713,7 +715,12 @@ fn recompute_totals(report: &mut CommitReport) {
         totals.ai_direct + totals.ai_strong + totals.ai_probable + totals.mixed,
         totals.e,
     );
-    report.coverage = coverage(covered, totals.e).to_owned();
+    report.coverage = crate::commit::coverage_band_with_unobserved(
+        covered,
+        totals.e,
+        report.coverage_unobserved_lines,
+    )
+    .to_owned();
     report.totals = totals;
 }
 
@@ -724,18 +731,6 @@ fn percentage(numerator: usize, denominator: usize) -> Option<f64> {
         let tenths =
             ((numerator as u128 * 1000 + denominator as u128 / 2) / denominator as u128) as u64;
         Some(tenths as f64 / 10.0)
-    }
-}
-
-fn coverage(covered: usize, total: usize) -> &'static str {
-    if total == 0 || covered == 0 {
-        "none"
-    } else if covered.saturating_mul(3) < total {
-        "low"
-    } else if covered.saturating_mul(3) < total.saturating_mul(2) {
-        "medium"
-    } else {
-        "high"
     }
 }
 
