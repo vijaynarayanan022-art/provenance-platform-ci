@@ -558,6 +558,71 @@ fn configure_structured_apply_patch(
     }
 }
 
+fn write_fixture_apply_patch_event(
+    fixture: &Fixture,
+    path: &str,
+    before: &[u8],
+    after: &[u8],
+    line_ranges: Value,
+) {
+    let repo_id = fixture.repo_id();
+    let event_dir = fixture.home.join("repos").join(&repo_id).join("events");
+    let blobs = fixture.home.join("repos").join(&repo_id).join("blobs");
+    fs::create_dir_all(&blobs).unwrap();
+    let before_sha = format!("{:x}", Sha256::digest(before));
+    let after_sha = format!("{:x}", Sha256::digest(after));
+    fs::write(blobs.join(&after_sha), after).unwrap();
+
+    let mut event: Value = serde_json::from_str(include_str!(
+        "fixtures/real_apply_patch_existing_file/event.jsonl"
+    ))
+    .unwrap();
+    event["repo_id"] = json!(repo_id);
+    event["path"] = json!(path);
+    event["before_sha"] = json!(before_sha);
+    event["after_sha"] = json!(after_sha);
+    event["line_ranges"] = line_ranges;
+    event["timestamp"] = json!(now());
+    event["tool_use_id"] = json!(format!("fixture-{}", now()));
+    event["head"] = json!(git_text(&fixture.repo, &["rev-parse", "HEAD"]));
+    event["overlap"] = json!(false);
+    event["degraded"] = json!(false);
+    event["after_incomplete"] = json!(false);
+    fs::create_dir_all(&event_dir).unwrap();
+    fs::write(
+        event_dir.join("real-apply-patch.jsonl"),
+        format!("{}\n", event),
+    )
+    .unwrap();
+}
+
+fn structured_existing_file_commit(
+    name: &str,
+    path: &str,
+    before: &[u8],
+    after: &[u8],
+    line_ranges: Value,
+) -> (Fixture, String, Value) {
+    let fixture = Fixture::new(name);
+    let file_path = fixture.repo.join(path);
+    fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    fs::write(&file_path, before).unwrap();
+    let _parent = fixture.commit("before structured apply_patch");
+    fixture.hook("PreToolUse", "fixture-apply-patch");
+    fixture.clear_events();
+    fs::write(&file_path, after).unwrap();
+    write_fixture_apply_patch_event(&fixture, path, before, after, line_ranges);
+    let commit = fixture.commit("structured apply_patch");
+    let result = derive(&fixture, &commit);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report = fixture.derived_value(&commit);
+    (fixture, commit, report)
+}
+
 fn mark_event_external(fixture: &Fixture, tool_use_id: &str) {
     let event_dir = fixture
         .home
@@ -1223,6 +1288,78 @@ fn codex_apply_patch_snapshot_ranges_receive_direct_labels() {
     assert_eq!(lines[0]["line"], 2);
     assert_eq!(lines[0]["label"], "d");
     existing.drop_root();
+}
+
+#[test]
+fn real_codex_apply_patch_existing_file_appends_direct_lines() {
+    const PATH: &str = "src/vs/base/common/arrays.ts";
+    let before = include_bytes!("fixtures/real_apply_patch_existing_file/before.bin");
+    let after = include_bytes!("fixtures/real_apply_patch_existing_file/after.bin");
+    let source_event: Value = serde_json::from_str(include_str!(
+        "fixtures/real_apply_patch_existing_file/event.jsonl"
+    ))
+    .unwrap();
+    assert_eq!(
+        source_event["before_sha"],
+        format!("{:x}", Sha256::digest(before))
+    );
+    assert_eq!(
+        source_event["after_sha"],
+        format!("{:x}", Sha256::digest(after))
+    );
+
+    let (fixture, commit, report) = structured_existing_file_commit(
+        "real-direct-existing-append",
+        PATH,
+        before,
+        after,
+        json!([[950, 951]]),
+    );
+    assert_eq!(file(&report, PATH)["ai_direct"], 2);
+    assert_eq!(file(&report, PATH)["ai_strong"], 0);
+    let sidecar = fixture.sidecar_value(&commit);
+    let direct = attribution_for(&sidecar, PATH, "ai_direct");
+    assert_eq!(direct["startLine"], 950);
+    assert_eq!(direct["endLine"], 951);
+    assert_eq!(direct["score"], 0.99);
+    assert_eq!(direct["primaryBasis"], "DIRECT_AGENT_PATCH");
+    fixture.drop_root();
+}
+
+#[test]
+fn codex_apply_patch_middle_insert_in_existing_file_is_direct() {
+    let (fixture, commit, report) = structured_existing_file_commit(
+        "direct-middle-insert",
+        "src/middle.txt",
+        b"alpha\nbeta\ngamma\n",
+        b"alpha\ninserted in the middle\nbeta\ngamma\n",
+        json!([[2, 2]]),
+    );
+    assert_eq!(file(&report, "src/middle.txt")["ai_direct"], 1);
+    assert_eq!(file(&report, "src/middle.txt")["ai_strong"], 0);
+    let sidecar = fixture.sidecar_value(&commit);
+    let direct = attribution_for(&sidecar, "src/middle.txt", "ai_direct");
+    assert_eq!(direct["startLine"], 2);
+    assert_eq!(direct["primaryBasis"], "DIRECT_AGENT_PATCH");
+    fixture.drop_root();
+}
+
+#[test]
+fn codex_apply_patch_replacing_existing_line_is_direct() {
+    let (fixture, commit, report) = structured_existing_file_commit(
+        "direct-line-replacement",
+        "src/replaced.txt",
+        b"alpha\nbeta\n",
+        b"alpha\nreplaced beta line\n",
+        json!([[2, 2]]),
+    );
+    assert_eq!(file(&report, "src/replaced.txt")["ai_direct"], 1);
+    assert_eq!(file(&report, "src/replaced.txt")["ai_strong"], 0);
+    let sidecar = fixture.sidecar_value(&commit);
+    let direct = attribution_for(&sidecar, "src/replaced.txt", "ai_direct");
+    assert_eq!(direct["startLine"], 2);
+    assert_eq!(direct["primaryBasis"], "DIRECT_AGENT_PATCH");
+    fixture.drop_root();
 }
 
 #[test]

@@ -1568,8 +1568,8 @@ fn steps_for_events(
     let mut steps = Vec::with_capacity(selected.len());
     let mut previous_snapshot = parent.to_vec();
     for event in selected {
-        let after = if event.event == "deletion" || event.after_sha.is_none() {
-            Vec::new()
+        let (after_snapshot, after) = if event.event == "deletion" || event.after_sha.is_none() {
+            (Vec::new(), Vec::new())
         } else {
             let sha = event.after_sha.as_deref().unwrap_or_default();
             if !is_sha256(sha) {
@@ -1578,7 +1578,7 @@ fn steps_for_events(
             let Some(bytes) = crate::read_blob(&store.join("blobs").join(sha), sha) else {
                 return (Vec::new(), "missing_blob");
             };
-            normalize_eol(&bytes)
+            (bytes.clone(), normalize_eol(&bytes))
         };
         let kind = match event.event.as_str() {
             "ai_change" => StepKind::Ai {
@@ -1628,7 +1628,7 @@ fn steps_for_events(
             && !event.overlap.unwrap_or(false)
             && event.structured_edit == Some(true)
         {
-            verified_structured_lines(event, &previous_snapshot, &after)
+            verified_structured_lines(event, &previous_snapshot, &after_snapshot, &after)
         } else {
             Vec::new()
         };
@@ -1677,24 +1677,31 @@ fn steps_for_events(
     (steps, evidence)
 }
 
-fn verified_structured_lines(event: &EventRecord, before: &[u8], after: &[u8]) -> Vec<Vec<u8>> {
+fn verified_structured_lines(
+    event: &EventRecord,
+    before: &[u8],
+    after_snapshot: &[u8],
+    normalized_after: &[u8],
+) -> Vec<Vec<u8>> {
     let before_sha_matches = if before.is_empty() {
         event.before_sha.is_none()
     } else {
         event.before_sha.as_deref() == Some(crate::hash(before).as_str())
     };
-    if !before_sha_matches || event.after_sha.as_deref() != Some(crate::hash(after).as_str()) {
+    if !before_sha_matches
+        || event.after_sha.as_deref() != Some(crate::hash(after_snapshot).as_str())
+    {
         return Vec::new();
     }
     let Some(recorded_ranges) = event.line_ranges.as_ref() else {
         return Vec::new();
     };
-    let actual_ranges = crate::changed_line_ranges(before, after);
+    let actual_ranges = crate::changed_line_ranges(before, normalized_after);
     if recorded_ranges != &actual_ranges {
         return Vec::new();
     }
     let old = commit_split_lines(&normalize_eol(before));
-    let new = commit_split_lines(&normalize_eol(after));
+    let new = commit_split_lines(normalized_after);
     let added = capture_diff_slices(Algorithm::Myers, &old, &new)
         .iter()
         .filter(|op| op.tag() != DiffTag::Equal)
