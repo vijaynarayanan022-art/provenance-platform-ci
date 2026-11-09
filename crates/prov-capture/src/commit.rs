@@ -896,6 +896,7 @@ fn derive_resolved_commit(
                     adapter_id: None,
                     tool_id: None,
                     run_id: None,
+                    session_id: None,
                     operation: None,
                     primary_basis: None,
                     score_milli: 600,
@@ -969,6 +970,7 @@ fn derive_resolved_commit(
                         .source
                         .as_ref()
                         .and_then(|source| source.session_ref.clone()),
+                    session_id: None,
                     operation: parent_line.operation,
                     primary_basis: Some("CONFLICTING_EVIDENCE".into()),
                     score_milli,
@@ -2131,6 +2133,7 @@ fn steps_for_events_with_trace(
             adapter_id: event.tool.clone(),
             tool_id: event.tool.clone(),
             run_id: event.tool_use_id.clone(),
+            session_id: event.session_id.clone(),
             operation: event.operation.clone(),
             primary_basis: Some(
                 if !direct_lines.is_empty() {
@@ -2606,6 +2609,7 @@ fn missing_snapshot_time_cut_fallback(
             adapter_id: event.tool.clone(),
             tool_id: event.tool.clone(),
             run_id: event.tool_use_id.clone(),
+            session_id: event.session_id.clone(),
             operation: event.operation.clone(),
             primary_basis: Some("INCOMPLETE_SOURCE".into()),
             score_milli: 920,
@@ -3268,6 +3272,7 @@ mod tests {
             adapter_id: Some("codex".into()),
             tool_id: Some("tool-1".into()),
             run_id: None,
+            session_id: None,
             operation: Some("Bash".into()),
             primary_basis: Some("EXACT_FRAGMENT_MATCH".into()),
             score_milli: 920,
