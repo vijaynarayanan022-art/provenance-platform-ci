@@ -438,6 +438,7 @@ fn summary_range_matches_pr_report_and_expands_full_category_names() {
         "--no-derive",
     ]);
     let report: Value = parsed(&report);
+    assert_eq!(summary["file_ranges"], report["file_ranges"]);
     for field in [
         "eligible",
         "ai_direct",
@@ -527,6 +528,99 @@ fn summary_range_matches_pr_report_and_expands_full_category_names() {
     assert!(table.contains("\tai_strong\t"));
     assert!(table.contains("primaryBasis\tsupportingBasis\tlimitingBasis\tsourceTool\toperation"));
     assert!(!table.contains("\ts\t"));
+    fixture.drop_root();
+}
+
+#[test]
+fn soft_reset_squash_summary_returns_ranges_for_each_committed_file() {
+    let fixture = Fixture::new("soft-reset-squash-ranges");
+    let base = fixture.base();
+    fs::create_dir_all(fixture.repo.join("retest")).unwrap();
+    fs::write(
+        fixture.repo.join("retest/clamp.ts"),
+        "export const clamp = 1;\n",
+    )
+    .unwrap();
+    fixture.commit("first file");
+    fs::write(
+        fixture.repo.join("retest/chunk.ts"),
+        "export const chunk = 2;\n",
+    )
+    .unwrap();
+    fixture.commit("second file");
+    git(&fixture.repo, &["reset", "--soft", &base]);
+    git(&fixture.repo, &["commit", "-m", "squashed files"]);
+    let squash = fixture.base();
+    fixture.derive(&squash);
+
+    let initial = fixture.cli(&[
+        "summary",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &squash,
+        "--format",
+        "json",
+    ]);
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let initial: Value = parsed(&initial);
+    let repo_id = initial["repo_id"].as_str().unwrap();
+    let mut sidecar: Value =
+        serde_json::from_slice(include_bytes!("fixtures/squash_ranges/lines.json")).unwrap();
+    sidecar["commit"] = json!(squash);
+    sidecar["repo_id"] = json!(repo_id);
+    let sidecar_path = fixture
+        .store
+        .join("repos")
+        .join(repo_id)
+        .join("commits")
+        .join(format!("{squash}.lines.json"));
+    fs::write(sidecar_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+
+    // Historical paths may be absent from the current worktree; summary still uses
+    // the selected commit's stored ranges.
+    fs::remove_file(fixture.repo.join("retest/clamp.ts")).unwrap();
+    fs::remove_file(fixture.repo.join("retest/chunk.ts")).unwrap();
+    for file in ["retest/clamp.ts", "retest/chunk.ts"] {
+        let output = fixture.cli(&[
+            "summary",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--commit",
+            &squash,
+            "--file",
+            file,
+            "--format",
+            "json",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: Value = parsed(&output);
+        let ranges = summary["file_ranges"].as_array().unwrap();
+        assert!(!ranges.is_empty(), "expected ranges for {file}");
+        assert!(ranges.iter().all(|range| range["file"] == file));
+    }
+
+    let missing = fixture.cli(&[
+        "summary",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &squash,
+        "--file",
+        "retest/missing.ts",
+        "--format",
+        "json",
+    ]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("not present in the selected commit"));
     fixture.drop_root();
 }
 
@@ -718,7 +812,7 @@ fn summary_marks_missing_reports_and_zero_eligible_percentages() {
         "table",
     ]);
     assert!(table.status.success());
-    assert!(String::from_utf8_lossy(&table.stdout).contains("\tn/a\tn/a\tnone"));
+    assert!(String::from_utf8_lossy(&table.stdout).contains("\tn/a\tn/a\tunknown"));
 
     fs::write(fixture.repo.join("tracked.txt"), "base\nnot derived\n").unwrap();
     let missing_commit = fixture.commit("not derived");

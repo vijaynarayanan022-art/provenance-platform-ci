@@ -967,7 +967,7 @@ fn ai_and_human_commits_are_classified_with_evidence() {
     let tracked = file(&value, "tracked.txt");
     assert_eq!(tracked["unknown"], 1);
     assert_eq!(tracked["evidence"], "none");
-    assert!(matches!(value["coverage"].as_str(), Some("none" | "low")));
+    assert_eq!(value["coverage"], "low");
     human.drop_root();
 }
 
@@ -989,7 +989,7 @@ fn no_event_parent_lineage_fallback_handles_the_s_python_repro() {
     assert_eq!(s_python["mixed"], 1);
     assert_eq!(s_python["unknown"], 1);
     assert_eq!(s_python["ai_strong"], 0);
-    assert_eq!(report["coverage"], "none");
+    assert_eq!(report["coverage"], "low");
 
     let sidecar = fixture.sidecar_value(&child);
     let mixed = attribution_for(&sidecar, "s.py", "mixed");
@@ -1050,7 +1050,7 @@ fn no_event_parent_lineage_fallback_requires_a_similar_removed_ai_line() {
     let report = addition.derived_value(&child);
     assert_eq!(file(&report, "s.py")["unknown"], 1);
     assert_eq!(file(&report, "s.py")["mixed"], 0);
-    assert_eq!(report["coverage"], "none");
+    assert_eq!(report["coverage"], "low");
     addition.drop_root();
 
     let unrelated = Fixture::new("parent-lineage-unrelated-replacement");
@@ -2299,7 +2299,7 @@ fn missing_events_and_missing_snapshot_blobs_are_unknown() {
     assert!(derive(&no_events, &commit).status.success());
     let value = no_events.derived_value(&commit);
     assert_eq!(file(&value, "tracked.txt")["unknown"], 1);
-    assert_eq!(value["coverage"], "none");
+    assert_eq!(value["coverage"], "low");
     no_events.drop_root();
 
     let missing = Fixture::new("missing-blob");

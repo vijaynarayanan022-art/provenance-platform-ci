@@ -12,7 +12,7 @@ const ALGORITHM_VERSION: &str = "derive-v1";
 const LINE_SURVIVAL_VERSION: &str = "unobserved-mixed-v1";
 const FORMULA_VERSION: &str = "strict-v1";
 const ELIGIBILITY_VERSION: &str = "non-blank-added-v1";
-const COVERAGE_VERSION: &str = "coverage-v2";
+const COVERAGE_VERSION: &str = "coverage-v3";
 
 #[derive(Default)]
 struct Options {
@@ -425,6 +425,7 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
         complete,
         observed_tools.as_deref(),
     );
+    let file_ranges = crate::summary::collect_all_file_ranges(repo, &commits)?;
 
     Ok(json!({
         "schema": "prov.pr-report/0.1",
@@ -451,6 +452,7 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
         "tools": tools,
         "carried_lines": complete.then_some(carried_lines),
         "top_files": top_files,
+        "file_ranges": file_ranges,
     }))
 }
 
@@ -707,7 +709,7 @@ mod tests {
         assert_eq!(LINE_SURVIVAL_VERSION, "unobserved-mixed-v1");
         assert_eq!(FORMULA_VERSION, "strict-v1");
         assert_eq!(ELIGIBILITY_VERSION, "non-blank-added-v1");
-        assert_eq!(COVERAGE_VERSION, "coverage-v2");
+        assert_eq!(COVERAGE_VERSION, "coverage-v3");
     }
 
     #[test]
