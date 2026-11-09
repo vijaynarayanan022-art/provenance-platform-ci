@@ -437,6 +437,54 @@ fn derive(fixture: &Fixture, commit: &str) -> Output {
     ])
 }
 
+fn explain_json(fixture: &Fixture, commit: &str, path: &str, line: Option<usize>) -> Value {
+    let mut args = vec![
+        "explain".to_owned(),
+        "--repo".to_owned(),
+        fixture.repo.to_string_lossy().into_owned(),
+        "--commit".to_owned(),
+        commit.to_owned(),
+        "--file".to_owned(),
+        path.to_owned(),
+        "--format".to_owned(),
+        "json".to_owned(),
+    ];
+    if let Some(line) = line {
+        args.push("--line".to_owned());
+        args.push(line.to_string());
+    }
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = fixture.cli(&refs);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn snapshot_store(fixture: &Fixture) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(root: &Path, current: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in fs::read_dir(current).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else {
+                files.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    if fixture.home.exists() {
+        walk(&fixture.home, &fixture.home, &mut files);
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
 fn ai_commit_with_eols(name: &str, autocrlf: &str, content: &[u8]) -> Value {
     let fixture = Fixture::new(name);
     git(&fixture.repo, &["config", "core.autocrlf", autocrlf]);
@@ -505,6 +553,30 @@ fn set_ai_change_field(fixture: &Fixture, field: &str, value: Value) {
     fs::write(event_path, output).unwrap();
 }
 
+fn set_fixture_apply_patch_field(fixture: &Fixture, path: &str, field: &str, value: Value) {
+    let event_dir = fixture
+        .home
+        .join("repos")
+        .join(fixture.repo_id())
+        .join("events");
+    for entry in fs::read_dir(event_dir).unwrap().flatten() {
+        let event_path = entry.path();
+        let mut output = Vec::new();
+        for line in fs::read(&event_path).unwrap().split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut event: Value = serde_json::from_slice(line).unwrap();
+            if event["event"] == "ai_change" && event["path"] == path {
+                event[field] = value.clone();
+            }
+            serde_json::to_writer(&mut output, &event).unwrap();
+            output.push(b'\n');
+        }
+        fs::write(event_path, output).unwrap();
+    }
+}
+
 fn configure_structured_apply_patch(
     fixture: &Fixture,
     path: &str,
@@ -556,6 +628,125 @@ fn configure_structured_apply_patch(
         }
         fs::write(event_path, output).unwrap();
     }
+}
+
+fn write_fixture_apply_patch_event(
+    fixture: &Fixture,
+    path: &str,
+    before: &[u8],
+    after: &[u8],
+    line_ranges: Value,
+) {
+    let repo_id = fixture.repo_id();
+    let event_dir = fixture.home.join("repos").join(&repo_id).join("events");
+    let blobs = fixture.home.join("repos").join(&repo_id).join("blobs");
+    fs::create_dir_all(&blobs).unwrap();
+    let before_sha = format!("{:x}", Sha256::digest(before));
+    let after_sha = format!("{:x}", Sha256::digest(after));
+    fs::write(blobs.join(&before_sha), before).unwrap();
+    fs::write(blobs.join(&after_sha), after).unwrap();
+
+    let mut event: Value = serde_json::from_str(include_str!(
+        "fixtures/real_apply_patch_existing_file/event.jsonl"
+    ))
+    .unwrap();
+    event["repo_id"] = json!(repo_id);
+    event["path"] = json!(path);
+    event["before_sha"] = json!(before_sha);
+    event["after_sha"] = json!(after_sha);
+    event["line_ranges"] = line_ranges;
+    event["timestamp"] = json!(now());
+    event["tool_use_id"] = json!(format!("fixture-{}", now()));
+    event["head"] = json!(git_text(&fixture.repo, &["rev-parse", "HEAD"]));
+    event["overlap"] = json!(false);
+    event["degraded"] = json!(false);
+    event["after_incomplete"] = json!(false);
+    fs::create_dir_all(&event_dir).unwrap();
+    fs::write(
+        event_dir.join("real-apply-patch.jsonl"),
+        format!("{}\n", event),
+    )
+    .unwrap();
+}
+
+#[derive(Default)]
+struct StructuredFixtureOptions<'a> {
+    autocrlf: Option<&'a str>,
+    corrupt_hash: Option<&'a str>,
+    remove_after_blob: bool,
+}
+
+fn structured_existing_file_commit(
+    name: &str,
+    path: &str,
+    before: &[u8],
+    after: &[u8],
+    line_ranges: Value,
+) -> (Fixture, String, Value) {
+    structured_existing_file_commit_with_options(
+        name,
+        path,
+        before,
+        after,
+        line_ranges,
+        StructuredFixtureOptions::default(),
+    )
+}
+
+fn structured_existing_file_commit_with_options(
+    name: &str,
+    path: &str,
+    before: &[u8],
+    after: &[u8],
+    line_ranges: Value,
+    options: StructuredFixtureOptions<'_>,
+) -> (Fixture, String, Value) {
+    let fixture = Fixture::new(name);
+    if let Some(value) = options.autocrlf {
+        git(&fixture.repo, &["config", "core.autocrlf", value]);
+    }
+    let file_path = fixture.repo.join(path);
+    fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    fs::write(&file_path, before).unwrap();
+    let _parent = fixture.commit("before structured apply_patch");
+    fixture.hook("PreToolUse", "fixture-apply-patch");
+    fixture.clear_events();
+    fs::write(&file_path, after).unwrap();
+    write_fixture_apply_patch_event(&fixture, path, before, after, line_ranges);
+    if let Some(field) = options.corrupt_hash {
+        let event_path = fixture
+            .home
+            .join("repos")
+            .join(fixture.repo_id())
+            .join("events")
+            .join("real-apply-patch.jsonl");
+        let mut event: Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
+        let sha = event[field].as_str().unwrap();
+        let replacement = if sha.as_bytes()[0] == b'a' { "b" } else { "a" };
+        event[field] = json!(format!("{replacement}{}", &sha[1..]));
+        fs::write(&event_path, format!("{}\n", event)).unwrap();
+    }
+    if options.remove_after_blob {
+        let after_sha = format!("{:x}", Sha256::digest(after));
+        fs::remove_file(
+            fixture
+                .home
+                .join("repos")
+                .join(fixture.repo_id())
+                .join("blobs")
+                .join(after_sha),
+        )
+        .unwrap();
+    }
+    let commit = fixture.commit("structured apply_patch");
+    let result = derive(&fixture, &commit);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report = fixture.derived_value(&commit);
+    (fixture, commit, report)
 }
 
 fn mark_event_external(fixture: &Fixture, tool_use_id: &str) {
@@ -1223,6 +1414,250 @@ fn codex_apply_patch_snapshot_ranges_receive_direct_labels() {
     assert_eq!(lines[0]["line"], 2);
     assert_eq!(lines[0]["label"], "d");
     existing.drop_root();
+}
+
+#[test]
+fn real_codex_apply_patch_existing_file_appends_direct_lines() {
+    const PATH: &str = "src/vs/base/common/arrays.ts";
+    let before = include_bytes!("fixtures/real_apply_patch_existing_file/before.bin");
+    let after = include_bytes!("fixtures/real_apply_patch_existing_file/after.bin");
+    let source_event: Value = serde_json::from_str(include_str!(
+        "fixtures/real_apply_patch_existing_file/event.jsonl"
+    ))
+    .unwrap();
+    assert_eq!(
+        source_event["before_sha"],
+        format!("{:x}", Sha256::digest(before))
+    );
+    assert_eq!(
+        source_event["after_sha"],
+        format!("{:x}", Sha256::digest(after))
+    );
+
+    let (fixture, commit, report) = structured_existing_file_commit(
+        "real-direct-existing-append",
+        PATH,
+        before,
+        after,
+        json!([[950, 951]]),
+    );
+    assert_eq!(file(&report, PATH)["ai_direct"], 2);
+    assert_eq!(file(&report, PATH)["ai_strong"], 0);
+    let sidecar = fixture.sidecar_value(&commit);
+    let direct = attribution_for(&sidecar, PATH, "ai_direct");
+    assert_eq!(direct["startLine"], 950);
+    assert_eq!(direct["endLine"], 951);
+    assert_eq!(direct["score"], 0.99);
+    assert_eq!(direct["primaryBasis"], "DIRECT_AGENT_PATCH");
+    fixture.drop_root();
+}
+
+#[test]
+fn structured_apply_patch_hashes_support_lf_crlf_and_mixed_line_endings() {
+    let cases = [
+        (
+            "crlf-before-after",
+            b"one\r\nbefore\r\n".as_slice(),
+            b"one\r\nafter\r\n".as_slice(),
+            "true",
+        ),
+        (
+            "lf-before-after",
+            b"one\nbefore\n".as_slice(),
+            b"one\nafter\n".as_slice(),
+            "false",
+        ),
+        (
+            "mixed-before-after",
+            b"one\r\nbefore\r\n".as_slice(),
+            b"one\nafter\n".as_slice(),
+            "true",
+        ),
+    ];
+    for (name, before, after, autocrlf) in cases {
+        let (fixture, _commit, report) = structured_existing_file_commit_with_options(
+            name,
+            "src/eol.txt",
+            before,
+            after,
+            json!([[2, 2]]),
+            StructuredFixtureOptions {
+                autocrlf: Some(autocrlf),
+                ..StructuredFixtureOptions::default()
+            },
+        );
+        assert_eq!(file(&report, "src/eol.txt")["ai_direct"], 1, "{name}");
+        assert_eq!(file(&report, "src/eol.txt")["ai_strong"], 0, "{name}");
+        fixture.drop_root();
+    }
+
+    let (mismatch, commit, report) = structured_existing_file_commit_with_options(
+        "crlf-before-hash-mismatch",
+        "src/eol.txt",
+        b"one\r\nbefore\r\n",
+        b"one\r\nafter\r\n",
+        json!([[2, 2]]),
+        StructuredFixtureOptions {
+            autocrlf: Some("true"),
+            corrupt_hash: Some("before_sha"),
+            ..StructuredFixtureOptions::default()
+        },
+    );
+    assert_eq!(file(&report, "src/eol.txt")["ai_direct"], 0);
+    assert_eq!(file(&report, "src/eol.txt")["ai_strong"], 1);
+    assert_eq!(mismatch.sidecar_value(&commit)["totals"]["ai_probable"], 0);
+    mismatch.drop_root();
+
+    let (missing, _commit, report) = structured_existing_file_commit_with_options(
+        "crlf-missing-after-blob",
+        "src/eol.txt",
+        b"one\r\nbefore\r\n",
+        b"one\r\nafter\r\n",
+        json!([[2, 2]]),
+        StructuredFixtureOptions {
+            autocrlf: Some("false"),
+            remove_after_blob: true,
+            ..StructuredFixtureOptions::default()
+        },
+    );
+    assert_eq!(file(&report, "src/eol.txt")["ai_direct"], 0);
+    assert_eq!(file(&report, "src/eol.txt")["unknown"], 1);
+    assert_eq!(file(&report, "src/eol.txt")["ai_probable"], 0);
+    missing.drop_root();
+}
+
+#[test]
+fn codex_apply_patch_middle_insert_in_existing_file_is_direct() {
+    let (fixture, commit, report) = structured_existing_file_commit(
+        "direct-middle-insert",
+        "src/middle.txt",
+        b"alpha\nbeta\ngamma\n",
+        b"alpha\ninserted in the middle\nbeta\ngamma\n",
+        json!([[2, 2]]),
+    );
+    assert_eq!(file(&report, "src/middle.txt")["ai_direct"], 1);
+    assert_eq!(file(&report, "src/middle.txt")["ai_strong"], 0);
+    let sidecar = fixture.sidecar_value(&commit);
+    let direct = attribution_for(&sidecar, "src/middle.txt", "ai_direct");
+    assert_eq!(direct["startLine"], 2);
+    assert_eq!(direct["primaryBasis"], "DIRECT_AGENT_PATCH");
+    fixture.drop_root();
+}
+
+#[test]
+fn codex_apply_patch_replacing_existing_line_is_direct() {
+    let (fixture, commit, report) = structured_existing_file_commit(
+        "direct-line-replacement",
+        "src/replaced.txt",
+        b"alpha\nbeta\n",
+        b"alpha\nreplaced beta line\n",
+        json!([[2, 2]]),
+    );
+    assert_eq!(file(&report, "src/replaced.txt")["ai_direct"], 1);
+    assert_eq!(file(&report, "src/replaced.txt")["ai_strong"], 0);
+    let sidecar = fixture.sidecar_value(&commit);
+    let direct = attribution_for(&sidecar, "src/replaced.txt", "ai_direct");
+    assert_eq!(direct["startLine"], 2);
+    assert_eq!(direct["primaryBasis"], "DIRECT_AGENT_PATCH");
+    fixture.drop_root();
+}
+
+#[test]
+fn explain_reports_direct_shell_mixed_unknown_and_excluded_decisions_read_only() {
+    let (direct, commit, _) = structured_existing_file_commit(
+        "explain-direct",
+        "src/direct.txt",
+        b"before\n",
+        b"direct line\n",
+        json!([[1, 1]]),
+    );
+    let before_store = snapshot_store(&direct);
+    let direct_result = explain_json(&direct, &commit, "src/direct.txt", Some(1));
+    assert_eq!(direct_result["lines"][0]["category"], "ai_direct");
+    assert_eq!(direct_result["lines"][0]["score"], 0.99);
+    assert_eq!(
+        direct_result["lines"][0]["firstFailedCondition"],
+        Value::Null
+    );
+    assert!(direct_result["lines"][0]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["condition"] == "before_sha" && check["passed"] == true));
+    let table = direct.cli(&[
+        "explain",
+        "--repo",
+        direct.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+        "--file",
+        "src/direct.txt",
+        "--line",
+        "1",
+    ]);
+    assert!(table.status.success());
+    assert!(String::from_utf8_lossy(&table.stdout).contains("ai_direct"));
+    assert_eq!(snapshot_store(&direct), before_store);
+    direct.drop_root();
+
+    let (shell, shell_commit, _) = structured_existing_file_commit(
+        "explain-shell",
+        "src/shell.txt",
+        b"before\n",
+        b"shell line\n",
+        json!([[1, 1]]),
+    );
+    set_fixture_apply_patch_field(&shell, "src/shell.txt", "operation", json!("Bash"));
+    set_fixture_apply_patch_field(&shell, "src/shell.txt", "structured_edit", json!(false));
+    assert!(derive(&shell, &shell_commit).status.success());
+    let shell_result = explain_json(&shell, &shell_commit, "src/shell.txt", None);
+    assert_eq!(shell_result["lines"][0]["category"], "ai_strong");
+    assert_eq!(
+        shell_result["lines"][0]["firstFailedCondition"],
+        "structured_edit"
+    );
+    shell.drop_root();
+
+    let mixed = Fixture::new("explain-mixed");
+    fs::write(mixed.repo.join("tracked.txt"), b"before\noriginal\n").unwrap();
+    let _parent = mixed.commit("mixed parent");
+    mixed.hook("PreToolUse", "explain-ai");
+    fs::write(mixed.repo.join("tracked.txt"), b"before\nai edit line\n").unwrap();
+    mixed.hook("PostToolUse", "explain-ai");
+    configure_structured_apply_patch(&mixed, "tracked.txt", Some(true), false, json!([[2, 2]]));
+    mixed.hook("PreToolUse", "explain-human");
+    fs::write(mixed.repo.join("tracked.txt"), b"before\nhuman edit line\n").unwrap();
+    mixed.hook("PostToolUse", "explain-human");
+    mark_event_external(&mixed, "explain-human");
+    let mixed_commit = mixed.commit("mixed final");
+    assert!(derive(&mixed, &mixed_commit).status.success());
+    let mixed_result = explain_json(&mixed, &mixed_commit, "tracked.txt", None);
+    assert_eq!(mixed_result["lines"][0]["category"], "mixed");
+    mixed.drop_root();
+
+    let unknown = Fixture::new("explain-unknown");
+    fs::write(unknown.repo.join("unknown.txt"), b"unobserved line\n").unwrap();
+    let unknown_commit = unknown.commit("unknown addition");
+    assert!(derive(&unknown, &unknown_commit).status.success());
+    let unknown_result = explain_json(&unknown, &unknown_commit, "unknown.txt", None);
+    assert_eq!(unknown_result["lines"][0]["category"], "unknown");
+    unknown.drop_root();
+
+    let excluded = Fixture::new("explain-excluded");
+    fs::write(
+        excluded.repo.join("package-lock.json"),
+        b"{\"lockfileVersion\":3}\n",
+    )
+    .unwrap();
+    let excluded_commit = excluded.commit("excluded lockfile");
+    assert!(derive(&excluded, &excluded_commit).status.success());
+    let excluded_result = explain_json(&excluded, &excluded_commit, "package-lock.json", None);
+    assert_eq!(excluded_result["lines"][0]["category"], "excluded");
+    assert_eq!(
+        excluded_result["lines"][0]["firstFailedCondition"],
+        "exclusion_rules"
+    );
+    excluded.drop_root();
 }
 
 #[test]

@@ -237,6 +237,39 @@ struct EventRecord {
     order: usize,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExplainCheck {
+    condition: String,
+    passed: bool,
+    compared: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExplainLine {
+    line: usize,
+    category: String,
+    score: Option<f64>,
+    checks: Vec<ExplainCheck>,
+    first_failed_condition: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExplainReport {
+    commit: String,
+    file: String,
+    lines: Vec<ExplainLine>,
+}
+
+struct EventDecisionTrace {
+    event: String,
+    tool_use_id: Option<String>,
+    operation: Option<String>,
+    checks: Vec<ExplainCheck>,
+}
+
 pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String> {
     let (repo, repo_id, store) = repo_context(repo_path)?;
     let events = read_events(&store.join("events"));
@@ -818,14 +851,17 @@ fn derive_resolved_commit(
         let (mut steps, mut evidence) = steps_for_events(
             store,
             &selected_events,
-            &normalized_parent,
+            &parent_content,
             &normalized_committed,
             commit_time,
         );
         if evidence == "missing_blob" {
-            if let Some(fallback) =
-                missing_snapshot_time_cut_fallback(store, &selected_events, &normalized_committed)
-            {
+            if let Some(fallback) = missing_snapshot_time_cut_fallback(
+                store,
+                &selected_events,
+                &committed_content,
+                &normalized_committed,
+            ) {
                 steps = vec![fallback];
                 evidence = "time_cut";
             } else {
@@ -1259,6 +1295,312 @@ pub fn show_commit(repo_path: &Path, revision: &str) -> Result<Vec<u8>, String> 
         .map_err(|_| format!("commit {commit} has not been derived"))
 }
 
+/// Explain attribution for a committed file without writing to the provenance store.
+pub fn explain_commit(
+    repo_path: &Path,
+    revision: &str,
+    file_path: &str,
+    line_filter: Option<usize>,
+) -> Result<serde_json::Value, String> {
+    let (root, _repo_id, store) = read_only_repo_context(repo_path)?;
+    let commit = resolve_commit(&root, revision)?;
+    let parent_line = git_checked(&root, &["rev-list", "--parents", "-n", "1", &commit])?;
+    let commits: Vec<_> = parent_line.split_whitespace().collect();
+    if commits.first() != Some(&commit.as_str()) || commits.len() > 2 {
+        return Err("explain requires a non-merge commit".into());
+    }
+    let parent = commits.get(1).copied();
+    let (files, has_changes) = commit_files(&root, parent, &commit)?;
+    if !has_changes {
+        return Err("commit has no changed files".into());
+    }
+    let path = file_path.replace('\\', "/");
+    let file = files
+        .into_iter()
+        .find(|candidate| candidate.path == path)
+        .ok_or_else(|| format!("file {path} is not changed by commit {commit}"))?;
+    let mut blob_ids = vec![file.new_blob.clone()];
+    if let Some(old) = &file.old_blob {
+        blob_ids.push(old.clone());
+    }
+    let sizes = crate::check_blob_sizes(&root, &blob_ids).ok_or("could not read Git blob sizes")?;
+    if sizes.values().any(|size| *size > MAX_FILE) {
+        return Err("cannot explain a file larger than the attribution limit".into());
+    }
+    let contents = crate::cat_blobs(&root, &blob_ids).ok_or("could not read Git blobs")?;
+    let parent_content = match &file.old_blob {
+        Some(old) => contents
+            .get(old)
+            .cloned()
+            .ok_or("could not read parent file content")?,
+        None => Vec::new(),
+    };
+    let committed_content = contents
+        .get(&file.new_blob)
+        .cloned()
+        .ok_or("could not read committed file content")?;
+
+    let path_exclusion = crate::exclusion::classify_path(&path);
+    let path_restricted =
+        path_exclusion.is_some_and(|exclusion| exclusion.reason_code != "BINARY_FILE");
+    let binary_content = parent_content[..parent_content.len().min(8192)].contains(&0)
+        || committed_content[..committed_content.len().min(8192)].contains(&0);
+    let content_exclusion = if path_restricted {
+        None
+    } else if binary_content {
+        crate::exclusion::classify_content(&committed_content)
+            .or_else(|| crate::exclusion::classify_content(&parent_content))
+    } else {
+        crate::exclusion::classify_content(&committed_content)
+    };
+    let exclusion = if path_restricted {
+        path_exclusion
+    } else {
+        content_exclusion
+            .or_else(|| path_exclusion.filter(|exclusion| exclusion.reason_code == "BINARY_FILE"))
+    };
+    let normalized_parent = normalize_eol(&parent_content);
+    let normalized_committed = normalize_eol(&committed_content);
+    if let Some(exclusion) = exclusion {
+        let attributions = excluded_attributions(
+            &path,
+            &parent_content,
+            &committed_content,
+            exclusion.reason_code,
+            exclusion.limiting_basis,
+        );
+        let lines = attributions
+            .iter()
+            .flat_map(|range| range.start_line..=range.end_line)
+            .filter(|line| line_filter.is_none_or(|wanted| wanted == *line))
+            .map(|line| ExplainLine {
+                line,
+                category: "excluded".into(),
+                score: None,
+                checks: vec![explain_check(
+                    "exclusion_rules",
+                    false,
+                    format!("excluded: {}", exclusion.reason_code),
+                )],
+                first_failed_condition: Some("exclusion_rules".into()),
+            })
+            .collect();
+        return serde_json::to_value(ExplainReport {
+            commit,
+            file: path,
+            lines,
+        })
+        .map_err(|error| error.to_string());
+    }
+
+    let parent_time = parent
+        .map(|value| committer_time_ns(&root, value))
+        .transpose()?
+        .unwrap_or(0);
+    let commit_time = committer_time_ns(&root, &commit)?;
+    let events = read_events(&store.join("events"));
+    let event_index = index_events(&events);
+    let selected_events = events_for_path(
+        &store,
+        &events,
+        &event_index,
+        &path,
+        parent_time,
+        &normalized_parent,
+    );
+    let (mut steps, mut evidence, event_traces) = steps_for_events_with_trace(
+        &store,
+        &selected_events,
+        &parent_content,
+        &normalized_committed,
+        commit_time,
+    );
+    if evidence == "missing_blob" {
+        if let Some(fallback) = missing_snapshot_time_cut_fallback(
+            &store,
+            &selected_events,
+            &committed_content,
+            &normalized_committed,
+        ) {
+            steps = vec![fallback];
+            evidence = "time_cut";
+        } else {
+            return Err(
+                "snapshot evidence is missing; derivation would mark this file unknown".into(),
+            );
+        }
+    }
+    let survival_steps = if evidence == "time_cut" {
+        prepare_unobserved_survival_steps(&steps)
+    } else {
+        None
+    };
+    let evidence_input = Evidence {
+        parent: normalized_parent,
+        steps: survival_steps.unwrap_or(steps),
+    };
+    let attributed_lines = if evidence == "time_cut" {
+        derive::derive_lines_with_unobserved_edits(&evidence_input, &normalized_committed)
+    } else {
+        derive::derive_lines_with_attribution(&evidence_input, &normalized_committed)
+    };
+    let ranges = attribution_ranges(&path, &attributed_lines, &evidence_input.steps);
+    let stored_ranges = fs::read(store.join("commits").join(format!("{commit}.lines.json")))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("attributions")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default();
+    let report_lines = attributed_lines
+        .iter()
+        .filter(|attributed| attributed.line.added && !attributed.line.blank)
+        .filter(|attributed| line_filter.is_none_or(|wanted| wanted == attributed.line.line))
+        .map(|attributed| {
+            let stored_range = stored_ranges.iter().find(|range| {
+                range["path"] == path
+                    && range["startLine"]
+                        .as_u64()
+                        .is_some_and(|start| start as usize <= attributed.line.line)
+                    && range["endLine"]
+                        .as_u64()
+                        .is_some_and(|end| attributed.line.line <= end as usize)
+            });
+            let range = ranges.iter().find(|range| {
+                range.start_line <= attributed.line.line && attributed.line.line <= range.end_line
+            });
+            let category = stored_range
+                .and_then(|range| range["category"].as_str())
+                .map(str::to_owned)
+                .or_else(|| range.map(|range| range.category.clone()))
+                .unwrap_or_else(|| category_name(attributed.line.label).to_owned());
+            let score = stored_range
+                .and_then(|range| range["score"].as_f64())
+                .or_else(|| range.and_then(|range| range.score));
+            let source_trace = attributed
+                .source_step
+                .and_then(|index| event_traces.get(index));
+            let mut checks = source_trace
+                .map(|trace| {
+                    let mut checks = trace.checks.clone();
+                    checks.push(explain_check(
+                        "source_event",
+                        true,
+                        format!(
+                            "event={}; tool_use_id={:?}; operation={:?}",
+                            trace.event, trace.tool_use_id, trace.operation
+                        ),
+                    ));
+                    checks
+                })
+                .unwrap_or_else(no_event_checks);
+            checks.push(explain_check(
+                "survival",
+                attributed.line.label != derive::Label::Unknown && attributed.source_step.is_some(),
+                format!(
+                    "source_step={:?}; final_category={category}",
+                    attributed.source_step
+                ),
+            ));
+            checks.push(explain_check(
+                "duplicate_ambiguity",
+                !attributed.ambiguous,
+                format!("ambiguous={}", attributed.ambiguous),
+            ));
+            checks.push(explain_check(
+                "unobserved_edit_in_file",
+                attributed.unobserved_edit.is_none(),
+                format!("unobserved_edit={:?}", attributed.unobserved_edit),
+            ));
+            checks.push(explain_check(
+                "exclusion_rules",
+                true,
+                "file passed path and content exclusion checks".into(),
+            ));
+            let first_failed_condition = checks
+                .iter()
+                .find(|check| !check.passed)
+                .map(|check| check.condition.clone());
+            ExplainLine {
+                line: attributed.line.line,
+                category,
+                score,
+                checks,
+                first_failed_condition,
+            }
+        })
+        .collect();
+    serde_json::to_value(ExplainReport {
+        commit,
+        file: path,
+        lines: report_lines,
+    })
+    .map_err(|error| error.to_string())
+}
+
+pub fn explain_table(value: &serde_json::Value) -> Result<String, String> {
+    let commit = value["commit"]
+        .as_str()
+        .ok_or("missing commit in explain result")?;
+    let file = value["file"]
+        .as_str()
+        .ok_or("missing file in explain result")?;
+    let lines = value["lines"]
+        .as_array()
+        .ok_or("missing lines in explain result")?;
+    let mut output =
+        format!("Commit {commit}  File {file}\nLINE  CATEGORY      SCORE  FIRST FAILED\n");
+    for line in lines {
+        let number = line["line"].as_u64().unwrap_or_default();
+        let category = line["category"].as_str().unwrap_or("unknown");
+        let score = line["score"]
+            .as_f64()
+            .map(|score| format!("{score:.2}"))
+            .unwrap_or_else(|| "—".into());
+        let first_failed = line["firstFailedCondition"].as_str().unwrap_or("—");
+        output.push_str(&format!(
+            "{number:<5} {category:<13} {score:<6} {first_failed}\n"
+        ));
+        if let Some(checks) = line["checks"].as_array() {
+            for check in checks {
+                let status = if check["passed"] == true {
+                    "PASS"
+                } else {
+                    "FAIL"
+                };
+                output.push_str(&format!(
+                    "      {status:<4} {}: {}\n",
+                    check["condition"].as_str().unwrap_or("condition"),
+                    check["compared"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn no_event_checks() -> Vec<ExplainCheck> {
+    [
+        "structured_edit",
+        "before_sha",
+        "after_sha",
+        "line_ranges",
+        "overlap",
+        "degraded",
+        "after_incomplete",
+        "evidence_exactness",
+    ]
+    .into_iter()
+    .map(|condition| {
+        let passed = matches!(condition, "overlap" | "degraded" | "after_incomplete");
+        explain_check(condition, passed, "no matching event".into())
+    })
+    .collect()
+}
+
 pub fn summary(bytes: &[u8]) -> Result<String, String> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
@@ -1287,6 +1629,21 @@ fn repo_context(path: &Path) -> Result<(crate::RepoInfo, String, PathBuf), Strin
         .ok_or("repository identity unavailable")?;
     let store = home.join("repos").join(&repo_id);
     Ok((repo, repo_id, store))
+}
+
+fn read_only_repo_context(path: &Path) -> Result<(PathBuf, String, PathBuf), String> {
+    let home = crate::store_home().ok_or("could not determine store directory")?;
+    let (root, _, _) = crate::find_git_dirs(path).ok_or("not a supported Git repository")?;
+    if crate::normalized_path(&home).starts_with(crate::normalized_path(&root)) {
+        return Err("the provenance store must be outside the repository".into());
+    }
+    let roots = roots_check(&root)?;
+    if roots.is_empty() {
+        return Err("repository identity unavailable".into());
+    }
+    let repo_id = crate::hash(roots.as_bytes());
+    let store = home.join("repos").join(&repo_id);
+    Ok((root, repo_id, store))
 }
 
 fn roots_check(root: &Path) -> Result<String, String> {
@@ -1535,8 +1892,20 @@ fn steps_for_events(
     committed: &[u8],
     commit_time: u128,
 ) -> (Vec<Step>, &'static str) {
+    let (steps, evidence, _) =
+        steps_for_events_with_trace(store, events, parent, committed, commit_time);
+    (steps, evidence)
+}
+
+fn steps_for_events_with_trace(
+    store: &Path,
+    events: &[&EventRecord],
+    parent: &[u8],
+    committed: &[u8],
+    commit_time: u128,
+) -> (Vec<Step>, &'static str, Vec<EventDecisionTrace>) {
     if events.is_empty() {
-        return (Vec::new(), "none");
+        return (Vec::new(), "none", Vec::new());
     }
     let exact_end = events
         .iter()
@@ -1560,25 +1929,60 @@ fn steps_for_events(
             .filter(|event| event.timestamp <= end_time)
             .collect();
         if filtered.is_empty() {
-            return (Vec::new(), "none");
+            return (Vec::new(), "none", Vec::new());
         }
         (filtered, "time_cut")
     };
+    let evidence_comparison = exact_end.map_or_else(
+        || "no stored after snapshot normalized to the committed bytes".to_owned(),
+        |end| {
+            let event = events[end];
+            let raw = event
+                .after_sha
+                .as_deref()
+                .and_then(|sha| crate::read_blob(&store.join("blobs").join(sha), sha));
+            format!(
+                "matching_event_index={end}; event_after_sha={:?}; normalized_snapshot_sha={:?}; normalized_committed_sha={}; snapshot_matches_committed={}",
+                event.after_sha,
+                raw.as_ref().map(|bytes| crate::hash(&normalize_eol(bytes))),
+                crate::hash(committed),
+                raw.as_ref().is_some_and(|bytes| normalize_eol(bytes) == committed)
+            )
+        },
+    );
 
     let mut steps = Vec::with_capacity(selected.len());
-    let mut previous_snapshot = parent.to_vec();
+    let mut decision_traces = Vec::with_capacity(selected.len());
+    let mut previous_snapshot = normalize_eol(parent);
+    let mut previous_snapshot_raw = parent.to_vec();
     for event in selected {
-        let after = if event.event == "deletion" || event.after_sha.is_none() {
-            Vec::new()
+        let (after_snapshot, after) = if event.event == "deletion" || event.after_sha.is_none() {
+            (Vec::new(), Vec::new())
         } else {
             let sha = event.after_sha.as_deref().unwrap_or_default();
             if !is_sha256(sha) {
-                return (Vec::new(), "missing_blob");
+                decision_traces.push(missing_snapshot_trace(
+                    store,
+                    event,
+                    &previous_snapshot_raw,
+                    &previous_snapshot,
+                    evidence,
+                    "invalid after_sha format",
+                ));
+                return (Vec::new(), "missing_blob", decision_traces);
             }
             let Some(bytes) = crate::read_blob(&store.join("blobs").join(sha), sha) else {
-                return (Vec::new(), "missing_blob");
+                decision_traces.push(missing_snapshot_trace(
+                    store,
+                    event,
+                    &previous_snapshot_raw,
+                    &previous_snapshot,
+                    evidence,
+                    "after snapshot blob is unavailable or fails its raw content hash",
+                ));
+                return (Vec::new(), "missing_blob", decision_traces);
             };
-            normalize_eol(&bytes)
+            (bytes.clone(), normalize_eol(&bytes))
         };
         let kind = match event.event.as_str() {
             "ai_change" => StepKind::Ai {
@@ -1621,17 +2025,37 @@ fn steps_for_events(
             penalties_milli.push(80);
         }
         let is_ai = matches!(kind, StepKind::Ai { .. });
-        let direct_lines = if is_ai
-            && evidence == "exact"
-            && !event.degraded.unwrap_or(false)
-            && !event.after_incomplete.unwrap_or(false)
-            && !event.overlap.unwrap_or(false)
-            && event.structured_edit == Some(true)
-        {
-            verified_structured_lines(event, &previous_snapshot, &after)
+        let before_snapshot = event
+            .before_sha
+            .as_deref()
+            .and_then(|sha| crate::read_blob(&store.join("blobs").join(sha), sha))
+            .filter(|raw| normalize_eol(raw) == previous_snapshot)
+            .or_else(|| {
+                (normalize_eol(&previous_snapshot_raw) == previous_snapshot)
+                    .then(|| previous_snapshot_raw.clone())
+            })
+            .or_else(|| {
+                (event.before_sha.is_none() && previous_snapshot.is_empty()).then(Vec::new)
+            });
+        let (direct_lines, checks) = if is_ai {
+            verified_structured_lines(
+                event,
+                before_snapshot.as_deref(),
+                &previous_snapshot,
+                &after_snapshot,
+                &after,
+                evidence == "exact",
+                &evidence_comparison,
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        decision_traces.push(EventDecisionTrace {
+            event: event.event.clone(),
+            tool_use_id: event.tool_use_id.clone(),
+            operation: event.operation.clone(),
+            checks,
+        });
         let attribution = Some(derive::StepAttribution {
             adapter_id: event.tool.clone(),
             tool_id: event.tool.clone(),
@@ -1673,34 +2097,207 @@ fn steps_for_events(
             attribution,
         });
         previous_snapshot = after;
+        previous_snapshot_raw = after_snapshot;
     }
-    (steps, evidence)
+    (steps, evidence, decision_traces)
 }
 
-fn verified_structured_lines(event: &EventRecord, before: &[u8], after: &[u8]) -> Vec<Vec<u8>> {
-    let before_sha_matches = if before.is_empty() {
-        event.before_sha.is_none()
-    } else {
-        event.before_sha.as_deref() == Some(crate::hash(before).as_str())
+fn verified_structured_lines(
+    event: &EventRecord,
+    raw_before: Option<&[u8]>,
+    normalized_before: &[u8],
+    after_snapshot: &[u8],
+    normalized_after: &[u8],
+    evidence_exact: bool,
+    evidence_comparison: &str,
+) -> (Vec<Vec<u8>>, Vec<ExplainCheck>) {
+    let before_actual = raw_before.map(crate::hash);
+    let before_sha_matches = match (event.before_sha.as_deref(), before_actual.as_deref()) {
+        (None, Some(actual)) => normalized_before.is_empty() && actual == crate::hash(&[]),
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => false,
     };
-    if !before_sha_matches || event.after_sha.as_deref() != Some(crate::hash(after).as_str()) {
-        return Vec::new();
+    let after_actual = crate::hash(after_snapshot);
+    let after_sha_matches = event.after_sha.as_deref() == Some(after_actual.as_str());
+    let actual_ranges = crate::changed_line_ranges(normalized_before, normalized_after);
+    let recorded_ranges = event.line_ranges.as_ref();
+    let ranges_match = recorded_ranges == Some(&actual_ranges);
+    let checks = vec![
+        explain_check(
+            "structured_edit",
+            event.structured_edit == Some(true),
+            format!("recorded={:?}; required=true", event.structured_edit),
+        ),
+        explain_check(
+            "before_sha",
+            before_sha_matches
+                && raw_before.is_some_and(|bytes| normalize_eol(bytes) == normalized_before),
+            format!(
+                "raw_before_sha={:?}; computed_raw_sha={:?}; raw_snapshot_normalizes_to_previous={}; bytes={}",
+                event.before_sha,
+                before_actual,
+                raw_before.is_some_and(|bytes| normalize_eol(bytes) == normalized_before),
+                if raw_before.is_some() {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+            ),
+        ),
+        explain_check(
+            "after_sha",
+            after_sha_matches,
+            format!(
+                "raw_after_sha={:?}; computed_raw_sha={}; normalized_after_sha={}",
+                event.after_sha,
+                after_actual,
+                crate::hash(normalized_after)
+            ),
+        ),
+        explain_check(
+            "line_ranges",
+            ranges_match,
+            format!(
+                "recorded={:?}; recomputed_from_normalized_bytes={:?}",
+                recorded_ranges, actual_ranges
+            ),
+        ),
+        explain_check(
+            "overlap",
+            !event.overlap.unwrap_or(false),
+            format!("recorded={:?}; required=false", event.overlap),
+        ),
+        explain_check(
+            "degraded",
+            !event.degraded.unwrap_or(false),
+            format!("recorded={:?}; required=false", event.degraded),
+        ),
+        explain_check(
+            "after_incomplete",
+            !event.after_incomplete.unwrap_or(false),
+            format!("recorded={:?}; required=false", event.after_incomplete),
+        ),
+        explain_check(
+            "evidence_exactness",
+            evidence_exact,
+            evidence_comparison.to_owned(),
+        ),
+    ];
+    if checks.iter().any(|check| !check.passed) {
+        return (Vec::new(), checks);
     }
-    let Some(recorded_ranges) = event.line_ranges.as_ref() else {
-        return Vec::new();
-    };
-    let actual_ranges = crate::changed_line_ranges(before, after);
-    if recorded_ranges != &actual_ranges {
-        return Vec::new();
-    }
-    let old = commit_split_lines(&normalize_eol(before));
-    let new = commit_split_lines(&normalize_eol(after));
+    let old = commit_split_lines(normalized_before);
+    let new = commit_split_lines(normalized_after);
     let added = capture_diff_slices(Algorithm::Myers, &old, &new)
         .iter()
         .filter(|op| op.tag() != DiffTag::Equal)
         .flat_map(|op| op.new_range().map(|index| new[index].clone()))
         .collect::<Vec<_>>();
-    added
+    let nonempty = !added.is_empty();
+    let mut checks = checks;
+    checks.push(explain_check(
+        "verified_added_lines",
+        nonempty,
+        format!("verified_added_line_count={}", added.len()),
+    ));
+    if nonempty {
+        (added, checks)
+    } else {
+        (Vec::new(), checks)
+    }
+}
+
+fn explain_check(condition: &str, passed: bool, compared: String) -> ExplainCheck {
+    ExplainCheck {
+        condition: condition.to_owned(),
+        passed,
+        compared,
+    }
+}
+
+fn missing_snapshot_trace(
+    store: &Path,
+    event: &EventRecord,
+    previous_raw: &[u8],
+    previous_normalized: &[u8],
+    evidence: &str,
+    after_status: &str,
+) -> EventDecisionTrace {
+    let before_raw = event
+        .before_sha
+        .as_deref()
+        .and_then(|sha| crate::read_blob(&store.join("blobs").join(sha), sha))
+        .filter(|bytes| normalize_eol(bytes) == previous_normalized)
+        .or_else(|| {
+            (normalize_eol(previous_raw) == previous_normalized).then(|| previous_raw.to_vec())
+        });
+    let before_actual = before_raw.as_deref().map(crate::hash);
+    let before_ok = match (event.before_sha.as_deref(), before_actual.as_deref()) {
+        (None, Some(actual)) => previous_normalized.is_empty() && actual == crate::hash(&[]),
+        (Some(expected), Some(actual)) => expected == actual,
+        _ => false,
+    };
+    let checks = vec![
+        explain_check(
+            "structured_edit",
+            event.structured_edit == Some(true),
+            format!("recorded={:?}; required=true", event.structured_edit),
+        ),
+        explain_check(
+            "before_sha",
+            before_ok,
+            format!(
+                "raw_before_sha={:?}; computed_raw_sha={:?}; raw_snapshot_normalizes_to_previous={}",
+                event.before_sha,
+                before_actual,
+                before_raw
+                    .as_deref()
+                    .is_some_and(|bytes| normalize_eol(bytes) == previous_normalized)
+            ),
+        ),
+        explain_check(
+            "after_sha",
+            false,
+            format!(
+                "raw_after_sha={:?}; computed_raw_sha=unavailable; {after_status}",
+                event.after_sha
+            ),
+        ),
+        explain_check(
+            "line_ranges",
+            false,
+            format!(
+                "recorded={:?}; recomputed ranges unavailable without the snapshot",
+                event.line_ranges
+            ),
+        ),
+        explain_check(
+            "overlap",
+            !event.overlap.unwrap_or(false),
+            format!("recorded={:?}; required=false", event.overlap),
+        ),
+        explain_check(
+            "degraded",
+            !event.degraded.unwrap_or(false),
+            format!("recorded={:?}; required=false", event.degraded),
+        ),
+        explain_check(
+            "after_incomplete",
+            !event.after_incomplete.unwrap_or(false),
+            format!("recorded={:?}; required=false", event.after_incomplete),
+        ),
+        explain_check(
+            "evidence_exactness",
+            evidence == "exact",
+            format!("event_evidence={evidence}; required=exact"),
+        ),
+    ];
+    EventDecisionTrace {
+        event: event.event.clone(),
+        tool_use_id: event.tool_use_id.clone(),
+        operation: event.operation.clone(),
+        checks,
+    }
 }
 
 fn commit_split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -1927,9 +2524,10 @@ fn prepare_unobserved_survival_steps(steps: &[Step]) -> Option<Vec<Step>> {
 fn missing_snapshot_time_cut_fallback(
     store: &Path,
     events: &[&EventRecord],
-    committed: &[u8],
+    committed_raw: &[u8],
+    committed_normalized: &[u8],
 ) -> Option<Step> {
-    let committed_sha = crate::hash(committed);
+    let committed_sha = crate::hash(committed_raw);
     let event = events.iter().find(|event| {
         if event.event != "ai_change" {
             return false;
@@ -1943,7 +2541,7 @@ fn missing_snapshot_time_cut_fallback(
     })?;
     Some(Step {
         kind: StepKind::Ai { degraded: true },
-        after: committed.to_vec(),
+        after: committed_normalized.to_vec(),
         attribution: Some(derive::StepAttribution {
             adapter_id: event.tool.clone(),
             tool_id: event.tool.clone(),
