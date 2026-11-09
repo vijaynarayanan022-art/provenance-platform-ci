@@ -22,6 +22,7 @@ pub struct StepAttribution {
     pub adapter_id: Option<String>,
     pub tool_id: Option<String>,
     pub run_id: Option<String>,
+    pub session_id: Option<String>,
     pub operation: Option<String>,
     pub primary_basis: Option<String>,
     pub score_milli: u16,
@@ -194,8 +195,13 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
             } else {
                 match owned.owner {
                     Owner::Direct if !ambiguous => Label::AiDirect,
+                    Owner::Direct if duplicate_candidates_share_ai_source(line, ev) => {
+                        Label::AiStrong
+                    }
                     Owner::Direct => Label::AiProbable,
-                    Owner::Ai if !ambiguous => Label::AiStrong,
+                    Owner::Ai if !ambiguous || duplicate_candidates_share_ai_source(line, ev) => {
+                        Label::AiStrong
+                    }
                     Owner::Ai | Owner::AiWeak => Label::AiProbable,
                     Owner::AiEdited => Label::Mixed,
                     Owner::Base | Owner::External | Owner::Gap => Label::Unknown,
@@ -214,6 +220,38 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
             }
         })
         .collect()
+}
+
+fn duplicate_candidates_share_ai_source(line: &[u8], evidence: &Evidence) -> bool {
+    let mut source = None;
+    let mut found = false;
+    for step in &evidence.steps {
+        if !matches!(step.kind, StepKind::Ai { .. })
+            || !split_lines(&step.after)
+                .iter()
+                .any(|candidate| candidate == line)
+        {
+            continue;
+        }
+        let Some(attribution) = step.attribution.as_ref() else {
+            return false;
+        };
+        let (Some(adapter), Some(tool), Some(session), Some(operation)) = (
+            attribution.adapter_id.as_deref(),
+            attribution.tool_id.as_deref(),
+            attribution.session_id.as_deref(),
+            attribution.operation.as_deref(),
+        ) else {
+            return false;
+        };
+        let identity = (adapter, tool, session, operation);
+        if source.is_some_and(|previous| previous != identity) {
+            return false;
+        }
+        source = Some(identity);
+        found = true;
+    }
+    found
 }
 
 /// Reconcile an unobserved final edit against the last captured AI snapshot.
@@ -855,6 +893,24 @@ mod tests {
         }
     }
 
+    fn sourced_ai_step(after: &[u8], adapter: &str, tool: &str, session: &str) -> Step {
+        let mut result = step(StepKind::Ai { degraded: false }, after);
+        result.attribution = Some(StepAttribution {
+            adapter_id: Some(adapter.into()),
+            tool_id: Some(adapter.into()),
+            run_id: Some(format!("invocation-{}", after.len())),
+            session_id: Some(session.into()),
+            operation: Some(tool.into()),
+            primary_basis: None,
+            score_milli: 900,
+            penalties_milli: Vec::new(),
+            supporting_basis: Vec::new(),
+            limiting_basis: Vec::new(),
+            direct_lines: Vec::new(),
+        });
+        result
+    }
+
     fn evidence(parent: &[u8], steps: Vec<Step>) -> Evidence {
         Evidence {
             parent: parent.to_vec(),
@@ -944,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn current_identical_text_ambiguity_downgrades_ai_to_probable() {
+    fn duplicate_ambiguity_is_probable_only_across_ai_sources() {
         let touched_duplicate = evidence(
             b"",
             vec![
@@ -960,13 +1016,60 @@ mod tests {
         let ai_only_duplicate = evidence(
             b"",
             vec![
-                step(StepKind::Ai { degraded: false }, b"same\n"),
-                step(StepKind::Ai { degraded: false }, b"same\nsame\n"),
+                sourced_ai_step(b"same\n", "vscode-copilot", "create_file", "session-a"),
+                sourced_ai_step(
+                    b"same\nsame\n",
+                    "vscode-copilot",
+                    "create_file",
+                    "session-a",
+                ),
             ],
         );
         let labels = derive_lines(&ai_only_duplicate, b"same\nsame\n");
+        assert_eq!(labels[0].label, Label::AiStrong);
+        assert_eq!(labels[1].label, Label::AiStrong);
+
+        let mixed_tool_duplicate = evidence(
+            b"",
+            vec![
+                sourced_ai_step(b"same\n", "vscode-copilot", "create_file", "session-a"),
+                sourced_ai_step(b"same\nsame\n", "codex", "create_file", "session-a"),
+            ],
+        );
+        let labels = derive_lines(&mixed_tool_duplicate, b"same\nsame\n");
         assert_eq!(labels[0].label, Label::AiProbable);
         assert_eq!(labels[1].label, Label::AiProbable);
+
+        let mixed_session_duplicate = evidence(
+            b"",
+            vec![
+                sourced_ai_step(b"same\n", "vscode-copilot", "create_file", "session-a"),
+                sourced_ai_step(
+                    b"same\nsame\n",
+                    "vscode-copilot",
+                    "create_file",
+                    "session-b",
+                ),
+            ],
+        );
+        let labels = derive_lines(&mixed_session_duplicate, b"same\nsame\n");
+        assert_eq!(labels[0].label, Label::AiProbable);
+        assert_eq!(labels[1].label, Label::AiProbable);
+
+        let mut direct_first =
+            sourced_ai_step(b"same\n", "vscode-copilot", "create_file", "session-a");
+        direct_first.attribution.as_mut().unwrap().direct_lines = vec![b"same".to_vec()];
+        let mut direct_second = sourced_ai_step(
+            b"same\nsame\n",
+            "vscode-copilot",
+            "create_file",
+            "session-a",
+        );
+        direct_second.attribution.as_mut().unwrap().direct_lines = vec![b"same".to_vec()];
+        let direct_duplicate = evidence(b"", vec![direct_first, direct_second]);
+        assert!(derive_lines(&direct_duplicate, b"same\nsame\n")
+            .iter()
+            .all(|line| line.label == Label::AiStrong));
 
         let conflicting_committed_owners = evidence(
             b"base\n",
@@ -991,6 +1094,51 @@ mod tests {
             .iter()
             .filter(|line| line.added)
             .all(|line| { line.label == Label::Unknown }));
+    }
+
+    #[test]
+    fn multi_create_fixture_keeps_same_session_duplicate_lines_strong() {
+        let first = include_bytes!("../tests/fixtures/multi_create/first.ts");
+        let second = include_bytes!("../tests/fixtures/multi_create/second.ts");
+        let third = include_bytes!("../tests/fixtures/multi_create/third.ts");
+        let committed = include_bytes!("../tests/fixtures/multi_create/committed.ts");
+        let events = include_str!("../tests/fixtures/multi_create/events.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let source = |snapshot: &[u8], event: &serde_json::Value| {
+            let mut result = sourced_ai_step(
+                snapshot,
+                event["tool"].as_str().unwrap(),
+                event["operation"].as_str().unwrap(),
+                event["session_id"].as_str().unwrap(),
+            );
+            let attribution = result.attribution.as_mut().unwrap();
+            attribution.run_id = event["tool_use_id"].as_str().map(str::to_owned);
+            result
+        };
+        let steps = [&first[..], &second[..], &third[..]]
+            .into_iter()
+            .zip(&events)
+            .map(|(snapshot, event)| source(snapshot, event))
+            .collect();
+        let ev = evidence(b"", steps);
+
+        let labels = derive_lines_with_attribution(&ev, committed);
+        assert!(labels.iter().any(|line| line.ambiguous));
+        let ambiguous_ai = labels
+            .iter()
+            .filter(|line| {
+                line.ambiguous
+                    && line.line.added
+                    && !line.line.blank
+                    && line.line.label != Label::Unknown
+            })
+            .collect::<Vec<_>>();
+        assert!(!ambiguous_ai.is_empty());
+        assert!(ambiguous_ai
+            .iter()
+            .all(|line| line.line.label == Label::AiStrong));
     }
 
     #[test]
@@ -1443,6 +1591,7 @@ mod tests {
             adapter_id: Some("vscode-copilot".into()),
             tool_id: Some("vscode-copilot".into()),
             run_id: None,
+            session_id: None,
             operation: Some("create_file".into()),
             primary_basis: Some("DIRECT_ACCEPTED_EDIT".into()),
             score_milli: 1000,
