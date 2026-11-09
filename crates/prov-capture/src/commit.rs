@@ -1130,7 +1130,7 @@ fn derive_resolved_commit(
     let coverage_unobserved_lines = unobserved_eligible_line_count(&attributions);
     let mut coverage = coverage_band_with_unobserved(covered, totals.e, coverage_unobserved_lines);
     if !parent_fallback_lines.is_empty() && coverage == "high" {
-        coverage = "medium";
+        coverage = "partial";
     }
     let patch_id = if has_changes {
         parent
@@ -1221,7 +1221,7 @@ fn write_empty_commit(
         commit,
         parent,
         totals: Totals::default(),
-        coverage: "none",
+        coverage: "unknown",
         coverage_unobserved_lines: 0,
         files: Vec::new(),
         patch_id: None,
@@ -1648,7 +1648,7 @@ pub fn summary(bytes: &[u8]) -> Result<String, String> {
         totals["ai_probable"].as_u64().unwrap_or(0),
         totals["mixed"].as_u64().unwrap_or(0),
         totals["unknown"].as_u64().unwrap_or(0),
-        value["coverage"].as_str().unwrap_or("none"),
+        value["coverage"].as_str().unwrap_or("unknown"),
     ))
 }
 
@@ -3088,12 +3088,12 @@ pub fn percentage_tenths(numerator: usize, denominator: usize) -> Option<f64> {
 }
 
 pub fn coverage_band(covered: usize, total: usize) -> &'static str {
-    if total == 0 || covered == 0 {
-        "none"
+    if total == 0 {
+        "unknown"
     } else if covered.saturating_mul(3) < total {
         "low"
     } else if covered.saturating_mul(3) < total.saturating_mul(2) {
-        "medium"
+        "partial"
     } else {
         "high"
     }
@@ -3108,17 +3108,22 @@ pub fn coverage_band_with_unobserved(
 }
 
 pub fn coverage_band_limited(band: &str, total: usize, unobserved_lines: usize) -> &'static str {
-    if total == 0 || band == "none" {
+    if total == 0 {
         return match band {
             "high" => "high",
-            "medium" => "medium",
+            "medium" | "partial" => "partial",
             "low" => "low",
             "complete" => "complete",
-            "partial" => "partial",
             "unknown" => "unknown",
-            _ => "none",
+            "none" => "unknown",
+            _ => "unknown",
         };
     }
+    let band = match band {
+        "medium" => "partial",
+        "none" => "low",
+        other => other,
+    };
     let unobserved_percent = (unobserved_lines as u128).saturating_mul(100);
     let total = total as u128;
     if unobserved_percent >= total.saturating_mul(UNOBSERVED_COVERAGE_LOW_PERCENT as u128) {
@@ -3126,26 +3131,24 @@ pub fn coverage_band_limited(band: &str, total: usize, unobserved_lines: usize) 
     } else if unobserved_percent >= total.saturating_mul(UNOBSERVED_COVERAGE_MEDIUM_PERCENT as u128)
     {
         if band == "high" {
-            "medium"
+            "partial"
         } else {
             match band {
-                "medium" => "medium",
+                "partial" => "partial",
                 "low" => "low",
                 "complete" => "complete",
-                "partial" => "partial",
                 "unknown" => "unknown",
-                _ => "none",
+                _ => "unknown",
             }
         }
     } else {
         match band {
             "high" => "high",
-            "medium" => "medium",
+            "partial" => "partial",
             "low" => "low",
             "complete" => "complete",
-            "partial" => "partial",
             "unknown" => "unknown",
-            _ => "none",
+            _ => "unknown",
         }
     }
 }
@@ -3225,9 +3228,13 @@ mod tests {
     fn unobserved_edit_coverage_thresholds_and_r22_fixtures() {
         assert_eq!(coverage_band_with_unobserved(100, 100, 0), "high");
         assert_eq!(coverage_band_with_unobserved(100, 100, 4), "high");
-        assert_eq!(coverage_band_with_unobserved(100, 100, 5), "medium");
-        assert_eq!(coverage_band_with_unobserved(100, 100, 19), "medium");
+        assert_eq!(coverage_band_with_unobserved(100, 100, 5), "partial");
+        assert_eq!(coverage_band_with_unobserved(100, 100, 19), "partial");
         assert_eq!(coverage_band_with_unobserved(100, 100, 20), "low");
+        assert_eq!(coverage_band(0, 0), "unknown");
+        assert_eq!(coverage_band_limited("medium", 100, 0), "partial");
+        assert_eq!(coverage_band_limited("none", 0, 0), "unknown");
+        assert_eq!(coverage_band_limited("none", 10, 0), "low");
 
         let shell_lines = fixture_unobserved_line_count(include_str!(
             "../tests/fixtures/r22_coverage/repos/82ecea8ad5090c0735a1419ee1e73701ad9a110aee0aa756ec6cf6b87ceeb3d8/commits/22e8fb2184e9397f134648d58f14f722e0dce654.lines.json"

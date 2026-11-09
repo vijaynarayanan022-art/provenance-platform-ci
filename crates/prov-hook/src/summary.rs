@@ -137,7 +137,26 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<String, String> {
         (totals_from_rows(&rows), false)
     };
     let file_ranges = match options.file.as_deref() {
-        Some(file) => collect_file_ranges(&repo, &commit_ids, file)?,
+        Some(file) => {
+            let relative = repo_relative_file(&repo, file)
+                .ok_or_else(|| format!("file {file} is outside the repository"))?;
+            let included = rows.iter().any(|row| {
+                row.report
+                    .as_ref()
+                    .and_then(|report| report["files"].as_array())
+                    .is_some_and(|files| {
+                        files
+                            .iter()
+                            .any(|item| item["path"].as_str() == Some(&relative))
+                    })
+            });
+            if !included {
+                return Err(format!(
+                    "file {relative} is not present in the selected commit(s)"
+                ));
+            }
+            collect_file_ranges(&repo, &commit_ids, file)?
+        }
         None => Vec::new(),
     };
     if options.format == "json" {
@@ -683,9 +702,24 @@ fn collect_file_ranges(
     commits: &[String],
     requested: &str,
 ) -> Result<Vec<FileRange>, String> {
-    let Some(path) = repo_relative_file(repo, requested) else {
-        return Ok(Vec::new());
-    };
+    let path = repo_relative_file(repo, requested)
+        .ok_or_else(|| format!("file {requested} is outside the repository"))?;
+    collect_file_ranges_filtered(repo, commits, Some(&path))
+}
+
+pub(crate) fn collect_all_file_ranges(
+    repo: &Path,
+    commits: &[String],
+) -> Result<Vec<Value>, String> {
+    collect_file_ranges_filtered(repo, commits, None)
+        .map(|ranges| ranges.iter().map(file_range_json).collect())
+}
+
+fn collect_file_ranges_filtered(
+    repo: &Path,
+    commits: &[String],
+    requested: Option<&str>,
+) -> Result<Vec<FileRange>, String> {
     let sidecars = prov_capture::commit::lines_for_commits(repo, commits)?;
     let mut ranges = Vec::new();
     for (commit, bytes) in commits.iter().zip(sidecars) {
@@ -696,8 +730,11 @@ fn collect_file_ranges(
         if let Some(file_attributions) = document["attributions"].as_array() {
             for attribution in file_attributions
                 .iter()
-                .filter(|range| range["path"].as_str() == Some(&path))
+                .filter(|range| requested.is_none_or(|path| range["path"].as_str() == Some(path)))
             {
+                let Some(path) = attribution["path"].as_str() else {
+                    continue;
+                };
                 let Some(start_line) = attribution["startLine"].as_u64() else {
                     continue;
                 };
@@ -706,7 +743,7 @@ fn collect_file_ranges(
                 };
                 ranges.push(FileRange {
                     commit: commit.clone(),
-                    file: path.clone(),
+                    file: path.to_owned(),
                     start_line: start_line as usize,
                     end_line: end_line as usize,
                     supporting_basis: attribution["supportingBasis"]
@@ -762,10 +799,13 @@ fn collect_file_ranges(
                 });
             }
         } else if let Some(file_rows) = document["files"].as_array() {
-            if let Some(file) = file_rows
+            for file in file_rows
                 .iter()
-                .find(|file| file["path"].as_str() == Some(&path))
+                .filter(|file| requested.is_none_or(|path| file["path"].as_str() == Some(path)))
             {
+                let Some(path) = file["path"].as_str() else {
+                    continue;
+                };
                 if let Some(file_lines) = file["lines"].as_array() {
                     for line in file_lines {
                         let Some(number) = line["line"].as_u64() else {
@@ -777,7 +817,7 @@ fn collect_file_ranges(
                             .or_else(|| line["label"].as_u64().map(|value| value as u8 as char));
                         ranges.push(FileRange {
                             commit: commit.clone(),
-                            file: path.clone(),
+                            file: path.to_owned(),
                             start_line: number as usize,
                             end_line: number as usize,
                             category: full_category(label.unwrap_or('u')).into(),
@@ -875,7 +915,24 @@ fn repo_relative_file(repo: &Path, requested: &str) -> Option<String> {
 
 fn canonical_or_lexical(path: &Path) -> PathBuf {
     let normalized = lexical_normalize(path);
-    normalized.canonicalize().unwrap_or(normalized)
+    let mut ancestor = normalized.as_path();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut resolved) = ancestor.canonicalize() {
+            for component in missing.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+        let Some(name) = ancestor.file_name() else {
+            return normalized;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            return normalized;
+        };
+        ancestor = parent;
+    }
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
