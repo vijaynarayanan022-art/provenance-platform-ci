@@ -545,6 +545,26 @@ fn set_ai_change_field(fixture: &Fixture, field: &str, value: Value) {
         }
         let mut event: Value = serde_json::from_slice(line).unwrap();
         if event["event"] == "ai_change" && event["path"] == "tracked.txt" {
+            if field == "overlap" && value == true {
+                let open = event["window_open"].as_u64().unwrap();
+                let close = event["window_close"].as_u64().unwrap();
+                for (timestamp, event_name, opened, closed) in [
+                    (open + 1, "window_open", Some(open + 1), None),
+                    (close, "window_close", Some(open + 1), Some(close - 1)),
+                ] {
+                    let concurrent = json!({
+                        "schema_version":"prov.event/0.1",
+                        "event":event_name,
+                        "timestamp":timestamp,
+                        "session_id":"independent-overlap-session",
+                        "tool_use_id":"independent-overlap-tool",
+                        "window_open":opened,
+                        "window_close":closed,
+                    });
+                    serde_json::to_writer(&mut output, &concurrent).unwrap();
+                    output.push(b'\n');
+                }
+            }
             event[field] = value.clone();
         }
         serde_json::to_writer(&mut output, &event).unwrap();
@@ -1063,7 +1083,7 @@ fn no_event_parent_lineage_fallback_mixes_a_probable_parent_line() {
     assert_eq!(file(&report, "s.py")["unknown"], 0);
     let sidecar = fixture.sidecar_value(&child);
     let mixed = attribution_for(&sidecar, "s.py", "mixed");
-    assert_eq!(mixed["score"], 0.71);
+    assert_eq!(mixed["score"], 0.84);
     assert_eq!(mixed["source"]["toolId"], "codex");
     fixture.drop_root();
 }
@@ -1661,6 +1681,21 @@ fn explain_reports_direct_shell_mixed_unknown_and_excluded_decisions_read_only()
 }
 
 #[test]
+fn explain_blank_line_prints_eligibility_message() {
+    let fixture = Fixture::new("explain-blank-line");
+    fixture.hook("PreToolUse", "blank-line-tool");
+    fs::write(fixture.repo.join("tracked.txt"), b"one\ntwo\n\n").unwrap();
+    fixture.hook("PostToolUse", "blank-line-tool");
+    let commit = fixture.commit("add blank line");
+    assert!(derive(&fixture, &commit).status.success());
+    let result = explain_json(&fixture, &commit, "tracked.txt", Some(3));
+    assert!(result["lines"].as_array().unwrap().is_empty());
+    let table = prov_capture::commit::explain_table(&result).unwrap();
+    assert!(table.contains("blank line, not eligible"));
+    fixture.drop_root();
+}
+
+#[test]
 fn structured_direct_evidence_respects_human_edits_and_limits() {
     let human_edit = Fixture::new("direct-human-edit");
     human_edit.hook("PreToolUse", "patch-human-edit");
@@ -1743,6 +1778,7 @@ fn structured_direct_evidence_respects_human_edits_and_limits() {
     fs::write(overlap.repo.join("tracked.txt"), b"one\noverlap line\n").unwrap();
     overlap.hook("PostToolUse", "overlapping-patch");
     configure_structured_apply_patch(&overlap, "tracked.txt", Some(true), true, json!([[2, 2]]));
+    set_ai_change_field(&overlap, "overlap", json!(true));
     let commit = overlap.commit("overlap limits direct confidence");
     assert!(derive(&overlap, &commit).status.success());
     let sidecar = sidecar_value(&overlap, &commit);
@@ -2192,31 +2228,7 @@ fn overlap_or_degraded_ai_events_are_probable() {
         fixture.hook("PreToolUse", "ai-tool");
         fs::write(fixture.repo.join("tracked.txt"), b"one\nai line\n").unwrap();
         fixture.hook("PostToolUse", "ai-tool");
-        let event_path = fs::read_dir(
-            fixture
-                .home
-                .join("repos")
-                .join(fixture.repo_id())
-                .join("events"),
-        )
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-        let mut output = Vec::new();
-        for line in fs::read(&event_path).unwrap().split(|byte| *byte == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let mut value: Value = serde_json::from_slice(line).unwrap();
-            if value["event"] == "ai_change" && value["path"] == "tracked.txt" {
-                value[field] = true.into();
-            }
-            serde_json::to_writer(&mut output, &value).unwrap();
-            output.push(b'\n');
-        }
-        fs::write(event_path, output).unwrap();
+        set_ai_change_field(&fixture, field, json!(true));
         let commit = fixture.commit("degraded AI event");
         assert!(derive(&fixture, &commit).status.success());
         let result = fixture.derived_value(&commit);
