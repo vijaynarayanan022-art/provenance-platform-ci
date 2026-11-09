@@ -26,6 +26,7 @@ struct Row {
     deterministic_pct: Option<f64>,
     linked_pct: Option<f64>,
     coverage: Option<String>,
+    coverage_unobserved_lines: Option<usize>,
     tools: Option<Vec<String>>,
     report: Option<Value>,
 }
@@ -77,10 +78,14 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<String, String> {
     let repo = git_hooks::repo_root(&path)?;
     let commit_ids = select_commits(&repo, &options)?;
     let reports = prov_capture::commit::reports_for_commits(&repo, &commit_ids)?;
+    let line_sidecars = prov_capture::commit::lines_for_commits(&repo, &commit_ids)?;
     let mut rows = Vec::with_capacity(commit_ids.len());
     let mut tool_commit_ids = BTreeSet::new();
-    for (commit, report) in commit_ids.iter().zip(reports.reports) {
-        let row = make_row(commit, report.as_deref());
+    for ((commit, report), sidecar) in commit_ids.iter().zip(reports.reports).zip(line_sidecars) {
+        let sidecar_unobserved_lines = sidecar
+            .as_deref()
+            .map(prov_capture::commit::unobserved_eligible_lines_from_sidecar);
+        let row = make_row(commit, report.as_deref(), sidecar_unobserved_lines);
         if let Some(report) = &row.report {
             if let Some(own_commit) = report["commit"].as_str() {
                 tool_commit_ids.insert(own_commit.to_owned());
@@ -285,7 +290,11 @@ fn pr_report_for_range(repo: &Path, base: &str, head: &str) -> Result<Value, Str
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
-fn make_row(commit: &str, report_bytes: Option<&[u8]>) -> Row {
+fn make_row(
+    commit: &str,
+    report_bytes: Option<&[u8]>,
+    sidecar_unobserved_lines: Option<usize>,
+) -> Row {
     let Some(report) = report_bytes.and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
     else {
         return Row::not_derived(commit);
@@ -308,6 +317,7 @@ fn make_row(commit: &str, report_bytes: Option<&[u8]>) -> Row {
             deterministic_pct: None,
             linked_pct: None,
             coverage: None,
+            coverage_unobserved_lines: None,
             tools: None,
             report: Some(report),
         };
@@ -334,6 +344,15 @@ fn make_row(commit: &str, report_bytes: Option<&[u8]>) -> Row {
     else {
         return Row::not_derived(commit);
     };
+    let coverage_unobserved_lines = report["coverage_unobserved_lines"]
+        .as_u64()
+        .map(|value| value as usize)
+        .or(sidecar_unobserved_lines)
+        .unwrap_or_default();
+    let coverage = report["coverage"].as_str().map(|band| {
+        prov_capture::commit::coverage_band_limited(band, eligible, coverage_unobserved_lines)
+            .to_owned()
+    });
     Row {
         commit: commit.into(),
         status: "derived",
@@ -347,7 +366,8 @@ fn make_row(commit: &str, report_bytes: Option<&[u8]>) -> Row {
         excluded: Some(excluded),
         deterministic_pct: optional_number(totals, "ai_deterministic_pct"),
         linked_pct: optional_number(totals, "ai_linked_pct"),
-        coverage: report["coverage"].as_str().map(str::to_owned),
+        coverage,
+        coverage_unobserved_lines: Some(coverage_unobserved_lines),
         tools: None,
         report: Some(report),
     }
@@ -369,6 +389,7 @@ impl Row {
             deterministic_pct: None,
             linked_pct: None,
             coverage: None,
+            coverage_unobserved_lines: None,
             tools: None,
             report: None,
         }
@@ -434,6 +455,7 @@ fn totals_from_rows(rows: &[Row]) -> Totals {
     let mut unknown = 0usize;
     let mut excluded = 0usize;
     let mut covered = 0usize;
+    let mut unobserved_lines = 0usize;
     let mut tools = BTreeSet::new();
     for row in rows {
         eligible += row.eligible.unwrap_or_default();
@@ -443,6 +465,7 @@ fn totals_from_rows(rows: &[Row]) -> Totals {
         mixed += row.mixed.unwrap_or_default();
         unknown += row.unknown.unwrap_or_default();
         excluded += row.excluded.unwrap_or_default();
+        unobserved_lines += row.coverage_unobserved_lines.unwrap_or_default();
         if let Some(values) = &row.tools {
             tools.extend(values.iter().cloned());
         }
@@ -476,7 +499,14 @@ fn totals_from_rows(rows: &[Row]) -> Totals {
             ai_direct + ai_strong + ai_probable + mixed,
             eligible,
         ),
-        coverage: Some(prov_capture::commit::coverage_band(covered, eligible).into()),
+        coverage: Some(
+            prov_capture::commit::coverage_band_with_unobserved(
+                covered,
+                eligible,
+                unobserved_lines,
+            )
+            .into(),
+        ),
         tools: Some(tools.into_iter().collect()),
     }
 }

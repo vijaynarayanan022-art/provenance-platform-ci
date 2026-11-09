@@ -18,6 +18,9 @@ const DERIVE_LOCK_AGE: Duration = Duration::from_secs(120);
 const MIN_PARENT_EDIT_SIMILARITY: f64 = 0.5;
 const MAX_PARENT_MATCH_CELLS: usize = 1_000_000;
 const MIXED_SCORE_MILLI: u16 = 840;
+const UNOBSERVED_COVERAGE_MEDIUM_PERCENT: usize = 5;
+const UNOBSERVED_COVERAGE_LOW_PERCENT: usize = 20;
+const UNOBSERVED_COVERAGE_BASIS: [&str; 2] = ["X_UNOBSERVED_EDIT", "X_UNOBSERVED_EDIT_IN_FILE"];
 
 #[derive(Clone, Default)]
 struct StoredParentLine {
@@ -45,6 +48,7 @@ struct CommitOutput {
     parent: Option<String>,
     totals: Totals,
     coverage: &'static str,
+    coverage_unobserved_lines: usize,
     files: Vec<FileOutput>,
     patch_id: Option<String>,
     rewrite: RewriteOutput,
@@ -1123,7 +1127,8 @@ fn derive_resolved_commit(
         totals.ai_direct + totals.ai_strong + totals.ai_probable + totals.mixed,
         totals.e,
     );
-    let mut coverage = coverage_band(covered, totals.e);
+    let coverage_unobserved_lines = unobserved_eligible_line_count(&attributions);
+    let mut coverage = coverage_band_with_unobserved(covered, totals.e, coverage_unobserved_lines);
     if !parent_fallback_lines.is_empty() && coverage == "high" {
         coverage = "medium";
     }
@@ -1168,6 +1173,7 @@ fn derive_resolved_commit(
         parent,
         totals,
         coverage,
+        coverage_unobserved_lines,
         files: output_files,
         patch_id,
         rewrite: RewriteOutput {
@@ -1216,6 +1222,7 @@ fn write_empty_commit(
         parent,
         totals: Totals::default(),
         coverage: "none",
+        coverage_unobserved_lines: 0,
         files: Vec::new(),
         patch_id: None,
         rewrite: RewriteOutput {
@@ -3092,6 +3099,85 @@ pub fn coverage_band(covered: usize, total: usize) -> &'static str {
     }
 }
 
+pub fn coverage_band_with_unobserved(
+    covered: usize,
+    total: usize,
+    unobserved_lines: usize,
+) -> &'static str {
+    coverage_band_limited(coverage_band(covered, total), total, unobserved_lines)
+}
+
+pub fn coverage_band_limited(band: &str, total: usize, unobserved_lines: usize) -> &'static str {
+    if total == 0 || band == "none" {
+        return match band {
+            "high" => "high",
+            "medium" => "medium",
+            "low" => "low",
+            "complete" => "complete",
+            "partial" => "partial",
+            "unknown" => "unknown",
+            _ => "none",
+        };
+    }
+    let unobserved_percent = (unobserved_lines as u128).saturating_mul(100);
+    let total = total as u128;
+    if unobserved_percent >= total.saturating_mul(UNOBSERVED_COVERAGE_LOW_PERCENT as u128) {
+        "low"
+    } else if unobserved_percent >= total.saturating_mul(UNOBSERVED_COVERAGE_MEDIUM_PERCENT as u128)
+    {
+        if band == "high" {
+            "medium"
+        } else {
+            match band {
+                "medium" => "medium",
+                "low" => "low",
+                "complete" => "complete",
+                "partial" => "partial",
+                "unknown" => "unknown",
+                _ => "none",
+            }
+        }
+    } else {
+        match band {
+            "high" => "high",
+            "medium" => "medium",
+            "low" => "low",
+            "complete" => "complete",
+            "partial" => "partial",
+            "unknown" => "unknown",
+            _ => "none",
+        }
+    }
+}
+
+pub fn unobserved_eligible_lines_from_sidecar(bytes: &[u8]) -> usize {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return 0;
+    };
+    let Ok(attributions) =
+        serde_json::from_value::<Vec<AttributionRange>>(value["attributions"].clone())
+    else {
+        return 0;
+    };
+    unobserved_eligible_line_count(&attributions)
+}
+
+fn unobserved_eligible_line_count(attributions: &[AttributionRange]) -> usize {
+    let mut lines = BTreeSet::new();
+    for range in attributions {
+        if range.category == "excluded"
+            || !range
+                .limiting_basis
+                .iter()
+                .any(|basis| UNOBSERVED_COVERAGE_BASIS.contains(&basis.as_str()))
+        {
+            continue;
+        }
+        lines.extend((range.start_line..=range.end_line).map(|line| (range.path.as_str(), line)));
+    }
+    lines.len()
+}
+
 fn git_output(root: &Path, args: &[&str]) -> Result<Output, String> {
     let mut command = Command::new("git");
     command
@@ -3133,6 +3219,38 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join(&digest), bytes).unwrap();
         digest
+    }
+
+    #[test]
+    fn unobserved_edit_coverage_thresholds_and_r22_fixtures() {
+        assert_eq!(coverage_band_with_unobserved(100, 100, 0), "high");
+        assert_eq!(coverage_band_with_unobserved(100, 100, 4), "high");
+        assert_eq!(coverage_band_with_unobserved(100, 100, 5), "medium");
+        assert_eq!(coverage_band_with_unobserved(100, 100, 19), "medium");
+        assert_eq!(coverage_band_with_unobserved(100, 100, 20), "low");
+
+        let shell_lines = fixture_unobserved_line_count(include_str!(
+            "../tests/fixtures/r22_coverage/repos/82ecea8ad5090c0735a1419ee1e73701ad9a110aee0aa756ec6cf6b87ceeb3d8/commits/22e8fb2184e9397f134648d58f14f722e0dce654.lines.json"
+        ));
+        let direct_lines = fixture_unobserved_line_count(include_str!(
+            "../tests/fixtures/r22_coverage/repos/82ecea8ad5090c0735a1419ee1e73701ad9a110aee0aa756ec6cf6b87ceeb3d8/commits/d11cbaaad40c74ebf7308f214914d7c51f4b8823.lines.json"
+        ));
+        let edited_lines = fixture_unobserved_line_count(include_str!(
+            "../tests/fixtures/r22_coverage/repos/82ecea8ad5090c0735a1419ee1e73701ad9a110aee0aa756ec6cf6b87ceeb3d8/commits/b1a6fd424d42edad66bcc2ca181c84acac6021c0.lines.json"
+        ));
+        assert_eq!(shell_lines, 0);
+        assert_eq!(direct_lines, 0);
+        assert_eq!(edited_lines, 38);
+        assert_eq!(coverage_band_with_unobserved(9, 9, shell_lines), "high");
+        assert_eq!(coverage_band_with_unobserved(86, 86, direct_lines), "high");
+        assert_eq!(coverage_band_with_unobserved(163, 163, edited_lines), "low");
+    }
+
+    fn fixture_unobserved_line_count(sidecar: &str) -> usize {
+        let value: serde_json::Value = serde_json::from_str(sidecar).unwrap();
+        let attributions: Vec<AttributionRange> =
+            serde_json::from_value(value["attributions"].clone()).unwrap();
+        unobserved_eligible_line_count(&attributions)
     }
 
     fn event(
