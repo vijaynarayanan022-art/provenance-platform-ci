@@ -1,7 +1,7 @@
 use crate::derive::{self, Evidence, Step, StepKind};
 use serde::{Deserialize, Serialize};
 use similar::{capture_diff_slices, Algorithm, DiffTag};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ const ATTEMPT_MARKER_AGE: Duration = Duration::from_secs(60);
 const DERIVE_LOCK_AGE: Duration = Duration::from_secs(120);
 const MIN_PARENT_EDIT_SIMILARITY: f64 = 0.5;
 const MAX_PARENT_MATCH_CELLS: usize = 1_000_000;
+const MIXED_SCORE_MILLI: u16 = 840;
 
 #[derive(Clone, Default)]
 struct StoredParentLine {
@@ -208,6 +209,12 @@ struct EventRecord {
     #[serde(default)]
     tool_use_id: Option<String>,
     #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    window_open: Option<u128>,
+    #[serde(default)]
+    window_close: Option<u128>,
+    #[serde(default)]
     operation: Option<String>,
     #[serde(default)]
     structured_edit: Option<bool>,
@@ -260,6 +267,8 @@ struct ExplainLine {
 struct ExplainReport {
     commit: String,
     file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
     lines: Vec<ExplainLine>,
 }
 
@@ -1388,6 +1397,7 @@ pub fn explain_commit(
         return serde_json::to_value(ExplainReport {
             commit,
             file: path,
+            message: None,
             lines,
         })
         .map_err(|error| error.to_string());
@@ -1533,9 +1543,17 @@ pub fn explain_commit(
             }
         })
         .collect();
+    let message = line_filter
+        .filter(|line| {
+            split_normalized_lines(&normalized_committed)
+                .get(line.saturating_sub(1))
+                .is_some_and(|text| text.iter().all(u8::is_ascii_whitespace))
+        })
+        .map(|_| "blank line, not eligible".to_owned());
     serde_json::to_value(ExplainReport {
         commit,
         file: path,
+        message,
         lines: report_lines,
     })
     .map_err(|error| error.to_string())
@@ -1551,6 +1569,11 @@ pub fn explain_table(value: &serde_json::Value) -> Result<String, String> {
     let lines = value["lines"]
         .as_array()
         .ok_or("missing lines in explain result")?;
+    if lines.is_empty() {
+        if let Some(message) = value["message"].as_str() {
+            return Ok(format!("Commit {commit}  File {file}\n{message}\n"));
+        }
+    }
     let mut output =
         format!("Commit {commit}  File {file}\nLINE  CATEGORY      SCORE  FIRST FAILED\n");
     for line in lines {
@@ -1833,7 +1856,55 @@ fn read_events(events_dir: &Path) -> Vec<EventRecord> {
         }
     }
     events.sort_by_key(|event| (event.timestamp, event.order));
+    normalize_window_overlaps(&mut events);
     events
+}
+
+fn normalize_window_overlaps(events: &mut [EventRecord]) {
+    let mut starts = HashMap::<(String, String), u128>::new();
+    let mut intervals = Vec::<(String, String, u128, u128)>::new();
+    for event in events.iter() {
+        let (Some(session), Some(tool_use_id)) =
+            (event.session_id.as_ref(), event.tool_use_id.as_ref())
+        else {
+            continue;
+        };
+        let key = (session.clone(), tool_use_id.clone());
+        match event.event.as_str() {
+            "window_open" => {
+                if let Some(opened_at) = event.window_open {
+                    starts.insert(key, opened_at);
+                }
+            }
+            "window_close" => {
+                if let (Some(start), Some(end)) = (starts.remove(&key), event.window_close) {
+                    if end >= start {
+                        intervals.push((session.clone(), tool_use_id.clone(), start, end));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut overlapping = HashSet::<(String, String)>::new();
+    for (index, (session, tool, start, end)) in intervals.iter().enumerate() {
+        for (other_session, other_tool, other_start, other_end) in intervals.iter().skip(index + 1)
+        {
+            if session != other_session && start < other_end && other_start < end {
+                overlapping.insert((session.clone(), tool.clone()));
+                overlapping.insert((other_session.clone(), other_tool.clone()));
+            }
+        }
+    }
+    for event in events.iter_mut().filter(|event| event.event == "ai_change") {
+        event.overlap = Some(
+            event
+                .session_id
+                .as_ref()
+                .zip(event.tool_use_id.as_ref())
+                .is_some_and(|key| overlapping.contains(&(key.0.clone(), key.1.clone()))),
+        );
+    }
 }
 
 fn index_events(events: &[EventRecord]) -> HashMap<String, Vec<usize>> {
@@ -2400,18 +2471,7 @@ fn attribution_ranges(
             }
             None => {}
         }
-        let mut score_step = step.cloned();
-        if matches!(
-            attributed.unobserved_edit,
-            Some(
-                derive::UnobservedEditKind::MixedByTokenOverlap
-                    | derive::UnobservedEditKind::MixedBySimilarity
-            )
-        ) {
-            if let Some(score_step) = score_step.as_mut() {
-                score_step.penalties_milli.push(80);
-            }
-        }
+        let score_step = step.cloned();
         let score = score_for_label(label, score_step.as_ref(), &limiting_basis);
         let confidence_band = match label {
             derive::Label::Unknown => "none",
@@ -2665,7 +2725,7 @@ fn default_parent_score_milli(category: &str) -> u16 {
         "ai_direct" => 990,
         "ai_strong" => 920,
         "ai_probable" => 790,
-        "mixed" => 840,
+        "mixed" => MIXED_SCORE_MILLI,
         _ => 0,
     }
 }
@@ -2886,6 +2946,9 @@ fn score_for_label(
     if matches!(label, derive::Label::Unknown) {
         return None;
     }
+    if matches!(label, derive::Label::Mixed) {
+        return Some(f64::from(MIXED_SCORE_MILLI) / 1000.0);
+    }
     let mut score = i32::from(step.map_or(0, |step| step.score_milli));
     score -= step
         .map(|step| {
@@ -3080,6 +3143,9 @@ mod tests {
             path: Some("file.txt".into()),
             tool: Some("codex".into()),
             tool_use_id: Some("tool-1".into()),
+            session_id: Some("session-1".into()),
+            window_open: None,
+            window_close: None,
             operation: Some("apply_patch".into()),
             structured_edit: None,
             line_ranges: None,
@@ -3109,6 +3175,49 @@ mod tests {
             "missing".to_owned(),
         ];
         assert_eq!(readable_blob_ids(&sizes, &ids), vec!["at-limit"]);
+    }
+
+    #[test]
+    fn event_overlap_requires_two_closed_tool_windows() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../prov-hook/tests/fixtures/real_overlap");
+        let events = read_events(&fixture);
+        let codex_edits: Vec<_> = events
+            .iter()
+            .filter(|event| event.event == "ai_change")
+            .collect();
+        assert!(!codex_edits.is_empty());
+        assert!(codex_edits.iter().all(|event| event.overlap == Some(false)));
+        assert!(events.iter().any(|event| event.event == "turn_end"
+            && event.session_id.as_deref() == Some("0754415b-0754-4db2-8c70-82536857c41c")));
+
+        let mut concurrent = Vec::new();
+        let mut first_open = event(None, "window_open", false, None);
+        first_open.session_id = Some("first".into());
+        first_open.tool_use_id = Some("first-tool".into());
+        first_open.window_open = Some(10);
+        concurrent.push(first_open);
+        let mut second_open = event(None, "window_open", false, None);
+        second_open.session_id = Some("second".into());
+        second_open.tool_use_id = Some("second-tool".into());
+        second_open.window_open = Some(20);
+        concurrent.push(second_open);
+        let mut first_close = event(None, "window_close", false, None);
+        first_close.session_id = Some("first".into());
+        first_close.tool_use_id = Some("first-tool".into());
+        first_close.window_close = Some(30);
+        concurrent.push(first_close);
+        let mut second_close = event(None, "window_close", false, None);
+        second_close.session_id = Some("second".into());
+        second_close.tool_use_id = Some("second-tool".into());
+        second_close.window_close = Some(40);
+        concurrent.push(second_close);
+        let mut edit = event(Some("after".into()), "ai_change", false, None);
+        edit.session_id = Some("first".into());
+        edit.tool_use_id = Some("first-tool".into());
+        concurrent.push(edit);
+        normalize_window_overlaps(&mut concurrent);
+        assert_eq!(concurrent[4].overlap, Some(true));
     }
 
     #[test]
@@ -3170,6 +3279,10 @@ mod tests {
         assert_eq!(
             score_for_label(derive::Label::AiStrong, Some(&exact), &[]),
             Some(0.92)
+        );
+        assert_eq!(
+            score_for_label(derive::Label::Mixed, Some(&exact), &[]),
+            Some(0.84)
         );
 
         let missing_lineage = derive::StepAttribution {

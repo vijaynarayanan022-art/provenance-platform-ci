@@ -119,6 +119,8 @@ const LOCK_BUDGET: Duration = Duration::from_millis(500);
 const MAX_DIRTY_PATHS: usize = 500;
 const MAX_RECENT_KEYS: usize = 1000;
 const MAX_WINDOW_AGE_NS: u128 = 60 * 60 * 1_000_000_000;
+// Tool windows without a matching PostToolUse must not remain active indefinitely.
+const MAX_OPEN_WINDOW_AGE_NS: u128 = 5 * 60 * 1_000_000_000;
 #[derive(Debug, Deserialize)]
 struct HookInput {
     hook_event_name: Option<String>,
@@ -737,10 +739,7 @@ fn process_hook(
                 append_events(&event_path, &event_batch);
             }
             let now = now_ns();
-            let overlap = state
-                .windows
-                .iter()
-                .any(|w| w.session_id != session && w.opened_at <= now);
+            let overlap = has_other_active_window(&state.windows, &session, now);
             if overlap {
                 for w in &mut state.windows {
                     if w.session_id != session {
@@ -810,10 +809,7 @@ fn process_hook(
             let prior_bulk = window.as_ref().and_then(|w| w.bulk_count);
             let bulk_window = prior_bulk.is_some() || bulk_count.is_some();
             let overlap = window.as_ref().is_some_and(|w| w.overlap)
-                || state
-                    .windows
-                    .iter()
-                    .any(|o| o.session_id != session && o.opened_at <= now_ns());
+                || has_other_active_window(&state.windows, &session, now_ns());
             let head_moved = window
                 .as_ref()
                 .is_some_and(|w| w.head != close_head || w.branch != close_branch);
@@ -2000,10 +1996,18 @@ fn expire_state(state: &mut RepoState) {
     let now = now_ns();
     state
         .windows
-        .retain(|w| now.saturating_sub(w.opened_at) <= MAX_WINDOW_AGE_NS);
+        .retain(|w| now.saturating_sub(w.opened_at) <= MAX_OPEN_WINDOW_AGE_NS);
     state
         .recent_keys
         .retain(|k| now.saturating_sub(k.timestamp) <= MAX_WINDOW_AGE_NS);
+}
+
+fn has_other_active_window(windows: &[WindowState], session: &str, now: u128) -> bool {
+    windows.iter().any(|window| {
+        window.session_id != session
+            && window.opened_at <= now
+            && now.saturating_sub(window.opened_at) <= MAX_OPEN_WINDOW_AGE_NS
+    })
 }
 fn cap_state(state: &mut RepoState) {
     if state.recent_keys.len() > MAX_RECENT_KEYS {
@@ -2400,6 +2404,73 @@ pub fn process_json_timed(input: &[u8]) -> TimingSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlap_requires_a_recent_other_tool_window() {
+        let now = 10_000_000_000_000u128;
+        let window = |session: &str, opened_at| WindowState {
+            session_id: session.into(),
+            tool_use_id: Some("tool".into()),
+            target_paths: None,
+            opened_at,
+            head: String::new(),
+            branch: String::new(),
+            overlap: false,
+            bulk_count: None,
+            bulk_remaining: None,
+        };
+        assert!(has_other_active_window(
+            &[window("other", now - 1)],
+            "current",
+            now
+        ));
+        assert!(!has_other_active_window(&[], "current", now));
+        assert!(!has_other_active_window(
+            &[window("orphaned", now - MAX_OPEN_WINDOW_AGE_NS - 1)],
+            "current",
+            now
+        ));
+    }
+
+    #[test]
+    fn real_false_overlap_fixture_is_an_orphaned_window_not_chat_activity() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../prov-hook/tests/fixtures/real_overlap");
+        let stale = fs::read_to_string(fixture.join("never_closed_window.jsonl")).unwrap();
+        let codex = fs::read_to_string(fixture.join("codex_edit_windows.jsonl")).unwrap();
+        let idle = fs::read_to_string(fixture.join("idle_chat_session.jsonl")).unwrap();
+        let stale_rows: Vec<serde_json::Value> = stale
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let codex_rows: Vec<serde_json::Value> = codex
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let idle_rows: Vec<serde_json::Value> = idle
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(stale_rows
+            .iter()
+            .any(|event| event["event"] == "window_open"));
+        let orphan = stale_rows
+            .iter()
+            .find(|event| {
+                event["event"] == "window_open"
+                    && event["tool_use_id"] == "exec-9391243f-468d-463b-97e9-6ed380e0d750"
+            })
+            .unwrap();
+        assert!(!stale_rows.iter().any(|event| {
+            event["event"] == "window_close" && event["tool_use_id"] == orphan["tool_use_id"]
+        }));
+        assert!(codex_rows
+            .iter()
+            .any(|event| event["event"] == "ai_change" && event["overlap"] == true));
+        assert!(idle_rows
+            .iter()
+            .all(|event| event["event"] != "window_open"));
+    }
 
     #[cfg(windows)]
     #[test]

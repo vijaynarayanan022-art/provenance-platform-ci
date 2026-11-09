@@ -85,8 +85,6 @@ struct OwnedLine {
 
 #[derive(Clone, Copy)]
 struct DuplicateOwners {
-    owner: Owner,
-    source_step: Option<usize>,
     candidates: u8,
     ambiguous: bool,
 }
@@ -181,14 +179,14 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
         &[],
     );
     let added = added_lines(&parent, &committed_lines);
-    let duplicate_owners = duplicate_owners(&committed_lines, &committed_owners);
+    let duplicate_owners = duplicate_owners(&committed_owners);
 
     committed_lines
         .iter()
         .enumerate()
         .map(|(index, line)| {
             let owned = committed_owners[index];
-            let duplicates = duplicate_owners[line.as_slice()];
+            let duplicates = duplicate_owners[index];
             let candidates = owned.candidates | duplicates.candidates;
             let ambiguous = owned.ambiguous || duplicates.ambiguous;
             let label = if !added[index] || !all_candidates_have_ai_ancestry(candidates) {
@@ -281,20 +279,10 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
     while cursor < ops.len() {
         if ops[cursor].tag() == DiffTag::Equal {
             for (old_index, new_index) in ops[cursor].old_range().zip(ops[cursor].new_range()) {
-                let mut owner = owners[old_index];
-                if is_ai_ancestry(owner.owner) {
-                    if has_unmatched_changes {
-                        unobserved_edits[new_index] =
-                            Some(UnobservedEditKind::ExactSurvivorInChangedFile);
-                    }
-                    if snapshot_counts
-                        .get(&snapshot[old_index])
-                        .copied()
-                        .unwrap_or_default()
-                        > 1
-                    {
-                        owner.ambiguous = true;
-                    }
+                let owner = owners[old_index];
+                if is_ai_ancestry(owner.owner) && has_unmatched_changes {
+                    unobserved_edits[new_index] =
+                        Some(UnobservedEditKind::ExactSurvivorInChangedFile);
                 }
                 committed_owners[new_index] = owner;
             }
@@ -315,10 +303,32 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
             .iter()
             .flat_map(|op| op.new_range())
             .collect();
-        for &new_index in &new_indices {
+        let mut matched_new = HashSet::new();
+        let mut remaining_old = Vec::new();
+        let mut next_new = 0;
+        for old_index in old_indices {
+            let Some(relative_new) = new_indices[next_new..]
+                .iter()
+                .position(|&new_index| snapshot[old_index] == committed_lines[new_index])
+            else {
+                remaining_old.push(old_index);
+                continue;
+            };
+            let new_position = next_new + relative_new;
+            let new_index = new_indices[new_position];
+            next_new = new_position + 1;
+            matched_new.insert(new_index);
+            committed_owners[new_index] = owners[old_index];
+            unobserved_edits[new_index] = Some(UnobservedEditKind::ExactSurvivorInChangedFile);
+        }
+        let remaining_new: Vec<_> = new_indices
+            .into_iter()
+            .filter(|new_index| !matched_new.contains(new_index))
+            .collect();
+        for &new_index in &remaining_new {
             unobserved_edits[new_index] = Some(UnobservedEditKind::UnmatchedUnknown);
         }
-        for (old_index, new_index) in old_indices.into_iter().zip(new_indices) {
+        for (old_index, new_index) in remaining_old.into_iter().zip(remaining_new) {
             let old_line = &snapshot[old_index];
             let new_line = &committed_lines[new_index];
             if sufficiently_informative(old_line)
@@ -341,32 +351,34 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
     for line in &committed_lines {
         *committed_counts.entry(line.clone()).or_default() += 1;
     }
-    for (line, count) in committed_counts {
-        let captured = snapshot_counts.get(&line).copied().unwrap_or_default();
-        if count <= captured || !snapshot_counts.contains_key(&line) {
-            continue;
+    let mut committed_occurrences = HashMap::<Vec<u8>, usize>::new();
+    for (index, line) in committed_lines.iter().enumerate() {
+        let occurrence = committed_occurrences.entry(line.clone()).or_default();
+        *occurrence += 1;
+        let captured = snapshot_counts.get(line).copied().unwrap_or_default();
+        if captured == 1 && committed_counts.get(line).copied().unwrap_or_default() > 1 {
+            committed_owners[index].candidates |= owner_candidate(Owner::Gap);
+            committed_owners[index].ambiguous = true;
         }
-        for (index, committed_line) in committed_lines.iter().enumerate() {
-            if *committed_line == line {
-                committed_owners[index] = OwnedLine {
-                    owner: Owner::Gap,
-                    candidates: owner_candidate(Owner::Gap),
-                    source_step: None,
-                    ambiguous: false,
-                };
-                unobserved_edits[index] = Some(UnobservedEditKind::UnmatchedUnknown);
-            }
+        if *occurrence > captured && captured > 0 {
+            committed_owners[index] = OwnedLine {
+                owner: Owner::Gap,
+                candidates: owner_candidate(Owner::Gap),
+                source_step: None,
+                ambiguous: false,
+            };
+            unobserved_edits[index] = Some(UnobservedEditKind::UnmatchedUnknown);
         }
     }
 
-    let duplicate_owners = duplicate_owners(&committed_lines, &committed_owners);
+    let duplicate_owners = duplicate_owners(&committed_owners);
 
     committed_lines
         .iter()
         .enumerate()
         .map(|(index, line)| {
             let owned = committed_owners[index];
-            let duplicates = duplicate_owners[line.as_slice()];
+            let duplicates = duplicate_owners[index];
             let candidates = owned.candidates | duplicates.candidates;
             let ambiguous = owned.ambiguous || duplicates.ambiguous;
             let label = if !added[index] || !all_candidates_have_ai_ancestry(candidates) {
@@ -708,6 +720,80 @@ fn replay(
                 if !touched.remove(line) {
                     continue;
                 }
+                let old_count = old
+                    .iter()
+                    .filter(|candidate| candidate.as_slice() == line)
+                    .count();
+                let new_count = new
+                    .iter()
+                    .filter(|candidate| candidate.as_slice() == line)
+                    .count();
+                let mut provenance = None;
+                let conflicting_provenance = old
+                    .iter()
+                    .zip(owners)
+                    .filter(|(candidate, _)| candidate.as_slice() == line)
+                    .any(|(_, owner)| {
+                        let current = (owner.owner, owner.source_step, owner.candidates);
+                        provenance
+                            .replace(current)
+                            .is_some_and(|previous| previous != current)
+                    });
+                let equal_old_count = ops
+                    .iter()
+                    .filter(|operation| operation.tag() == DiffTag::Equal)
+                    .flat_map(|operation| operation.old_range().zip(operation.new_range()))
+                    .filter(|(old_index, new_index)| {
+                        old[*old_index].as_slice() == line && new[*new_index].as_slice() == line
+                    })
+                    .count();
+                let all_old_occurrences_direct = old
+                    .iter()
+                    .zip(owners)
+                    .filter(|(candidate, _)| candidate.as_slice() == line)
+                    .all(|(_, owner)| owner.owner == Owner::Direct);
+                if old_count > 1
+                    && new_count >= old_count
+                    && equal_old_count == old_count
+                    && !conflicting_provenance
+                    && all_old_occurrences_direct
+                    && matches!(kind, StepKind::External)
+                {
+                    if new_count > old_count
+                        && matches!(kind, StepKind::External | StepKind::Unknown)
+                    {
+                        let equal_new: HashSet<_> = ops
+                            .iter()
+                            .filter(|operation| operation.tag() == DiffTag::Equal)
+                            .flat_map(|operation| operation.old_range().zip(operation.new_range()))
+                            .filter_map(|(old_index, new_index)| {
+                                (old[old_index].as_slice() == line
+                                    && new[new_index].as_slice() == line)
+                                    .then_some(new_index)
+                            })
+                            .collect();
+                        for (index, candidate) in new.iter().enumerate() {
+                            if candidate.as_slice() == line && !equal_new.contains(&index) {
+                                next_owners[index] = match kind {
+                                    StepKind::External => OwnedLine {
+                                        owner: Owner::External,
+                                        candidates: owner_candidate(Owner::External),
+                                        source_step: Some(source_step),
+                                        ambiguous: false,
+                                    },
+                                    StepKind::Unknown => OwnedLine {
+                                        owner: Owner::Gap,
+                                        candidates: owner_candidate(Owner::Gap),
+                                        source_step: Some(source_step),
+                                        ambiguous: false,
+                                    },
+                                    StepKind::Ai { .. } => unreachable!(),
+                                };
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let mut candidates = 0;
                 for (old_line, owner) in old.iter().zip(owners) {
                     if old_line.as_slice() == line {
@@ -736,27 +822,14 @@ fn replay(
     next_owners
 }
 
-fn duplicate_owners<'a>(
-    lines: &'a [Vec<u8>],
-    owners: &[OwnedLine],
-) -> HashMap<&'a [u8], DuplicateOwners> {
-    let mut groups = HashMap::<&[u8], DuplicateOwners>::new();
-    for (line, owner) in lines.iter().zip(owners.iter()) {
-        let group = groups.entry(line.as_slice()).or_insert(DuplicateOwners {
-            owner: owner.owner,
-            source_step: owner.source_step,
-            candidates: 0,
-            ambiguous: false,
-        });
-        if group.owner != owner.owner
-            || group.source_step != owner.source_step
-            || group.candidates != 0 && group.candidates != owner.candidates
-        {
-            group.ambiguous = true;
-        }
-        group.candidates |= owner.candidates;
-    }
-    groups
+fn duplicate_owners(owners: &[OwnedLine]) -> Vec<DuplicateOwners> {
+    owners
+        .iter()
+        .map(|owner| DuplicateOwners {
+            candidates: owner.candidates,
+            ambiguous: owner.ambiguous,
+        })
+        .collect()
 }
 
 fn added_lines(parent: &[Vec<u8>], committed: &[Vec<u8>]) -> Vec<bool> {
@@ -1250,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_ai_snapshot_lines_are_probable_after_unobserved_alignment() {
+    fn duplicate_ai_snapshot_lines_from_one_source_stay_strong_after_alignment() {
         let ev = evidence(
             b"base\n",
             vec![step(
@@ -1262,8 +1335,8 @@ mod tests {
             &ev,
             b"base\nrepeat_call();\nrepeat_call();\nlate_value();\n",
         );
-        assert_eq!(lines[1].line.label, Label::AiProbable);
-        assert_eq!(lines[2].line.label, Label::AiProbable);
+        assert_eq!(lines[1].line.label, Label::AiStrong);
+        assert_eq!(lines[2].line.label, Label::AiStrong);
         assert_eq!(lines[3].line.label, Label::Unknown);
     }
 
@@ -1282,6 +1355,126 @@ mod tests {
         );
         assert_eq!(lines[1].line.label, Label::Unknown);
         assert_eq!(lines[2].line.label, Label::Unknown);
+    }
+
+    #[test]
+    fn real_reading_level_append_and_single_edit_keep_ai_lines_aligned() {
+        let snapshot =
+            include_bytes!("../../prov-hook/tests/fixtures/real_reading_level/ai_snapshot.ts");
+        let committed =
+            include_bytes!("../../prov-hook/tests/fixtures/real_reading_level/committed.ts");
+        let ev = evidence(b"", vec![step(StepKind::Ai { degraded: false }, snapshot)]);
+        let lines = derive_lines_with_unobserved_edits(&ev, committed);
+        let text = split_lines(committed);
+        let edited_line = text
+            .iter()
+            .position(|line| line.windows(3).any(|window| window == b"206"))
+            .unwrap();
+        assert_eq!(lines[edited_line].line.label, Label::Mixed);
+        assert_eq!(
+            lines[edited_line].unobserved_edit,
+            Some(UnobservedEditKind::MixedByTokenOverlap)
+        );
+        let ai_snapshot_lines = split_lines(snapshot);
+        let appended_start = ai_snapshot_lines.len();
+        assert!(lines[appended_start..]
+            .iter()
+            .all(|line| line.line.label == Label::Unknown));
+        for attributed in lines.iter().take(appended_start) {
+            if attributed.line.line == edited_line + 1 {
+                continue;
+            }
+            if attributed.line.blank {
+                continue;
+            }
+            assert_eq!(
+                attributed.line.label,
+                Label::AiStrong,
+                "line {}",
+                attributed.line.line
+            );
+            assert_eq!(
+                attributed.unobserved_edit,
+                Some(UnobservedEditKind::ExactSurvivorInChangedFile),
+                "line {}",
+                attributed.line.line
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_braces_align_in_order_when_a_function_is_appended() {
+        let snapshot = b"function one() {\n}\nfunction two() {\n}\nvalue = 200;\n";
+        let committed =
+            b"function one() {\n}\nfunction two() {\n}\nvalue = 201;\nfunction user() {\n}\n";
+        let ev = evidence(b"", vec![step(StepKind::Ai { degraded: false }, snapshot)]);
+        let lines = derive_lines_with_unobserved_edits(&ev, committed);
+        assert_eq!(lines[1].line.label, Label::AiStrong);
+        assert_eq!(lines[3].line.label, Label::AiStrong);
+        assert_eq!(lines[4].line.label, Label::Mixed);
+        assert!(lines[5..]
+            .iter()
+            .all(|line| line.line.label == Label::Unknown));
+    }
+
+    #[test]
+    fn real_sentence_split_external_snapshot_explains_unknown_and_mixed_lines() {
+        let ai =
+            include_bytes!("../../prov-hook/tests/fixtures/real_sentence_split/ai_snapshot.ts");
+        let external = include_bytes!(
+            "../../prov-hook/tests/fixtures/real_sentence_split/external_snapshot.ts"
+        );
+        let committed =
+            include_bytes!("../../prov-hook/tests/fixtures/real_sentence_split/committed.ts");
+        let normalize = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .replace("\r\n", "\n")
+                .into_bytes()
+        };
+        let ai = normalize(ai);
+        let external = normalize(external);
+        let committed = normalize(committed);
+        assert_eq!(split_lines(&ai).len(), 167);
+        assert_eq!(split_lines(&external).len(), 159);
+        assert_eq!(split_lines(&committed).len(), 159);
+        assert_eq!(external, committed);
+        let mut ai_step = step(StepKind::Ai { degraded: false }, &ai);
+        ai_step.attribution = Some(StepAttribution {
+            adapter_id: Some("vscode-copilot".into()),
+            tool_id: Some("vscode-copilot".into()),
+            run_id: None,
+            operation: Some("create_file".into()),
+            primary_basis: Some("DIRECT_ACCEPTED_EDIT".into()),
+            score_milli: 1000,
+            penalties_milli: Vec::new(),
+            supporting_basis: Vec::new(),
+            limiting_basis: Vec::new(),
+            direct_lines: split_lines(&ai),
+        });
+        let ev = evidence(b"", vec![ai_step, step(StepKind::External, &external)]);
+        let lines = derive_lines_with_attribution(&ev, &committed);
+        assert!(!lines[50].ambiguous);
+        assert_ne!(lines[50].line.label, Label::Unknown);
+        let counts = count(
+            &lines
+                .iter()
+                .map(|line| line.line.clone())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            (counts.d, counts.s, counts.p, counts.m, counts.u, counts.e),
+            (94, 0, 10, 5, 25, 134)
+        );
+        assert!(lines.iter().any(|line| line.line.label == Label::Unknown));
+        let events =
+            include_str!("../../prov-hook/tests/fixtures/real_sentence_split/events.jsonl");
+        let external_event = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["event"] == "external_change")
+            .unwrap();
+        assert!(external_event["line_ranges"].as_array().unwrap().len() > 1);
+        assert_eq!(external_event["deleted_at"].as_array().unwrap().len(), 14);
     }
 
     #[test]
