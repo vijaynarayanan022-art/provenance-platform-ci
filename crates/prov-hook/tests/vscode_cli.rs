@@ -307,7 +307,7 @@ fn vscode_always_returns_exact_empty_object_for_empty_garbage_and_fixtures() {
 }
 
 #[test]
-fn read_only_tools_are_ignored_and_unknown_tool_only_logs_diagnostic() {
+fn read_only_tools_are_ignored_and_unknown_tool_logs_diagnostic_and_opens_window() {
     let fixture = Fixture::new("filtering");
     for name in [
         "file_search",
@@ -363,7 +363,275 @@ fn read_only_tools_are_ignored_and_unknown_tool_only_logs_diagnostic() {
     );
     assert!(events(&fixture.store)
         .iter()
-        .all(|event| event["event"] == "unsupported_tool"));
+        .any(|event| event["event"] == "window_open"));
+    assert!(events(&fixture.store)
+        .iter()
+        .any(|event| event["event"] == "window_close"));
+    fixture.drop_root();
+}
+
+#[test]
+fn r26_store_fixture_identifies_the_unknown_existing_file_edit_tool() {
+    let fixture_root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vscode_edit_tools_r26");
+    let markers: Vec<Value> = fs::read_to_string(fixture_root.join("markers.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let unsupported: Vec<_> = markers
+        .iter()
+        .filter(|marker| marker["event"] == "unsupported_tool")
+        .collect();
+    assert_eq!(unsupported.len(), 2);
+    assert!(unsupported
+        .iter()
+        .all(|marker| marker["tool_name"] == "multi_replace_string_in_file"));
+
+    let events: Vec<Value> = fs::read_to_string(fixture_root.join("copilot-events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for path in ["index.js", "package.json"] {
+        assert!(events.iter().any(|event| {
+            event["event"] == "external_change"
+                && event["path"] == path
+                && event["hook_event_name"] == "PreToolUse"
+        }));
+    }
+    assert!(events
+        .iter()
+        .any(|event| { event["event"] == "ai_change" && event["path"] == "taskUtils.js" }));
+}
+
+#[test]
+fn r26_commit_27_multi_replace_edits_are_direct_for_existing_files() {
+    let fixture = Fixture::new("r26-commit-27");
+    let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/vscode_edit_tools_r26/commit-27");
+    let edits = [("package.json", "package"), ("index.js", "index")];
+    for (path, stem) in edits {
+        let before = fs::read(fixture_root.join(format!("{stem}.before.bin"))).unwrap();
+        fs::write(fixture.repo.join(path), &before).unwrap();
+    }
+    fixture.commit("R26 parent files");
+
+    for (index, (path, stem)) in edits.iter().enumerate() {
+        let before = fs::read(fixture_root.join(format!("{stem}.before.bin"))).unwrap();
+        let after = fs::read(fixture_root.join(format!("{stem}.after.bin"))).unwrap();
+        let input = json!({
+            "replacements":[{
+                "filePath":fixture.repo.join(path),
+                "oldString":String::from_utf8(before).unwrap(),
+                "newString":String::from_utf8(after.clone()).unwrap()
+            }]
+        });
+        let pre = json!({
+            "hook_event_name":"PreToolUse","session_id":"r26-session",
+            "cwd":fixture.repo,"tool_name":"multi_replace_string_in_file",
+            "tool_use_id":format!("r26-edit-{index}"),"tool_input":input
+        });
+        assert_hook_response(&fixture.hook(&pre, "vscode"));
+        fs::write(fixture.repo.join(path), after).unwrap();
+        let mut post = pre;
+        post["hook_event_name"] = json!("PostToolUse");
+        assert_hook_response(&fixture.hook(&post, "vscode"));
+        if index == 0 {
+            let terminal_pre = json!({
+                "hook_event_name":"PreToolUse","session_id":"r26-session",
+                "cwd":fixture.repo,"tool_name":"run_in_terminal","tool_use_id":"test-run",
+                "tool_input":{"command":"npm test"}
+            });
+            assert_hook_response(&fixture.hook(&terminal_pre, "vscode"));
+            let mut terminal_post = terminal_pre;
+            terminal_post["hook_event_name"] = json!("PostToolUse");
+            assert_hook_response(&fixture.hook(&terminal_post, "vscode"));
+        }
+    }
+
+    let commit = fixture.commit("R26 source changes");
+    let derived = fixture.cli(&[
+        "derive",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+    ]);
+    assert!(
+        derived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&derived.stderr)
+    );
+    let report = file_report(&fixture, &commit);
+    let summary = fixture.cli(&[
+        "summary",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+        "--format",
+        "json",
+    ]);
+    assert!(
+        summary.status.success(),
+        "{}",
+        String::from_utf8_lossy(&summary.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    assert!(summary["totals"]["ai_direct"].as_u64().unwrap() > 0);
+    for path in ["index.js", "package.json"] {
+        let file = report["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == path)
+            .unwrap();
+        assert!(file["ai_direct"].as_u64().unwrap() > 0, "{path}: {file}");
+        let explanation = fixture.cli(&[
+            "explain",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--commit",
+            &commit,
+            "--file",
+            path,
+            "--format",
+            "json",
+        ]);
+        assert!(
+            explanation.status.success(),
+            "{path}: {}",
+            String::from_utf8_lossy(&explanation.stderr)
+        );
+        let explanation: Value = serde_json::from_slice(&explanation.stdout).unwrap();
+        assert!(
+            explanation["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| { line["category"] == "ai_direct" }),
+            "{path}: {explanation}"
+        );
+    }
+    fixture.drop_root();
+}
+
+#[test]
+fn recognized_existing_file_edit_tools_are_direct_and_unknown_tools_are_strong() {
+    let recognized = [
+        (
+            "insert_edit_into_file",
+            json!({"filePath":"tracked.txt","code":"const added = true;\n"}),
+            "base\nconst added = true\n",
+        ),
+        (
+            "replace_string_in_file",
+            json!({"filePath":"tracked.txt","oldString":"base","newString":"changed\nconst added = true"}),
+            "changed\nconst added = true\n",
+        ),
+        (
+            "multi_replace_string_in_file",
+            json!({"replacements":[{"filePath":"tracked.txt","oldString":"base","newString":"changed\nconst added = true"}]}),
+            "changed\nconst added = true\n",
+        ),
+        (
+            "apply_patch",
+            json!({"input":"*** Begin Patch\n*** Update File: tracked.txt\n@@\n base\n+const added = true;\n*** End Patch"}),
+            "base\nconst added = true;\n",
+        ),
+    ];
+    for (tool, input, after) in recognized {
+        let fixture = Fixture::new(tool);
+        let mut pre = json!({
+            "hook_event_name":"PreToolUse","session_id":"edit-session",
+            "cwd":fixture.repo,"tool_name":tool,"tool_use_id":"edit-call",
+            "tool_input":input
+        });
+        if let Some(path) = pre["tool_input"]["filePath"].as_str() {
+            pre["tool_input"]["filePath"] = json!(fixture.repo.join(path));
+        }
+        if let Some(path) = pre["tool_input"]["replacements"][0]["filePath"].as_str() {
+            pre["tool_input"]["replacements"][0]["filePath"] = json!(fixture.repo.join(path));
+        }
+        assert_hook_response(&fixture.hook(&pre, "vscode"));
+        fs::write(fixture.repo.join("tracked.txt"), after).unwrap();
+        let mut post = pre.clone();
+        post["hook_event_name"] = json!("PostToolUse");
+        assert_hook_response(&fixture.hook(&post, "vscode"));
+
+        let matching = events(&fixture.store)
+            .into_iter()
+            .find(|event| event["event"] == "ai_change" && event["path"] == "tracked.txt")
+            .unwrap_or_else(|| panic!("{tool} did not record an AI change"));
+        assert_eq!(matching["structured_edit"], true, "{tool}");
+        assert!(matching["before_sha"].is_string(), "{tool}");
+        assert!(matching["after_sha"].is_string(), "{tool}");
+        assert!(matching["line_ranges"].is_array(), "{tool}");
+
+        let commit = fixture.commit("Copilot edit");
+        let derived = fixture.cli(&[
+            "derive",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--commit",
+            &commit,
+        ]);
+        assert!(
+            derived.status.success(),
+            "{tool}: {}",
+            String::from_utf8_lossy(&derived.stderr)
+        );
+        let report = file_report(&fixture, &commit);
+        let file = report["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "tracked.txt")
+            .unwrap();
+        assert!(file["ai_direct"].as_u64().unwrap() > 0, "{tool}: {file}");
+        fixture.drop_root();
+    }
+
+    let fixture = Fixture::new("unknown-edit-fallback");
+    let pre = json!({
+        "hook_event_name":"PreToolUse","session_id":"unknown-session",
+        "cwd":fixture.repo,"tool_name":"future_edit_tool","tool_use_id":"unknown-call",
+        "tool_input":{"filePath":fixture.repo.join("tracked.txt")}
+    });
+    assert_hook_response(&fixture.hook(&pre, "vscode"));
+    fs::write(fixture.repo.join("tracked.txt"), "base\nfallback line\n").unwrap();
+    let mut post = pre.clone();
+    post["hook_event_name"] = json!("PostToolUse");
+    assert_hook_response(&fixture.hook(&post, "vscode"));
+    let ai_event = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["path"] == "tracked.txt")
+        .unwrap();
+    assert_eq!(ai_event["structured_edit"], false);
+    let markers = events(&fixture.store);
+    assert!(markers
+        .iter()
+        .any(|event| event["event"] == "unsupported_tool"
+            && event["tool_name"] == "future_edit_tool"));
+    let commit = fixture.commit("Unknown tool edit");
+    let derived = fixture.cli(&[
+        "derive",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+    ]);
+    assert!(derived.status.success());
+    let file = file_report(&fixture, &commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(file["ai_direct"], 0);
+    assert!(file["ai_strong"].as_u64().unwrap() > 0);
     fixture.drop_root();
 }
 
@@ -501,6 +769,63 @@ fn missing_pre_snapshot_is_degraded_and_never_ai_credited() {
         .unwrap();
     assert_eq!(tracked["ai_strong"], 0);
     assert!(tracked["unknown"].as_u64().unwrap() >= 1);
+    fixture.drop_root();
+}
+
+#[test]
+fn human_edit_between_tool_calls_stays_external_and_unattributed() {
+    let fixture = Fixture::new("human-between-tools");
+    let input = json!({
+        "filePath":fixture.repo.join("tracked.txt"),
+        "oldString":"base",
+        "newString":"base\nAI line"
+    });
+    let first_pre = json!({
+        "hook_event_name":"PreToolUse","session_id":"human-session",
+        "cwd":fixture.repo,"tool_name":"replace_string_in_file",
+        "tool_use_id":"first-edit","tool_input":input
+    });
+    assert_hook_response(&fixture.hook(&first_pre, "vscode"));
+    let mut first_post = first_pre.clone();
+    first_post["hook_event_name"] = json!("PostToolUse");
+    assert_hook_response(&fixture.hook(&first_post, "vscode"));
+
+    fs::write(fixture.repo.join("tracked.txt"), "human line\n").unwrap();
+    let second_pre = json!({
+        "hook_event_name":"PreToolUse","session_id":"human-session",
+        "cwd":fixture.repo,"tool_name":"replace_string_in_file",
+        "tool_use_id":"second-edit","tool_input":input
+    });
+    assert_hook_response(&fixture.hook(&second_pre, "vscode"));
+    fs::write(fixture.repo.join("tracked.txt"), "human line\nAI line\n").unwrap();
+    let mut second_post = second_pre.clone();
+    second_post["hook_event_name"] = json!("PostToolUse");
+    assert_hook_response(&fixture.hook(&second_post, "vscode"));
+
+    let records = events(&fixture.store);
+    assert!(records.iter().any(|event| {
+        event["event"] == "external_change"
+            && event["path"] == "tracked.txt"
+            && event["hook_event_name"] == "PreToolUse"
+    }));
+    let commit = fixture.commit("human and AI edits");
+    let derived = fixture.cli(&[
+        "derive",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+    ]);
+    assert!(derived.status.success());
+    let file = file_report(&fixture, &commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(file["ai_direct"], 1);
+    assert_eq!(file["unknown"], 1);
     fixture.drop_root();
 }
 
