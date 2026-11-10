@@ -1,0 +1,124 @@
+﻿#!/usr/bin/env node
+#!/usr/bin/env node
+
+const { Command, Option } = require('commander');
+#include the rest of the file
+const fs = require('node:fs');
+const path = require('node:path');
+const {
+  normalizePriority,
+  validateDueDate,
+  sortTasks,
+  isOverdue,
+} = require('./taskUtils');
+
+const program = new Command();
+const tasksFile = path.join(__dirname, 'tasks.json');
+
+function readTasks() {
+  try {
+    const data = fs.readFileSync(tasksFile, 'utf8');
+    const tasks = JSON.parse(data);
+    if (!Array.isArray(tasks)) {
+      throw new Error('The tasks file must contain a JSON array.');
+    }
+    return tasks;
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+function writeTasks(tasks) {
+  fs.writeFileSync(tasksFile, `${JSON.stringify(tasks, null, 2)}\n`, 'utf8');
+}
+
+function formatTask(task) {
+  const status = task.done ? '[x]' : '[ ]';
+  const priority = ` [${task.priority ?? 'medium'}]`;
+  const due = task.dueDate ? ` due:${task.dueDate}` : '';
+  const description = `${status} #${task.id}${priority}${due} ${task.description}`;
+
+  if (isOverdue(task)) {
+    return `\x1b[31m${description}\x1b[0m`;
+  }
+
+  return description;
+}
+
+program
+  .name('tasktrack')
+  .description('A simple command-line task tracker')
+  .version('1.0.0');
+
+program
+  .command('add <description>')
+  .description('Add a task')
+  .addOption(new Option('-d, --due <date>', 'Due date in YYYY-MM-DD format'))
+  .addOption(new Option('-p, --priority <priority>', 'Task priority').choices(['low', 'medium', 'high']).default('medium'))
+  .action((description, options) => {
+    try {
+      const tasks = readTasks();
+      const id = tasks.reduce((highest, task) => Math.max(highest, task.id), 0) + 1;
+      const dueDate = validateDueDate(options.due);
+      const priority = normalizePriority(options.priority ?? 'medium');
+      const task = { id, description, done: false, dueDate, priority };
+
+      tasks.push(task);
+      writeTasks(tasks);
+      console.log(`Added task #${id}: ${description}`);
+    } catch (error) {
+      console.error(error.message);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command('list')
+  .description('List all tasks')
+  .action(() => {
+    const tasks = sortTasks(readTasks());
+    if (tasks.length === 0) {
+      console.log('No tasks yet. Add one with: tasktrack add "Your task"');
+      return;
+    }
+
+    for (const task of tasks) {
+      console.log(formatTask(task));
+    }
+  });
+
+program
+  .command('done <id>')
+  .description('Mark a task as done')
+  .action((rawId) => {
+    const id = Number(rawId);
+    if (!Number.isInteger(id) || id < 1) {
+      console.error('Task ID must be a positive integer.');
+      process.exitCode = 1;
+      return;
+    }
+
+    const tasks = readTasks();
+    const task = tasks.find((item) => item.id === id);
+    if (!task) {
+      console.error(`Task #${id} was not found.`);
+      process.exitCode = 1;
+      return;
+    }
+
+    task.done = true;
+    writeTasks(tasks);
+    console.log(`Marked task #${id} as done.`);
+  });
+
+if (require.main === module) {
+  program.parse();
+}
+
+module.exports = {
+  program,
+  readTasks,
+  writeTasks,
+  formatTask,
+};

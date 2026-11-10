@@ -350,7 +350,11 @@ pub fn tools_for_commits(repo_path: &Path, commits: &[String]) -> Result<Vec<Vec
             .map(|parent| committer_time_ns(&repo.root, parent))
             .transpose()?
             .unwrap_or_default();
-        let end = committer_time_ns(&repo.root, commit)?.saturating_add(2 * NANOSECOND);
+        let commit_time = committer_time_ns(&repo.root, commit)?;
+        let end = commit_time.saturating_add(2 * NANOSECOND);
+        let ancestors = git_checked(&repo.root, &["rev-list", commit])?;
+        let ancestors: HashSet<_> = ancestors.lines().collect();
+        let discarded_before = discarded_attempt_cutoff(&events, &ancestors, commit_time);
         let (files, _) = commit_files(&repo.root, parent, commit)?;
         let changed_paths: BTreeSet<_> = files.into_iter().map(|file| file.path).collect();
         let tools: BTreeSet<_> = events
@@ -359,6 +363,7 @@ pub fn tools_for_commits(repo_path: &Path, commits: &[String]) -> Result<Vec<Vec
                 event.event == "ai_change"
                     && event.timestamp >= start
                     && event.timestamp <= end
+                    && discarded_before.is_none_or(|boundary| event.timestamp > boundary)
                     && event
                         .path
                         .as_deref()
@@ -733,6 +738,9 @@ fn derive_resolved_commit(
         .transpose()?
         .unwrap_or(0);
     let commit_time = committer_time_ns(&repo.root, &commit)?;
+    let commit_ancestors = git_checked(&repo.root, &["rev-list", &commit])?;
+    let commit_ancestors: HashSet<_> = commit_ancestors.lines().collect();
+    let discarded_before = discarded_attempt_cutoff(event_records, &commit_ancestors, commit_time);
     let parent_evidence = parent
         .as_deref()
         .map(|parent| read_parent_evidence(&repo.root, store, parent))
@@ -893,6 +901,7 @@ fn derive_resolved_commit(
             &parent_line_labels,
             parent.as_deref().unwrap_or_default(),
             &parent_evidence,
+            discarded_before,
         );
         let delayed_commit = selected_events.first().is_some_and(|event| {
             event_predates_parent(
@@ -1501,6 +1510,11 @@ pub fn explain_commit(
         &parent_line_labels,
         parent.unwrap_or_default(),
         &parent_evidence,
+        {
+            let ancestors = git_checked(&root, &["rev-list", &commit])?;
+            let ancestors: HashSet<_> = ancestors.lines().collect();
+            discarded_attempt_cutoff(&events, &ancestors, commit_time)
+        },
     );
     let delayed_commit = selected_events.first().is_some_and(|event| {
         event_predates_parent(
@@ -2066,6 +2080,7 @@ fn events_for_path<'a>(
     parent_line_labels: &HashMap<String, HashMap<usize, StoredParentLine>>,
     parent: &str,
     parent_evidence: &ParentEvidence,
+    discarded_before: Option<u128>,
 ) -> Vec<&'a EventRecord> {
     let mut matched: Vec<_> = event_index
         .get(path)
@@ -2074,6 +2089,7 @@ fn events_for_path<'a>(
         .map(|&index| &events[index])
         .filter(|event| {
             event.timestamp > parent_time
+                && discarded_before.is_none_or(|boundary| event.timestamp > boundary)
                 && !event_was_consumed(
                     event,
                     path,
@@ -2124,6 +2140,11 @@ fn events_for_path<'a>(
                 && event.after_sha.as_deref().is_some_and(|sha| {
                     crate::read_blob(&store.join("blobs").join(sha), sha).is_some()
                 })
+                && (discarded_before.is_none_or(|boundary| event.timestamp > boundary)
+                    || event.after_sha.as_deref().is_some_and(|sha| {
+                        crate::read_blob(&store.join("blobs").join(sha), sha)
+                            .is_some_and(|bytes| normalize_eol(&bytes) == committed_content)
+                    }))
         })
         .collect::<Vec<_>>();
     let exact_delayed = old_events.iter().find(|event| {
@@ -2136,6 +2157,25 @@ fn events_for_path<'a>(
         return vec![event];
     }
     matched
+}
+
+fn discarded_attempt_cutoff(
+    events: &[EventRecord],
+    commit_ancestors: &HashSet<&str>,
+    commit_time: u128,
+) -> Option<u128> {
+    events
+        .iter()
+        .filter(|event| {
+            event.event == "head_move"
+                && event.timestamp < commit_time
+                && event
+                    .new_head
+                    .as_deref()
+                    .is_some_and(|head| !commit_ancestors.contains(head))
+        })
+        .map(|event| event.timestamp)
+        .max()
 }
 
 fn event_was_consumed(
@@ -3603,6 +3643,47 @@ mod tests {
     }
 
     #[test]
+    fn discarded_attempt_cutoff_uses_the_latest_head_move_off_target_history() {
+        let mut moves = Vec::new();
+        for (timestamp, head) in [(10, "parent"), (20, "discarded"), (30, "target")] {
+            let mut record = event(None, "head_move", false, None);
+            record.timestamp = timestamp;
+            record.new_head = Some(head.into());
+            moves.push(record);
+        }
+        let ancestors = HashSet::from(["parent", "target"]);
+        assert_eq!(discarded_attempt_cutoff(&moves, &ancestors, 40), Some(20));
+        assert_eq!(discarded_attempt_cutoff(&moves, &ancestors, 25), Some(20));
+        assert_eq!(discarded_attempt_cutoff(&moves[..1], &ancestors, 40), None);
+    }
+
+    #[test]
+    fn r27_store_fixture_places_the_reset_boundary_before_the_second_attempt() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../prov-hook/tests/fixtures/r27_discarded_attempts/repos/66fc164676cc5b2cdff7bf6eb592f5cfad2379f30e5c4fd6e9618c4b405419d4/events/git.jsonl",
+        );
+        let events = read_event_paths(vec![fixture]);
+        let ancestors = HashSet::from([
+            "360b8d29054a24ef162144df76753807e1a04cd5",
+            "8d65579ee6ad8dd1f975a874c51d1d90caae31ed",
+        ]);
+        let cutoff = discarded_attempt_cutoff(&events, &ancestors, u128::MAX).unwrap();
+        let second_head = events
+            .iter()
+            .filter(|event| {
+                event.new_head.as_deref() == Some("8d65579ee6ad8dd1f975a874c51d1d90caae31ed")
+            })
+            .map(|event| event.timestamp)
+            .min()
+            .unwrap();
+        assert!(cutoff < second_head);
+        assert!(events.iter().any(|event| {
+            event.new_head.as_deref() == Some("27f49d1dfe58155d2c933440abc97a7b339d56f1")
+                && event.timestamp < cutoff
+        }));
+    }
+
+    #[test]
     fn readable_blob_ids_enforces_the_one_mib_limit_and_requires_known_sizes() {
         let sizes = BTreeMap::from([
             ("at-limit".to_owned(), MAX_FILE),
@@ -3647,9 +3728,62 @@ mod tests {
             &HashMap::new(),
             "parent",
             &ParentEvidence::default(),
+            None,
         );
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].tool_use_id.as_deref(), Some("tool-64"));
+        let _ = fs::remove_dir_all(store);
+    }
+
+    #[test]
+    fn discarded_events_survive_only_as_exact_delayed_evidence() {
+        let store = test_store("discarded-event-delayed-exact");
+        let committed = b"exact delayed snapshot\n";
+        let exact_sha = put_blob(&store, committed);
+        let unrelated_sha = put_blob(&store, b"unrelated discarded snapshot\n");
+        let mut unrelated = event(Some(unrelated_sha), "ai_change", false, None);
+        unrelated.timestamp = 10;
+        unrelated.path = Some("delayed.txt".into());
+        unrelated.head = Some("ancestor".into());
+        let mut exact = event(Some(exact_sha), "ai_change", false, None);
+        exact.timestamp = 20;
+        exact.path = Some("delayed.txt".into());
+        exact.head = Some("ancestor".into());
+        let events = vec![unrelated, exact];
+        let index = index_events(&events);
+        let parent_evidence = ParentEvidence {
+            ancestors: HashSet::from(["ancestor".to_owned()]),
+            consumed_tool_use_ids: HashSet::new(),
+        };
+        let selected = events_for_path(
+            &store,
+            &events,
+            &index,
+            "delayed.txt",
+            100,
+            b"",
+            committed,
+            &HashMap::new(),
+            "parent",
+            &parent_evidence,
+            Some(50),
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].timestamp, 20);
+        let no_exact_match = events_for_path(
+            &store,
+            &events,
+            &index,
+            "delayed.txt",
+            100,
+            b"",
+            b"different final snapshot\n",
+            &HashMap::new(),
+            "parent",
+            &parent_evidence,
+            Some(50),
+        );
+        assert!(no_exact_match.is_empty());
         let _ = fs::remove_dir_all(store);
     }
 
@@ -3701,6 +3835,7 @@ mod tests {
                 &HashMap::new(),
                 "parent",
                 &evidence,
+                None,
             );
             assert_eq!(selected.len(), 1);
             assert_eq!(selected[0].tool_use_id.as_deref(), Some("tool-c"));

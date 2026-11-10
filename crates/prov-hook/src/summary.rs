@@ -518,14 +518,12 @@ fn totals_from_rows(rows: &[Row]) -> Totals {
             ai_direct + ai_strong + ai_probable + mixed,
             eligible,
         ),
-        coverage: Some(
-            prov_capture::commit::coverage_band_with_unobserved(
-                covered,
-                eligible,
-                unobserved_lines,
-            )
-            .into(),
-        ),
+        coverage: Some(if rows.len() == 1 {
+            rows[0].coverage.clone().unwrap_or_else(|| "unknown".into())
+        } else {
+            prov_capture::commit::coverage_band_with_unobserved(covered, eligible, unobserved_lines)
+                .into()
+        }),
         tools: Some(tools.into_iter().collect()),
     }
 }
@@ -964,7 +962,9 @@ use crate::{git_hooks, pr_report};
 
 #[cfg(test)]
 mod tests {
-    use super::full_category;
+    use super::{
+        full_category, render_table, row_json, totals_from_rows, totals_json, FileRange, Row,
+    };
 
     #[test]
     fn line_codes_expand_to_full_category_names() {
@@ -978,5 +978,41 @@ mod tests {
         ] {
             assert_eq!(full_category(code), expected);
         }
+    }
+
+    #[test]
+    fn single_commit_total_uses_the_commit_coverage_band() {
+        let row = Row {
+            commit: "commit".into(),
+            status: "derived",
+            files: Some(1),
+            eligible: Some(10),
+            ai_direct: Some(10),
+            ai_strong: Some(0),
+            ai_probable: Some(0),
+            mixed: Some(0),
+            unknown: Some(0),
+            excluded: Some(0),
+            deterministic_pct: Some(100.0),
+            linked_pct: Some(100.0),
+            coverage: Some("partial".into()),
+            coverage_unobserved_lines: Some(0),
+            tools: Some(Vec::new()),
+            report: Some(
+                serde_json::json!({"files":[{"path":"file.txt","e":10,"evidence":"exact"}]}),
+            ),
+        };
+        let rows = vec![row];
+        let totals = totals_from_rows(&rows);
+        assert_eq!(totals.coverage.as_deref(), Some("partial"));
+        assert_eq!(row_json(&rows[0])["coverage"], "partial");
+        assert_eq!(totals_json(&totals)["coverage"], "partial");
+        let table = render_table(&rows, &totals, &[] as &[FileRange]);
+        let coverage_cells: Vec<_> = table
+            .lines()
+            .skip(1)
+            .map(|line| line.split('\t').nth(11).unwrap())
+            .collect();
+        assert_eq!(coverage_cells, ["partial", "partial"]);
     }
 }

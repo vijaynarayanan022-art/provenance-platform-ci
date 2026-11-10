@@ -1000,6 +1000,36 @@ mod tests {
     }
 
     #[test]
+    fn discarded_attempt_is_omitted_while_intervening_human_edit_stays_unknown() {
+        let mut new_attempt = step(
+            StepKind::Ai { degraded: false },
+            b"base\nhuman edit\nnew ai edit\n",
+        );
+        new_attempt.attribution = Some(StepAttribution {
+            adapter_id: Some("vscode-copilot".into()),
+            tool_id: Some("vscode-copilot".into()),
+            run_id: Some("new-attempt".into()),
+            session_id: Some("session".into()),
+            operation: Some("apply_patch".into()),
+            primary_basis: Some("DIRECT_AGENT_PATCH".into()),
+            score_milli: 990,
+            penalties_milli: Vec::new(),
+            supporting_basis: Vec::new(),
+            limiting_basis: Vec::new(),
+            direct_lines: vec![b"new ai edit".to_vec()],
+        });
+        // The discarded AI snapshot is omitted from replay; the retained sequence
+        // starts with the human edit made after the reset.
+        let ev = evidence(
+            b"base\n",
+            vec![step(StepKind::External, b"base\nhuman edit\n"), new_attempt],
+        );
+        let lines = derive_lines(&ev, b"base\nhuman edit\nnew ai edit\n");
+        assert_eq!(lines[1].label, Label::Unknown);
+        assert_eq!(lines[2].label, Label::AiDirect);
+    }
+
+    #[test]
     fn duplicate_ambiguity_is_probable_only_across_ai_sources() {
         let touched_duplicate = evidence(
             b"",

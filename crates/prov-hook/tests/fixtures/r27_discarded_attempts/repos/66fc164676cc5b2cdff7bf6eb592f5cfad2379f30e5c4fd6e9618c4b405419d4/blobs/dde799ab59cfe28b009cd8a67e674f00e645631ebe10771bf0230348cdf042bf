@@ -1,0 +1,75 @@
+const PRIORITY_ORDER = {
+  low: 1,
+  medium: 2,
+  high: 3,
+};
+
+function normalizePriority(priority) {
+  const normalized = String(priority ?? '').trim().toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(PRIORITY_ORDER, normalized)) {
+    throw new Error('Priority must be one of: low, medium, high.');
+  }
+  return normalized;
+}
+
+function validateDueDate(value) {
+  if (value == null || value === '') {
+    return null;
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value))) {
+    throw new Error('Invalid due date: expected YYYY-MM-DD.');
+  }
+
+  const [year, month, day] = String(value).split('-').map(Number);
+  const candidate = new Date(Date.UTC(year, month - 1, day));
+
+  if (
+    Number.isNaN(candidate.getTime()) ||
+    candidate.getUTCFullYear() !== year ||
+    candidate.getUTCMonth() !== month - 1 ||
+    candidate.getUTCDate() !== day
+  ) {
+    throw new Error('Invalid due date: expected a real calendar date in YYYY-MM-DD format.');
+  }
+
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function getPriorityRank(priority) {
+  return PRIORITY_ORDER[normalizePriority(priority)] ?? PRIORITY_ORDER.medium;
+}
+
+function isOverdue(task) {
+  if (!task || !task.dueDate || task.done) {
+    return false;
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const dueDate = new Date(`${task.dueDate}T00:00:00`);
+  return dueDate < today;
+}
+
+function sortTasks(tasks) {
+  return [...tasks].sort((left, right) => {
+    const leftPriority = getPriorityRank(left.priority ?? 'medium');
+    const rightPriority = getPriorityRank(right.priority ?? 'medium');
+
+    if (leftPriority !== rightPriority) {
+      return rightPriority - leftPriority;
+    }
+
+    return 0;
+  });
+}
+
+module.exports = {
+  PRIORITY_ORDER,
+  normalizePriority,
+  validateDueDate,
+  getPriorityRank,
+  isOverdue,
+  sortTasks,
+};

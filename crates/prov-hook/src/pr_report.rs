@@ -222,6 +222,7 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
     let mut carried_lines = 0usize;
     let mut metrics_available = true;
     let mut tool_commits = BTreeSet::new();
+    let mut single_commit_coverage = None;
 
     for ((_commit, report_bytes), sidecar) in commits.iter().zip(reports).zip(line_sidecars) {
         let Some(report_bytes) = report_bytes else {
@@ -231,6 +232,9 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
             Ok(value) if value["schema"] == "prov.commit/0.1" => value,
             _ => continue,
         };
+        if commits.len() == 1 {
+            single_commit_coverage = report["coverage"].as_str().map(str::to_owned);
+        }
         let Some(totals) = report.get("totals") else {
             continue;
         };
@@ -392,15 +396,14 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
     } else {
         None
     };
-    let coverage_band = if complete {
-        json!(prov_capture::commit::coverage_band_with_unobserved(
-            covered,
-            eligible,
-            unobserved_lines,
-        ))
-    } else {
-        Value::Null
-    };
+    let coverage_band = coverage_band_for_range(
+        complete,
+        commits.len(),
+        single_commit_coverage.as_deref(),
+        covered,
+        eligible,
+        unobserved_lines,
+    );
     let tool_commits: Vec<_> = tool_commits.into_iter().collect();
     let observed_tools = prov_capture::commit::tools_for_commits(repo, &tool_commits)
         .ok()
@@ -454,6 +457,29 @@ fn build_pr_report(repo: &Path, input: &PrInput, no_derive: bool) -> Result<Valu
         "top_files": top_files,
         "file_ranges": file_ranges,
     }))
+}
+
+fn coverage_band_for_range(
+    complete: bool,
+    commit_count: usize,
+    single_commit_coverage: Option<&str>,
+    covered: usize,
+    eligible: usize,
+    unobserved_lines: usize,
+) -> Value {
+    if !complete {
+        return Value::Null;
+    }
+    if commit_count == 1 {
+        return json!(single_commit_coverage.unwrap_or_else(|| {
+            prov_capture::commit::coverage_band_with_unobserved(covered, eligible, unobserved_lines)
+        }));
+    }
+    json!(prov_capture::commit::coverage_band_with_unobserved(
+        covered,
+        eligible,
+        unobserved_lines,
+    ))
 }
 
 pub(crate) struct CommitRange {
@@ -696,9 +722,9 @@ fn iso8601_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        analysis_coverage, content_coverage, coverage_dimensions, history_coverage,
-        source_coverage, ALGORITHM_VERSION, COVERAGE_VERSION, ELIGIBILITY_VERSION, ENGINE_VERSION,
-        FORMULA_VERSION, LINE_SURVIVAL_VERSION,
+        analysis_coverage, content_coverage, coverage_band_for_range, coverage_dimensions,
+        history_coverage, source_coverage, ALGORITHM_VERSION, COVERAGE_VERSION,
+        ELIGIBILITY_VERSION, ENGINE_VERSION, FORMULA_VERSION, LINE_SURVIVAL_VERSION,
     };
     use std::collections::BTreeMap;
 
@@ -718,6 +744,18 @@ mod tests {
         assert_eq!(analysis_coverage(3, 3), "complete");
         assert_eq!(analysis_coverage(0, 3), "low");
         assert_eq!(analysis_coverage(1, 3), "partial");
+    }
+
+    #[test]
+    fn one_commit_pr_coverage_preserves_the_commit_band() {
+        assert_eq!(
+            coverage_band_for_range(true, 1, Some("partial"), 10, 10, 0),
+            serde_json::json!("partial")
+        );
+        assert_eq!(
+            coverage_band_for_range(true, 2, None, 20, 20, 0),
+            serde_json::json!("high")
+        );
     }
 
     #[test]
