@@ -157,6 +157,12 @@ impl Fixture {
         git_text(&self.repo, &["rev-parse", "HEAD"])
     }
 
+    fn commit_at(&self, message: &str, date: &str) -> String {
+        git(&self.repo, &["add", "-A"]);
+        git_with_dates(&self.repo, &["commit", "-m", message], date);
+        git_text(&self.repo, &["rev-parse", "HEAD"])
+    }
+
     fn repo_id(&self) -> String {
         fs::read_dir(self.home.join("repos"))
             .unwrap()
@@ -398,6 +404,48 @@ fn git(repo: &Path, args: &[&str]) {
         .status()
         .unwrap();
     assert!(output.success(), "git {args:?} failed");
+}
+
+fn git_with_dates(repo: &Path, args: &[&str], date: &str) {
+    let output = isolated_command("git")
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_AUTHOR_NAME", "Derive Test")
+        .env("GIT_AUTHOR_EMAIL", "derive@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Derive Test")
+        .env("GIT_COMMITTER_EMAIL", "derive@example.invalid")
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(output.success(), "git {args:?} failed");
+}
+
+fn set_ai_event_timestamp(fixture: &Fixture, path: &str, timestamp: u128) {
+    let event_dir = fixture
+        .home
+        .join("repos")
+        .join(fixture.repo_id())
+        .join("events");
+    for entry in fs::read_dir(event_dir).unwrap().flatten() {
+        let event_path = entry.path();
+        let mut output = Vec::new();
+        for line in fs::read(&event_path).unwrap().split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let mut event: Value = serde_json::from_slice(line).unwrap();
+            if event["event"] == "ai_change" && event["path"] == path {
+                event["timestamp"] = json!(timestamp);
+            }
+            serde_json::to_writer(&mut output, &event).unwrap();
+            output.push(b'\n');
+        }
+        fs::write(event_path, output).unwrap();
+    }
 }
 
 fn git_text(repo: &Path, args: &[&str]) -> String {
@@ -1472,6 +1520,9 @@ fn detected_renames_count_only_added_lines_and_ignore_git_rename_config() {
         .collect();
     assert_eq!(carried.len(), 3);
     assert!(carried.iter().all(|range| range["category"] == "ai_direct"));
+    assert!(carried
+        .iter()
+        .all(|range| range["primaryBasis"] == "MOVE_LINEAGE"));
     let summary = fixture.cli(&[
         "summary",
         "--repo",
@@ -1517,6 +1568,110 @@ fn detected_renames_count_only_added_lines_and_ignore_git_rename_config() {
     assert_eq!(mass["totals"]["e"], 0);
     assert_eq!(mass["files"].as_array().unwrap().len(), 27);
     fixture.drop_root();
+}
+
+#[test]
+fn delayed_commit_uses_only_unconsumed_exact_ai_snapshot() {
+    const FIXED_DATE: &str = "@1712318400 +0000";
+    const SAME_SECOND_EVENT_TIME: u128 = 1_712_318_400_000_000_001;
+
+    let delayed = Fixture::new("delayed-commit-exact");
+    git_with_dates(
+        &delayed.repo,
+        &["commit", "--amend", "--no-edit"],
+        FIXED_DATE,
+    );
+    delayed.hook("PreToolUse", "delayed-file");
+    fs::write(
+        delayed.repo.join("delayed.txt"),
+        b"AI line one\nAI line two\n",
+    )
+    .unwrap();
+    delayed.hook("PostToolUse", "delayed-file");
+    set_ai_event_timestamp(&delayed, "delayed.txt", SAME_SECOND_EVENT_TIME);
+    fs::write(delayed.repo.join("unrelated.txt"), b"unrelated\n").unwrap();
+    git(&delayed.repo, &["add", "unrelated.txt"]);
+    git_with_dates(
+        &delayed.repo,
+        &["commit", "-m", "unrelated change"],
+        FIXED_DATE,
+    );
+    let intervening = git_text(&delayed.repo, &["rev-parse", "HEAD"]);
+    assert!(derive(&delayed, &intervening).status.success());
+    fs::write(delayed.repo.join("current.txt"), b"current human file\n").unwrap();
+    let committed = delayed.commit_at("commit delayed AI file", FIXED_DATE);
+    assert!(derive(&delayed, &committed).status.success());
+    let report = delayed.derived_value(&committed);
+    assert_eq!(file(&report, "delayed.txt")["ai_strong"], 2);
+    assert_eq!(file(&report, "current.txt")["unknown"], 1);
+    let sidecar = delayed.sidecar_value(&committed);
+    let ranges = sidecar["attributions"].as_array().unwrap();
+    let delayed_ranges = ranges
+        .iter()
+        .filter(|range| range["path"] == "delayed.txt")
+        .collect::<Vec<_>>();
+    assert!(!delayed_ranges.is_empty());
+    assert!(delayed_ranges.iter().all(|range| {
+        range["primaryBasis"] == "EXACT_FRAGMENT_MATCH"
+            && range["limitingBasis"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("X_DELAYED_COMMIT"))
+    }));
+    delayed.drop_root();
+
+    let edited = Fixture::new("delayed-commit-human-edit");
+    git_with_dates(
+        &edited.repo,
+        &["commit", "--amend", "--no-edit"],
+        FIXED_DATE,
+    );
+    edited.hook("PreToolUse", "delayed-edited-file");
+    fs::write(edited.repo.join("delayed.txt"), b"AI original\n").unwrap();
+    edited.hook("PostToolUse", "delayed-edited-file");
+    set_ai_event_timestamp(&edited, "delayed.txt", SAME_SECOND_EVENT_TIME);
+    fs::write(edited.repo.join("unrelated.txt"), b"unrelated\n").unwrap();
+    git(&edited.repo, &["add", "unrelated.txt"]);
+    git_with_dates(
+        &edited.repo,
+        &["commit", "-m", "unrelated change"],
+        FIXED_DATE,
+    );
+    let intervening = git_text(&edited.repo, &["rev-parse", "HEAD"]);
+    assert!(derive(&edited, &intervening).status.success());
+    fs::write(edited.repo.join("delayed.txt"), b"human replacement\n").unwrap();
+    let committed = edited.commit_at("commit hand edited file", FIXED_DATE);
+    assert!(derive(&edited, &committed).status.success());
+    let edited_report = edited.derived_value(&committed);
+    let edited_file = file(&edited_report, "delayed.txt");
+    assert_eq!(edited_file["evidence"], "time_cut");
+    assert_eq!(edited_file["unknown"], 1);
+    assert_eq!(edited_file["ai_strong"], 0);
+    edited.drop_root();
+
+    let consumed = Fixture::new("delayed-commit-consumed");
+    git_with_dates(
+        &consumed.repo,
+        &["commit", "--amend", "--no-edit"],
+        FIXED_DATE,
+    );
+    consumed.hook("PreToolUse", "consumed-file");
+    fs::write(consumed.repo.join("consumed.txt"), b"AI original\n").unwrap();
+    consumed.hook("PostToolUse", "consumed-file");
+    set_ai_event_timestamp(&consumed, "consumed.txt", SAME_SECOND_EVENT_TIME);
+    let first = consumed.commit_at("consume AI event", FIXED_DATE);
+    assert!(derive(&consumed, &first).status.success());
+    fs::remove_file(consumed.repo.join("consumed.txt")).unwrap();
+    let deleted = consumed.commit_at("delete previously committed file", FIXED_DATE);
+    assert!(derive(&consumed, &deleted).status.success());
+    fs::write(consumed.repo.join("consumed.txt"), b"AI original\n").unwrap();
+    let readded = consumed.commit_at("re-add without new evidence", FIXED_DATE);
+    assert!(derive(&consumed, &readded).status.success());
+    assert_eq!(
+        file(&consumed.derived_value(&readded), "consumed.txt")["unknown"],
+        1
+    );
+    consumed.drop_root();
 }
 
 #[test]
