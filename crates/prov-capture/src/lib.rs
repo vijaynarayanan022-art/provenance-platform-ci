@@ -377,6 +377,17 @@ pub fn process_vscode_json(input: &[u8]) {
             );
             true
         }
+        (
+            "PreToolUse" | "PostToolUse",
+            Some("insert_edit_into_file" | "replace_string_in_file"),
+        ) => {
+            target_paths = Some(vscode_file_paths(payload.get("tool_input")));
+            true
+        }
+        ("PreToolUse" | "PostToolUse", Some("multi_replace_string_in_file")) => {
+            target_paths = Some(vscode_file_paths(payload.get("tool_input")));
+            true
+        }
         ("PreToolUse" | "PostToolUse", Some("run_in_terminal")) => false,
         ("PreToolUse" | "PostToolUse", Some(name)) if is_read_only_vscode_tool(name) => return,
         ("PreToolUse" | "PostToolUse", Some(name)) => {
@@ -385,7 +396,7 @@ pub fn process_vscode_json(input: &[u8]) {
                 name,
                 event_name == "PreToolUse",
             );
-            return;
+            false
         }
         _ => return,
     };
@@ -412,6 +423,30 @@ pub fn process_vscode_json(input: &[u8]) {
         tool_input: payload.get("tool_input").cloned(),
     };
     process_hook(hook, "vscode-copilot", target_paths, require_window);
+}
+
+fn vscode_file_paths(input: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(input) = input else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    if let Some(path) = input.get("filePath").and_then(serde_json::Value::as_str) {
+        paths.push(path.to_owned());
+    }
+    if let Some(replacements) = input
+        .get("replacements")
+        .and_then(serde_json::Value::as_array)
+    {
+        paths.extend(replacements.iter().filter_map(|replacement| {
+            replacement
+                .get("filePath")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn is_read_only_vscode_tool(name: &str) -> bool {
@@ -452,7 +487,8 @@ fn structured_edit_allowed(adapter: &str, operation: Option<&str>) -> bool {
                     "create_file"
                         | "apply_patch"
                         | "insert_edit_into_file"
-                        | "replace_string_in_file",
+                        | "replace_string_in_file"
+                        | "multi_replace_string_in_file",
                 ),
             )
     )
@@ -475,6 +511,20 @@ fn structured_added_lines(
             .or_else(|| input.get("text"))
             .and_then(serde_json::Value::as_str)?,
         ("vscode-copilot", "replace_string_in_file") => input.get("newString")?.as_str()?,
+        ("vscode-copilot", "multi_replace_string_in_file") => {
+            let replacements = input.get("replacements")?.as_array()?;
+            return Some(
+                replacements
+                    .iter()
+                    .filter_map(|replacement| {
+                        replacement
+                            .get("newString")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .flat_map(|text| text.lines().map(str::to_owned))
+                    .collect(),
+            );
+        }
         _ => return None,
     };
     let lines = if operation == "create_file" {
@@ -509,6 +559,11 @@ fn structured_input(
         }
         ("vscode-copilot", "insert_edit_into_file") => "code",
         ("vscode-copilot", "replace_string_in_file") => "newString",
+        ("vscode-copilot", "multi_replace_string_in_file") => {
+            return input
+                .get("replacements")
+                .and_then(|replacements| serde_json::to_string(replacements).ok());
+        }
         _ => return None,
     };
     input.get(field)?.as_str().map(str::to_owned)
