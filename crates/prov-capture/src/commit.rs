@@ -243,6 +243,8 @@ struct EventRecord {
     #[serde(default)]
     new_head: Option<String>,
     #[serde(default)]
+    head: Option<String>,
+    #[serde(default)]
     commit_in_window: Option<bool>,
     #[serde(default)]
     paths: Option<Vec<String>>,
@@ -285,6 +287,12 @@ struct EventDecisionTrace {
     tool_use_id: Option<String>,
     operation: Option<String>,
     checks: Vec<ExplainCheck>,
+}
+
+#[derive(Default)]
+struct ParentEvidence {
+    ancestors: HashSet<String>,
+    consumed_tool_use_ids: HashSet<String>,
 }
 
 pub fn derive_commit(repo_path: &Path, revision: &str) -> Result<PathBuf, String> {
@@ -725,9 +733,9 @@ fn derive_resolved_commit(
         .transpose()?
         .unwrap_or(0);
     let commit_time = committer_time_ns(&repo.root, &commit)?;
-    let consumed_tool_use_ids = parent
+    let parent_evidence = parent
         .as_deref()
-        .map(|parent| consumed_tool_use_ids(&repo.root, store, parent))
+        .map(|parent| read_parent_evidence(&repo.root, store, parent))
         .unwrap_or_default();
     let mut blob_ids = BTreeSet::new();
     for file in &files {
@@ -883,14 +891,19 @@ fn derive_resolved_commit(
             &normalized_parent,
             &normalized_committed,
             &parent_line_labels,
-            &consumed_tool_use_ids,
+            parent.as_deref().unwrap_or_default(),
+            &parent_evidence,
         );
         let delayed_commit = selected_events.first().is_some_and(|event| {
-            event.timestamp <= parent_time
-                && event.after_sha.as_deref().is_some_and(|sha| {
-                    crate::read_blob(&store.join("blobs").join(sha), sha)
-                        .is_some_and(|bytes| normalize_eol(&bytes) == normalized_committed)
-                })
+            event_predates_parent(
+                event,
+                parent_time,
+                parent.as_deref().unwrap_or_default(),
+                &parent_evidence.ancestors,
+            ) && event.after_sha.as_deref().is_some_and(|sha| {
+                crate::read_blob(&store.join("blobs").join(sha), sha)
+                    .is_some_and(|bytes| normalize_eol(&bytes) == normalized_committed)
+            })
         });
         let (mut steps, mut evidence) = steps_for_events(
             store,
@@ -1474,8 +1487,8 @@ pub fn explain_commit(
     let parent_line_labels = parent
         .map(|parent| read_parent_line_labels(&store, parent))
         .unwrap_or_default();
-    let consumed_tool_use_ids = parent
-        .map(|parent| consumed_tool_use_ids(&root, &store, parent))
+    let parent_evidence = parent
+        .map(|parent| read_parent_evidence(&root, &store, parent))
         .unwrap_or_default();
     let selected_events = events_for_path(
         &store,
@@ -1486,14 +1499,19 @@ pub fn explain_commit(
         &normalized_parent,
         &normalized_committed,
         &parent_line_labels,
-        &consumed_tool_use_ids,
+        parent.unwrap_or_default(),
+        &parent_evidence,
     );
     let delayed_commit = selected_events.first().is_some_and(|event| {
-        event.timestamp <= parent_time
-            && event.after_sha.as_deref().is_some_and(|sha| {
-                crate::read_blob(&store.join("blobs").join(sha), sha)
-                    .is_some_and(|bytes| normalize_eol(&bytes) == normalized_committed)
-            })
+        event_predates_parent(
+            event,
+            parent_time,
+            parent.unwrap_or_default(),
+            &parent_evidence.ancestors,
+        ) && event.after_sha.as_deref().is_some_and(|sha| {
+            crate::read_blob(&store.join("blobs").join(sha), sha)
+                .is_some_and(|bytes| normalize_eol(&bytes) == normalized_committed)
+        })
     });
     let (mut steps, mut evidence, event_traces) = steps_for_events_with_trace(
         &store,
@@ -1938,7 +1956,7 @@ fn read_events(events_dir: &Path) -> Vec<EventRecord> {
     let Ok(entries) = fs::read_dir(events_dir) else {
         return Vec::new();
     };
-    let mut paths: Vec<_> = entries
+    let paths: Vec<_> = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
@@ -1946,6 +1964,10 @@ fn read_events(events_dir: &Path) -> Vec<EventRecord> {
                 .is_some_and(|extension| extension == "jsonl")
         })
         .collect();
+    read_event_paths(paths)
+}
+
+fn read_event_paths(mut paths: Vec<PathBuf>) -> Vec<EventRecord> {
     paths.sort();
     let mut events = Vec::new();
     let mut order = 0;
@@ -2042,14 +2064,24 @@ fn events_for_path<'a>(
     parent_content: &[u8],
     committed_content: &[u8],
     parent_line_labels: &HashMap<String, HashMap<usize, StoredParentLine>>,
-    consumed_tool_use_ids: &HashSet<String>,
+    parent: &str,
+    parent_evidence: &ParentEvidence,
 ) -> Vec<&'a EventRecord> {
     let mut matched: Vec<_> = event_index
         .get(path)
         .into_iter()
         .flatten()
         .map(|&index| &events[index])
-        .filter(|event| event.timestamp > parent_time)
+        .filter(|event| {
+            event.timestamp > parent_time
+                && !event_was_consumed(
+                    event,
+                    path,
+                    parent_line_labels,
+                    &parent_evidence.consumed_tool_use_ids,
+                )
+                && !event_predates_parent(event, parent_time, parent, &parent_evidence.ancestors)
+        })
         .collect();
     let start = matched.len().saturating_sub(64);
     for index in (start..matched.len()).rev() {
@@ -2085,11 +2117,10 @@ fn events_for_path<'a>(
         .map(|&index| &events[index])
         .filter(|event| {
             event.event == "ai_change"
-                && event.timestamp <= parent_time
-                && event
-                    .tool_use_id
-                    .as_deref()
-                    .is_some_and(|id| !consumed.contains(id) && !consumed_tool_use_ids.contains(id))
+                && event_predates_parent(event, parent_time, parent, &parent_evidence.ancestors)
+                && event.tool_use_id.as_deref().is_some_and(|id| {
+                    !consumed.contains(id) && !parent_evidence.consumed_tool_use_ids.contains(id)
+                })
                 && event.after_sha.as_deref().is_some_and(|sha| {
                     crate::read_blob(&store.join("blobs").join(sha), sha).is_some()
                 })
@@ -2105,6 +2136,37 @@ fn events_for_path<'a>(
         return vec![event];
     }
     matched
+}
+
+fn event_was_consumed(
+    event: &EventRecord,
+    path: &str,
+    parent_line_labels: &HashMap<String, HashMap<usize, StoredParentLine>>,
+    consumed_tool_use_ids: &HashSet<String>,
+) -> bool {
+    event.event == "ai_change"
+        && event.tool_use_id.as_deref().is_some_and(|tool_use_id| {
+            consumed_tool_use_ids.contains(tool_use_id)
+                || parent_line_labels
+                    .get(path)
+                    .into_iter()
+                    .flat_map(|lines| lines.values())
+                    .filter_map(|line| line.source.as_ref()?.session_ref.as_deref())
+                    .any(|session_ref| session_ref == tool_use_id)
+        })
+}
+
+fn event_predates_parent(
+    event: &EventRecord,
+    parent_time: u128,
+    parent: &str,
+    ancestors: &HashSet<String>,
+) -> bool {
+    event.timestamp <= parent_time
+        || event
+            .head
+            .as_deref()
+            .is_some_and(|head| !parent.is_empty() && head != parent && ancestors.contains(head))
 }
 
 fn steps_for_events(
@@ -2872,11 +2934,12 @@ fn read_parent_line_labels(
     files
 }
 
-fn consumed_tool_use_ids(root: &Path, store: &Path, parent: &str) -> HashSet<String> {
-    let Ok(ancestors) = git_checked(root, &["rev-list", "--max-count=64", parent]) else {
-        return HashSet::new();
+fn read_parent_evidence(root: &Path, store: &Path, parent: &str) -> ParentEvidence {
+    let Ok(ancestor_output) = git_checked(root, &["rev-list", "--max-count=64", parent]) else {
+        return ParentEvidence::default();
     };
-    ancestors
+    let ancestors: HashSet<String> = ancestor_output.lines().map(str::to_owned).collect();
+    let consumed_tool_use_ids = ancestor_output
         .lines()
         .filter_map(|commit| {
             let bytes =
@@ -2898,7 +2961,11 @@ fn consumed_tool_use_ids(root: &Path, store: &Path, parent: &str) -> HashSet<Str
             )
         })
         .flatten()
-        .collect()
+        .collect();
+    ParentEvidence {
+        ancestors,
+        consumed_tool_use_ids,
+    }
 }
 
 fn read_latest_path_line_labels(
@@ -3527,6 +3594,7 @@ mod tests {
             after_incomplete: Some(false),
             reason: reason.map(str::to_owned),
             new_head: None,
+            head: None,
             commit_in_window: None,
             paths: None,
             truncated: None,
@@ -3577,10 +3645,66 @@ mod tests {
             b"",
             committed,
             &HashMap::new(),
-            &HashSet::new(),
+            "parent",
+            &ParentEvidence::default(),
         );
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].tool_use_id.as_deref(), Some("tool-64"));
+        let _ = fs::remove_dir_all(store);
+    }
+
+    #[test]
+    fn delayed_event_selection_is_stable_when_session_files_arrive_reversed_or_shuffled() {
+        let store = test_store("delayed-event-file-order");
+        let event_dir = store.join("events");
+        fs::create_dir_all(&event_dir).unwrap();
+        let committed = b"same-second event snapshot\n";
+        let after_sha = put_blob(&store, committed);
+        let files = ["session-a.jsonl", "session-b.jsonl", "session-c.jsonl"]
+            .map(|name| event_dir.join(name));
+        for (name, tool_id) in files.iter().zip(["tool-a", "tool-b", "tool-c"]) {
+            let document = serde_json::json!({
+                "event":"ai_change",
+                "timestamp":100,
+                "path":"delayed.txt",
+                "tool_use_id":tool_id,
+                "after_sha":after_sha,
+                "head":"ancestor",
+            });
+            fs::write(name, format!("{document}\n")).unwrap();
+        }
+
+        for order in [
+            vec![files[2].clone(), files[1].clone(), files[0].clone()],
+            vec![files[1].clone(), files[0].clone(), files[2].clone()],
+            vec![files[0].clone(), files[2].clone(), files[1].clone()],
+        ] {
+            let events = read_event_paths(order);
+            let ordered_tools = events
+                .iter()
+                .map(|event| event.tool_use_id.as_deref().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(ordered_tools, ["tool-a", "tool-b", "tool-c"]);
+            let index = index_events(&events);
+            let evidence = ParentEvidence {
+                ancestors: HashSet::from(["ancestor".to_owned()]),
+                consumed_tool_use_ids: HashSet::new(),
+            };
+            let selected = events_for_path(
+                &store,
+                &events,
+                &index,
+                "delayed.txt",
+                100,
+                b"",
+                committed,
+                &HashMap::new(),
+                "parent",
+                &evidence,
+            );
+            assert_eq!(selected.len(), 1);
+            assert_eq!(selected[0].tool_use_id.as_deref(), Some("tool-c"));
+        }
         let _ = fs::remove_dir_all(store);
     }
 
