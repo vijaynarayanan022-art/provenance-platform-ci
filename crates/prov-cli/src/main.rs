@@ -479,6 +479,7 @@ fn run_single_commit(
             "--unified=0",
             "--no-color",
             "--no-ext-diff",
+            "-M",
             &sha,
         ],
     )?;
@@ -689,6 +690,7 @@ fn run_pr_range(
             "--unified=0",
             "--no-color",
             "--no-ext-diff",
+            "-M",
             &format!("{base_sha}...{head_sha}"),
         ],
     )?;

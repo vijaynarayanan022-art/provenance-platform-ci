@@ -621,7 +621,7 @@ fn resolve_merge_base(repo: &Path, base: &str, head: &str) -> Result<Option<Stri
 }
 
 fn changed_files_count(repo: &Path, base: &str, head: &str) -> Result<usize, String> {
-    let output = git(repo, &["diff", "--name-only", "-z", base, head])?;
+    let output = git(repo, &["diff", "-M", "--name-only", "-z", base, head])?;
     if !output.status.success() {
         return Err("could not read PR changed paths from Git".into());
     }

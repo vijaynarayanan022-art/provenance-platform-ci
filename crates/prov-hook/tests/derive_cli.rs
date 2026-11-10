@@ -1437,6 +1437,89 @@ fn codex_apply_patch_snapshot_ranges_receive_direct_labels() {
 }
 
 #[test]
+fn detected_renames_count_only_added_lines_and_ignore_git_rename_config() {
+    let fixture = Fixture::new("rename-eligibility");
+    fixture.hook("PreToolUse", "rename-source-ai");
+    fs::write(fixture.repo.join("rename-source.txt"), b"one\ntwo\nthree\n").unwrap();
+    fixture.hook("PostToolUse", "rename-source-ai");
+    configure_structured_apply_patch(
+        &fixture,
+        "rename-source.txt",
+        Some(true),
+        false,
+        json!([[1, 3]]),
+    );
+    let source = fixture.commit("add rename source");
+    assert!(derive(&fixture, &source).status.success());
+
+    git(&fixture.repo, &["config", "diff.renames", "false"]);
+    git(
+        &fixture.repo,
+        &["mv", "rename-source.txt", "rename-destination.txt"],
+    );
+    let pure_rename = fixture.commit("pure rename");
+    assert!(derive(&fixture, &pure_rename).status.success());
+    let pure = fixture.derived_value(&pure_rename);
+    assert_eq!(pure["totals"]["e"], 0);
+    assert_eq!(pure["files"].as_array().unwrap().len(), 1);
+    assert_eq!(pure["files"][0]["path"], "rename-destination.txt");
+    let pure_sidecar = fixture.sidecar_value(&pure_rename);
+    let carried: Vec<_> = pure_sidecar["attributions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|range| range["path"] == "rename-destination.txt")
+        .collect();
+    assert_eq!(carried.len(), 3);
+    assert!(carried.iter().all(|range| range["category"] == "ai_direct"));
+    let summary = fixture.cli(&[
+        "summary",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &pure_rename,
+        "--file",
+        "rename-destination.txt",
+        "--format",
+        "json",
+    ]);
+    assert!(summary.status.success());
+    let summary: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    assert_eq!(summary["commits"][0]["eligible"], 0);
+    assert!(summary["commits"][0]["deterministic_pct"].is_null());
+    assert!(summary["commits"][0]["linked_pct"].is_null());
+    assert_eq!(summary["commits"][0]["files"], 1);
+    assert_eq!(summary["file_ranges"].as_array().unwrap().len(), 3);
+
+    fs::write(
+        fixture.repo.join("rename-destination.txt"),
+        b"one\ntwo\nthree\nfour\nfive\n",
+    )
+    .unwrap();
+    let edited_rename = fixture.commit("rename with two added lines");
+    assert!(derive(&fixture, &edited_rename).status.success());
+    let edited = fixture.derived_value(&edited_rename);
+    assert_eq!(edited["totals"]["e"], 2);
+
+    for index in 0..27 {
+        let old = format!("mass-source-{index}.txt");
+        fs::write(fixture.repo.join(&old), b"unchanged content\n").unwrap();
+    }
+    fixture.commit("add mass rename sources");
+    for index in 0..27 {
+        let old = format!("mass-source-{index}.txt");
+        let new = format!("mass-destination-{index}.txt");
+        git(&fixture.repo, &["mv", &old, &new]);
+    }
+    let mass_rename = fixture.commit("mass rename");
+    assert!(derive(&fixture, &mass_rename).status.success());
+    let mass = fixture.derived_value(&mass_rename);
+    assert_eq!(mass["totals"]["e"], 0);
+    assert_eq!(mass["files"].as_array().unwrap().len(), 27);
+    fixture.drop_root();
+}
+
+#[test]
 fn real_codex_apply_patch_existing_file_appends_direct_lines() {
     const PATH: &str = "src/vs/base/common/arrays.ts";
     let before = include_bytes!("fixtures/real_apply_patch_existing_file/before.bin");
@@ -2484,7 +2567,7 @@ fn skipped_binary_secret_deleted_and_renamed_paths_are_safe() {
         .unwrap()
         .iter()
         .all(|entry| entry["path"] != "to-delete.txt"));
-    assert_eq!(file(&value, "renamed.txt")["unknown"], 2);
+    assert_eq!(file(&value, "renamed.txt")["unknown"], 0);
     fixture.drop_root();
 }
 

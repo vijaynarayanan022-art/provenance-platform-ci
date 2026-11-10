@@ -29,6 +29,8 @@ struct StoredParentLine {
     supporting_basis: Vec<String>,
     source: Option<AttributionSource>,
     operation: Option<String>,
+    exclusion_classifier: Option<String>,
+    exclusion_reason: Option<String>,
 }
 
 impl StoredParentLine {
@@ -197,6 +199,7 @@ struct RewriteOutput {
 #[derive(Clone)]
 struct CommitFile {
     path: String,
+    old_path: Option<String>,
     old_blob: Option<String>,
     new_blob: String,
     added_lines: usize,
@@ -694,11 +697,24 @@ fn derive_resolved_commit(
     }
 
     let parent = parents.first().map(|value| (*value).to_owned());
-    let parent_line_labels = parent
+    let mut parent_line_labels = parent
         .as_deref()
         .map(|parent| read_parent_line_labels(store, parent))
         .unwrap_or_default();
     let (files, has_changes) = commit_files(&repo.root, parent.as_deref(), &commit)?;
+    for file in &files {
+        if let Some(old_path) = &file.old_path {
+            let labels = parent_line_labels.get(old_path).cloned().or_else(|| {
+                parent.as_deref().and_then(|parent| {
+                    read_latest_path_line_labels(&repo.root, store, parent, old_path)
+                })
+            });
+            if let Some(labels) = labels {
+                parent_line_labels.insert(old_path.clone(), labels.clone());
+                parent_line_labels.insert(file.path.clone(), labels);
+            }
+        }
+    }
     if !has_changes {
         return write_empty_commit(store, repo_id, commit, parent);
     }
@@ -1081,6 +1097,16 @@ fn derive_resolved_commit(
             &attributed_lines,
             &evidence_input.steps,
         ));
+        if let Some(old_path) = &file.old_path {
+            if let Some(labels) = parent_line_labels.get(old_path) {
+                attributions.extend(rename_line_attributions(
+                    &file.path,
+                    &parent_content,
+                    &committed_content,
+                    labels,
+                ));
+            }
+        }
         line_files.insert(file.path.clone(), lines);
         output_files.push(FileOutput {
             path: file.path,
@@ -1247,7 +1273,7 @@ fn split_normalized_lines(bytes: &[u8]) -> Vec<&[u8]> {
 }
 
 fn stable_patch_id(root: &Path, parent: &str, commit: &str) -> Option<String> {
-    let diff = git_output(root, &["diff-tree", "-p", "--no-renames", parent, commit]).ok()?;
+    let diff = git_output(root, &["diff-tree", "-p", "-M", parent, commit]).ok()?;
     if !diff.status.success() || !patch_diff_size_allowed(diff.stdout.len()) {
         return None;
     }
@@ -1716,7 +1742,7 @@ fn commit_files(
             &[
                 "diff-tree",
                 "-r",
-                "--no-renames",
+                "-M",
                 "-z",
                 "--raw",
                 "--no-commit-id",
@@ -1731,7 +1757,7 @@ fn commit_files(
                 "diff-tree",
                 "--root",
                 "-r",
-                "--no-renames",
+                "-M",
                 "-z",
                 "--raw",
                 "--no-commit-id",
@@ -1753,13 +1779,25 @@ fn commit_files(
         .filter(|item| !item.is_empty());
     let mut files = Vec::new();
     while let Some(header) = records.next() {
-        let Some(path) = records.next() else {
+        let Some(first_path) = records.next() else {
             break;
         };
         let fields: Vec<_> = header.split(|byte| *byte == b' ').collect();
         if fields.len() < 5 || fields[4].first() == Some(&b'D') {
             continue;
         }
+        let is_rename = fields[4].first() == Some(&b'R');
+        let (old_path, path) = if is_rename {
+            let Some(new_path) = records.next() else {
+                break;
+            };
+            (
+                Some(String::from_utf8_lossy(first_path).replace('\\', "/")),
+                new_path,
+            )
+        } else {
+            (None, first_path)
+        };
         let old_mode = fields[0].strip_prefix(b":").unwrap_or(fields[0]);
         if matches!(old_mode, b"120000" | b"160000") || matches!(fields[1], b"120000" | b"160000") {
             continue;
@@ -1770,14 +1808,13 @@ fn commit_files(
         if new_id.bytes().all(|byte| byte == b'0') {
             continue;
         }
+        let path = String::from_utf8_lossy(path).replace('\\', "/");
         files.push(CommitFile {
-            path: String::from_utf8_lossy(path).replace('\\', "/"),
+            path: path.clone(),
+            old_path,
             old_blob,
             new_blob: new_id,
-            added_lines: additions
-                .get(&String::from_utf8_lossy(path).replace('\\', "/"))
-                .copied()
-                .unwrap_or_default(),
+            added_lines: additions.get(&path).copied().unwrap_or_default(),
         });
     }
     Ok((files, has_changes))
@@ -1792,7 +1829,7 @@ fn numstat_additions(
         vec![
             "diff-tree",
             "-r",
-            "--no-renames",
+            "-M",
             "-z",
             "--numstat",
             "--no-commit-id",
@@ -1804,7 +1841,7 @@ fn numstat_additions(
             "diff-tree",
             "--root",
             "-r",
-            "--no-renames",
+            "-M",
             "-z",
             "--numstat",
             "--no-commit-id",
@@ -1816,11 +1853,11 @@ fn numstat_additions(
         return Ok(std::collections::HashMap::new());
     }
     let mut additions = std::collections::HashMap::new();
-    for record in output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|item| !item.is_empty())
-    {
+    let mut records = output.stdout.split(|byte| *byte == 0);
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
         let fields: Vec<_> = record.splitn(3, |byte| *byte == b'\t').collect();
         if fields.len() != 3 || fields[0] == b"-" {
             continue;
@@ -1828,7 +1865,18 @@ fn numstat_additions(
         let Ok(count) = std::str::from_utf8(fields[0]).unwrap_or_default().parse() else {
             continue;
         };
-        additions.insert(String::from_utf8_lossy(fields[2]).replace('\\', "/"), count);
+        let path = if fields[2].is_empty() {
+            let Some(_old_path) = records.next() else {
+                break;
+            };
+            let Some(new_path) = records.next() else {
+                break;
+            };
+            new_path
+        } else {
+            fields[2]
+        };
+        additions.insert(String::from_utf8_lossy(path).replace('\\', "/"), count);
     }
     Ok(additions)
 }
@@ -2706,6 +2754,14 @@ fn read_parent_line_labels(
                 .get("operation")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
+            let exclusion_classifier = range
+                .get("exclusionClassifier")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let exclusion_reason = range
+                .get("exclusionReason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             let line_map = files.entry(path.to_owned()).or_default();
             for line in start..=end {
                 let stored = line_map.entry(line as usize).or_default();
@@ -2714,10 +2770,27 @@ fn read_parent_line_labels(
                 stored.source = source.clone();
                 stored.operation = operation.clone();
                 stored.supporting_basis = supporting_basis.clone();
+                stored.exclusion_classifier = exclusion_classifier.clone();
+                stored.exclusion_reason = exclusion_reason.clone();
             }
         }
     }
     files
+}
+
+fn read_latest_path_line_labels(
+    root: &Path,
+    store: &Path,
+    parent: &str,
+    path: &str,
+) -> Option<HashMap<usize, StoredParentLine>> {
+    let commit = git_checked(root, &["log", "-1", "--format=%H", parent, "--", path]).ok()?;
+    let commit = commit.trim();
+    if commit.is_empty() {
+        return None;
+    }
+    let mut labels = read_parent_line_labels(store, commit);
+    labels.remove(path)
 }
 
 fn category_for_line_code(code: &str) -> Option<&'static str> {
@@ -2935,6 +3008,52 @@ fn excluded_attributions(
                 exclusion_reason: Some(reason.into()),
             },
         );
+    }
+    ranges
+}
+
+fn rename_line_attributions(
+    path: &str,
+    parent: &[u8],
+    committed: &[u8],
+    stored_lines: &HashMap<usize, StoredParentLine>,
+) -> Vec<AttributionRange> {
+    let parent_lines = split_normalized_lines(parent);
+    let committed_lines = split_normalized_lines(committed);
+    let operations = capture_diff_slices(Algorithm::Myers, &parent_lines, &committed_lines);
+    let mut ranges = Vec::new();
+    for operation in operations
+        .iter()
+        .filter(|operation| operation.tag() == DiffTag::Equal)
+    {
+        for (old_line, new_line) in operation.old_range().zip(operation.new_range()) {
+            let Some(stored) = stored_lines.get(&(old_line + 1)) else {
+                continue;
+            };
+            if stored.category.is_empty() {
+                continue;
+            }
+            let line = new_line + 1;
+            let confidence_band = stored.score.map(confidence_band).unwrap_or("none");
+            ranges.push(AttributionRange {
+                path: path.into(),
+                start_line: line,
+                end_line: line,
+                end_line_exclusive: Some(line + 1),
+                category: stored.category.clone(),
+                score: stored.score,
+                confidence_band: confidence_band.into(),
+                primary_basis: None,
+                supporting_basis: stored.supporting_basis.clone(),
+                limiting_basis: Vec::new(),
+                source: stored.source.clone(),
+                operation: stored.operation.clone(),
+                algorithm_profile: "deterministic-v1".into(),
+                score_profile: "score-v1".into(),
+                exclusion_classifier: stored.exclusion_classifier.clone(),
+                exclusion_reason: stored.exclusion_reason.clone(),
+            });
+        }
     }
     ranges
 }

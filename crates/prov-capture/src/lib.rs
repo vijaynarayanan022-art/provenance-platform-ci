@@ -1900,12 +1900,7 @@ fn head_move_summary(root: &Path, old_head: &str, new_head: &str) -> Option<Head
     if old == "unknown" || new == "unknown" {
         return None;
     }
-    let out = git_output(
-        root,
-        &["diff", "--no-renames", "--name-only", "-z", old, new],
-        None,
-    )
-    .ok()?;
+    let out = git_output(root, &["diff", "-M", "--name-only", "-z", old, new], None).ok()?;
     if !out.status.success() {
         return None;
     }
