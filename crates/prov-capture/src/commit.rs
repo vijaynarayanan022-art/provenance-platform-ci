@@ -17,6 +17,7 @@ const ATTEMPT_MARKER_AGE: Duration = Duration::from_secs(60);
 const DERIVE_LOCK_AGE: Duration = Duration::from_secs(120);
 const MIN_PARENT_EDIT_SIMILARITY: f64 = 0.5;
 const MAX_PARENT_MATCH_CELLS: usize = 1_000_000;
+const MAX_DELAYED_EVENTS_PER_PATH: usize = 64;
 const MIXED_SCORE_MILLI: u16 = 840;
 const UNOBSERVED_COVERAGE_MEDIUM_PERCENT: usize = 5;
 const UNOBSERVED_COVERAGE_LOW_PERCENT: usize = 20;
@@ -724,6 +725,10 @@ fn derive_resolved_commit(
         .transpose()?
         .unwrap_or(0);
     let commit_time = committer_time_ns(&repo.root, &commit)?;
+    let consumed_tool_use_ids = parent
+        .as_deref()
+        .map(|parent| consumed_tool_use_ids(&repo.root, store, parent))
+        .unwrap_or_default();
     let mut blob_ids = BTreeSet::new();
     for file in &files {
         blob_ids.insert(file.new_blob.clone());
@@ -876,7 +881,17 @@ fn derive_resolved_commit(
             &file.path,
             parent_time,
             &normalized_parent,
+            &normalized_committed,
+            &parent_line_labels,
+            &consumed_tool_use_ids,
         );
+        let delayed_commit = selected_events.first().is_some_and(|event| {
+            event.timestamp <= parent_time
+                && event.after_sha.as_deref().is_some_and(|sha| {
+                    crate::read_blob(&store.join("blobs").join(sha), sha)
+                        .is_some_and(|bytes| normalize_eol(&bytes) == normalized_committed)
+                })
+        });
         let (mut steps, mut evidence) = steps_for_events(
             store,
             &selected_events,
@@ -884,6 +899,17 @@ fn derive_resolved_commit(
             &normalized_committed,
             commit_time,
         );
+        if delayed_commit {
+            for step in &mut steps {
+                let Some(attribution) = step.attribution.as_mut() else {
+                    continue;
+                };
+                attribution.primary_basis = Some("EXACT_FRAGMENT_MATCH".into());
+                attribution.score_milli = attribution.score_milli.min(920);
+                attribution.direct_lines.clear();
+                push_basis(&mut attribution.limiting_basis, "X_DELAYED_COMMIT");
+            }
+        }
         if evidence == "missing_blob" {
             if let Some(fallback) = missing_snapshot_time_cut_fallback(
                 store,
@@ -1445,6 +1471,12 @@ pub fn explain_commit(
     let commit_time = committer_time_ns(&root, &commit)?;
     let events = read_events(&store.join("events"));
     let event_index = index_events(&events);
+    let parent_line_labels = parent
+        .map(|parent| read_parent_line_labels(&store, parent))
+        .unwrap_or_default();
+    let consumed_tool_use_ids = parent
+        .map(|parent| consumed_tool_use_ids(&root, &store, parent))
+        .unwrap_or_default();
     let selected_events = events_for_path(
         &store,
         &events,
@@ -1452,7 +1484,17 @@ pub fn explain_commit(
         &path,
         parent_time,
         &normalized_parent,
+        &normalized_committed,
+        &parent_line_labels,
+        &consumed_tool_use_ids,
     );
+    let delayed_commit = selected_events.first().is_some_and(|event| {
+        event.timestamp <= parent_time
+            && event.after_sha.as_deref().is_some_and(|sha| {
+                crate::read_blob(&store.join("blobs").join(sha), sha)
+                    .is_some_and(|bytes| normalize_eol(&bytes) == normalized_committed)
+            })
+    });
     let (mut steps, mut evidence, event_traces) = steps_for_events_with_trace(
         &store,
         &selected_events,
@@ -1460,6 +1502,17 @@ pub fn explain_commit(
         &normalized_committed,
         commit_time,
     );
+    if delayed_commit {
+        for step in &mut steps {
+            let Some(attribution) = step.attribution.as_mut() else {
+                continue;
+            };
+            attribution.primary_basis = Some("EXACT_FRAGMENT_MATCH".into());
+            attribution.score_milli = attribution.score_milli.min(920);
+            attribution.direct_lines.clear();
+            push_basis(&mut attribution.limiting_basis, "X_DELAYED_COMMIT");
+        }
+    }
     if evidence == "missing_blob" {
         if let Some(fallback) = missing_snapshot_time_cut_fallback(
             &store,
@@ -1979,6 +2032,7 @@ fn index_events(events: &[EventRecord]) -> HashMap<String, Vec<usize>> {
     index
 }
 
+#[allow(clippy::too_many_arguments)] // Selection uses per-file evidence and bounded ancestry context.
 fn events_for_path<'a>(
     store: &Path,
     events: &'a [EventRecord],
@@ -1986,6 +2040,9 @@ fn events_for_path<'a>(
     path: &str,
     parent_time: u128,
     parent_content: &[u8],
+    committed_content: &[u8],
+    parent_line_labels: &HashMap<String, HashMap<usize, StoredParentLine>>,
+    consumed_tool_use_ids: &HashSet<String>,
 ) -> Vec<&'a EventRecord> {
     let mut matched: Vec<_> = event_index
         .get(path)
@@ -2009,6 +2066,43 @@ fn events_for_path<'a>(
             matched.drain(..=index);
             break;
         }
+    }
+    if !matched.is_empty() {
+        return matched;
+    }
+    let consumed: HashSet<&str> = parent_line_labels
+        .get(path)
+        .into_iter()
+        .flat_map(|lines| lines.values())
+        .filter_map(|line| line.source.as_ref()?.session_ref.as_deref())
+        .collect();
+    let old_events = event_index
+        .get(path)
+        .into_iter()
+        .flatten()
+        .rev()
+        .take(MAX_DELAYED_EVENTS_PER_PATH)
+        .map(|&index| &events[index])
+        .filter(|event| {
+            event.event == "ai_change"
+                && event.timestamp <= parent_time
+                && event
+                    .tool_use_id
+                    .as_deref()
+                    .is_some_and(|id| !consumed.contains(id) && !consumed_tool_use_ids.contains(id))
+                && event.after_sha.as_deref().is_some_and(|sha| {
+                    crate::read_blob(&store.join("blobs").join(sha), sha).is_some()
+                })
+        })
+        .collect::<Vec<_>>();
+    let exact_delayed = old_events.iter().find(|event| {
+        event.after_sha.as_deref().is_some_and(|sha| {
+            crate::read_blob(&store.join("blobs").join(sha), sha)
+                .is_some_and(|bytes| normalize_eol(&bytes) == committed_content)
+        })
+    });
+    if let Some(event) = exact_delayed.or_else(|| old_events.first()) {
+        return vec![event];
     }
     matched
 }
@@ -2778,6 +2872,35 @@ fn read_parent_line_labels(
     files
 }
 
+fn consumed_tool_use_ids(root: &Path, store: &Path, parent: &str) -> HashSet<String> {
+    let Ok(ancestors) = git_checked(root, &["rev-list", "--max-count=64", parent]) else {
+        return HashSet::new();
+    };
+    ancestors
+        .lines()
+        .filter_map(|commit| {
+            let bytes =
+                fs::read(store.join("commits").join(format!("{commit}.lines.json"))).ok()?;
+            let document: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            Some(
+                document
+                    .get("attributions")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|range| {
+                        range
+                            .get("source")?
+                            .get("sessionRef")?
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
 fn read_latest_path_line_labels(
     root: &Path,
     store: &Path,
@@ -3043,7 +3166,7 @@ fn rename_line_attributions(
                 category: stored.category.clone(),
                 score: stored.score,
                 confidence_band: confidence_band.into(),
-                primary_basis: None,
+                primary_basis: Some("MOVE_LINEAGE".into()),
                 supporting_basis: stored.supporting_basis.clone(),
                 limiting_basis: Vec::new(),
                 source: stored.source.clone(),
@@ -3423,6 +3546,55 @@ mod tests {
             "missing".to_owned(),
         ];
         assert_eq!(readable_blob_ids(&sizes, &ids), vec!["at-limit"]);
+    }
+
+    #[test]
+    fn delayed_event_scan_is_bounded_to_the_latest_sixty_four_path_events() {
+        let store = test_store("delayed-event-bound");
+        let committed = b"older exact snapshot\n";
+        let target_sha = put_blob(&store, committed);
+        let mut events = Vec::new();
+        let mut target = event(Some(target_sha), "ai_change", false, None);
+        target.path = Some("delayed.txt".into());
+        target.timestamp = 1;
+        events.push(target);
+        for index in 1..=MAX_DELAYED_EVENTS_PER_PATH {
+            let bytes = format!("unrelated old snapshot {index}\n");
+            let sha = put_blob(&store, bytes.as_bytes());
+            let mut record = event(Some(sha), "ai_change", false, None);
+            record.path = Some("delayed.txt".into());
+            record.timestamp = index as u128 + 1;
+            record.tool_use_id = Some(format!("tool-{index}"));
+            events.push(record);
+        }
+        let event_index = index_events(&events);
+        let selected = events_for_path(
+            &store,
+            &events,
+            &event_index,
+            "delayed.txt",
+            u128::MAX,
+            b"",
+            committed,
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].tool_use_id.as_deref(), Some("tool-64"));
+        let _ = fs::remove_dir_all(store);
+    }
+
+    #[test]
+    fn delayed_commit_fixture_matches_the_event_after_snapshot_after_normalization() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/r25_delayed_commit");
+        let event: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.join("event.jsonl")).unwrap()).unwrap();
+        let event_after = fs::read(fixture.join("event-after.bin")).unwrap();
+        let committed = fs::read(fixture.join("committed-after.bin")).unwrap();
+        assert_eq!(crate::hash(&event_after), event["after_sha"]);
+        assert_ne!(event_after, committed);
+        assert_eq!(normalize_eol(&event_after), normalize_eol(&committed));
     }
 
     #[test]

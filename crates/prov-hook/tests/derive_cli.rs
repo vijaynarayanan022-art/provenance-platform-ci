@@ -1472,6 +1472,9 @@ fn detected_renames_count_only_added_lines_and_ignore_git_rename_config() {
         .collect();
     assert_eq!(carried.len(), 3);
     assert!(carried.iter().all(|range| range["category"] == "ai_direct"));
+    assert!(carried
+        .iter()
+        .all(|range| range["primaryBasis"] == "MOVE_LINEAGE"));
     let summary = fixture.cli(&[
         "summary",
         "--repo",
@@ -1517,6 +1520,83 @@ fn detected_renames_count_only_added_lines_and_ignore_git_rename_config() {
     assert_eq!(mass["totals"]["e"], 0);
     assert_eq!(mass["files"].as_array().unwrap().len(), 27);
     fixture.drop_root();
+}
+
+#[test]
+fn delayed_commit_uses_only_unconsumed_exact_ai_snapshot() {
+    let delayed = Fixture::new("delayed-commit-exact");
+    delayed.hook("PreToolUse", "delayed-file");
+    fs::write(
+        delayed.repo.join("delayed.txt"),
+        b"AI line one\nAI line two\n",
+    )
+    .unwrap();
+    delayed.hook("PostToolUse", "delayed-file");
+    fs::write(delayed.repo.join("unrelated.txt"), b"unrelated\n").unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    git(&delayed.repo, &["add", "unrelated.txt"]);
+    git(&delayed.repo, &["commit", "-m", "unrelated change"]);
+    let intervening = git_text(&delayed.repo, &["rev-parse", "HEAD"]);
+    assert!(derive(&delayed, &intervening).status.success());
+    fs::write(delayed.repo.join("current.txt"), b"current human file\n").unwrap();
+    let committed = delayed.commit("commit delayed AI file");
+    assert!(derive(&delayed, &committed).status.success());
+    let report = delayed.derived_value(&committed);
+    assert_eq!(file(&report, "delayed.txt")["ai_strong"], 2);
+    assert_eq!(file(&report, "current.txt")["unknown"], 1);
+    let sidecar = delayed.sidecar_value(&committed);
+    let ranges = sidecar["attributions"].as_array().unwrap();
+    let delayed_ranges = ranges
+        .iter()
+        .filter(|range| range["path"] == "delayed.txt")
+        .collect::<Vec<_>>();
+    assert!(!delayed_ranges.is_empty());
+    assert!(delayed_ranges.iter().all(|range| {
+        range["primaryBasis"] == "EXACT_FRAGMENT_MATCH"
+            && range["limitingBasis"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("X_DELAYED_COMMIT"))
+    }));
+    delayed.drop_root();
+
+    let edited = Fixture::new("delayed-commit-human-edit");
+    edited.hook("PreToolUse", "delayed-edited-file");
+    fs::write(edited.repo.join("delayed.txt"), b"AI original\n").unwrap();
+    edited.hook("PostToolUse", "delayed-edited-file");
+    fs::write(edited.repo.join("unrelated.txt"), b"unrelated\n").unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    git(&edited.repo, &["add", "unrelated.txt"]);
+    git(&edited.repo, &["commit", "-m", "unrelated change"]);
+    let intervening = git_text(&edited.repo, &["rev-parse", "HEAD"]);
+    assert!(derive(&edited, &intervening).status.success());
+    fs::write(edited.repo.join("delayed.txt"), b"human replacement\n").unwrap();
+    let committed = edited.commit("commit hand edited file");
+    assert!(derive(&edited, &committed).status.success());
+    let edited_report = edited.derived_value(&committed);
+    let edited_file = file(&edited_report, "delayed.txt");
+    assert_eq!(edited_file["evidence"], "time_cut");
+    assert_eq!(edited_file["unknown"], 1);
+    assert_eq!(edited_file["ai_strong"], 0);
+    edited.drop_root();
+
+    let consumed = Fixture::new("delayed-commit-consumed");
+    consumed.hook("PreToolUse", "consumed-file");
+    fs::write(consumed.repo.join("consumed.txt"), b"AI original\n").unwrap();
+    consumed.hook("PostToolUse", "consumed-file");
+    let first = consumed.commit("consume AI event");
+    assert!(derive(&consumed, &first).status.success());
+    fs::remove_file(consumed.repo.join("consumed.txt")).unwrap();
+    let deleted = consumed.commit("delete previously committed file");
+    assert!(derive(&consumed, &deleted).status.success());
+    fs::write(consumed.repo.join("consumed.txt"), b"AI original\n").unwrap();
+    let readded = consumed.commit("re-add without new evidence");
+    assert!(derive(&consumed, &readded).status.success());
+    assert_eq!(
+        file(&consumed.derived_value(&readded), "consumed.txt")["unknown"],
+        1
+    );
+    consumed.drop_root();
 }
 
 #[test]

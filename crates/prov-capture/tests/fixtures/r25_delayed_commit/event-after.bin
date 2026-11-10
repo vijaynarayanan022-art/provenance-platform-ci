@@ -1,0 +1,33 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+/**
+ * Returns the product of all numeric values in the array.
+ *
+ * For an empty array, this returns 1, which preserves the identity value of multiplication.
+ */
+export function product(values: number[]): number {
+	return values.reduce((total, value) => total * value, 1);
+}
+
+/**
+ * Returns the median value of the array.
+ *
+ * For an empty array, this returns 0.
+ */
+export function median(values: number[]): number {
+	if (values.length === 0) {
+		return 0;
+	}
+
+	const sorted = [...values].sort((a, b) => a - b);
+	const middle = Math.floor(sorted.length / 2);
+
+	if (sorted.length % 2 === 0) {
+		return (sorted[middle - 1] + sorted[middle]) / 2;
+	}
+
+	return sorted[middle];
+}
