@@ -972,6 +972,8 @@ fn derive_resolved_commit(
                     supporting_basis: Vec::new(),
                     limiting_basis: vec!["X_RECONSTRUCTED_WINDOW".into()],
                     direct_lines: Vec::new(),
+                    direct_line_numbers: Vec::new(),
+                    event_index: None,
                 }),
             });
             evidence = "reconstructed";
@@ -1046,6 +1048,8 @@ fn derive_resolved_commit(
                     supporting_basis: parent_line.supporting_basis,
                     limiting_basis: vec!["X_UNOBSERVED_EDIT_IN_FILE".into()],
                     direct_lines: Vec::new(),
+                    direct_line_numbers: Vec::new(),
+                    event_index: None,
                 }),
             });
             attributed.line.label = derive::Label::Mixed;
@@ -1638,7 +1642,21 @@ pub fn explain_commit(
             checks.push(explain_check(
                 "duplicate_ambiguity",
                 !attributed.ambiguous,
-                format!("ambiguous={}", attributed.ambiguous),
+                format!(
+                    "ambiguous={}; competing_candidates={}",
+                    attributed.ambiguous,
+                    if attributed.ambiguous {
+                        duplicate_competing_candidates(
+                            split_normalized_lines(&normalized_committed)
+                                .get(attributed.line.line.saturating_sub(1))
+                                .copied()
+                                .unwrap_or_default(),
+                            &evidence_input,
+                        )
+                    } else {
+                        "[]".into()
+                    }
+                ),
             ));
             checks.push(explain_check(
                 "unobserved_edit_in_file",
@@ -2361,7 +2379,7 @@ fn steps_for_events_with_trace(
             .or_else(|| {
                 (event.before_sha.is_none() && previous_snapshot.is_empty()).then(Vec::new)
             });
-        let (direct_lines, checks) = if is_ai {
+        let (direct_lines, direct_line_numbers, checks) = if is_ai {
             verified_structured_lines(
                 event,
                 before_snapshot.as_deref(),
@@ -2372,7 +2390,7 @@ fn steps_for_events_with_trace(
                 &evidence_comparison,
             )
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
         decision_traces.push(EventDecisionTrace {
             event: event.event.clone(),
@@ -2415,6 +2433,8 @@ fn steps_for_events_with_trace(
             supporting_basis: Vec::new(),
             limiting_basis,
             direct_lines,
+            direct_line_numbers,
+            event_index: Some(event.order),
         });
         steps.push(Step {
             kind,
@@ -2435,7 +2455,7 @@ fn verified_structured_lines(
     normalized_after: &[u8],
     evidence_exact: bool,
     evidence_comparison: &str,
-) -> (Vec<Vec<u8>>, Vec<ExplainCheck>) {
+) -> (Vec<Vec<u8>>, Vec<usize>, Vec<ExplainCheck>) {
     let before_actual = raw_before.map(crate::hash);
     let before_sha_matches = match (event.before_sha.as_deref(), before_actual.as_deref()) {
         (None, Some(actual)) => normalized_before.is_empty() && actual == crate::hash(&[]),
@@ -2446,7 +2466,10 @@ fn verified_structured_lines(
     let after_sha_matches = event.after_sha.as_deref() == Some(after_actual.as_str());
     let actual_ranges = crate::changed_line_ranges(normalized_before, normalized_after);
     let recorded_ranges = event.line_ranges.as_ref();
-    let ranges_match = recorded_ranges == Some(&actual_ranges);
+    let duplicate_boundary_match = recorded_ranges.is_some_and(|recorded| {
+        ranges_match_at_duplicate_boundary(recorded, &actual_ranges, normalized_after)
+    });
+    let ranges_match = recorded_ranges == Some(&actual_ranges) || duplicate_boundary_match;
     let checks = vec![
         explain_check(
             "structured_edit",
@@ -2483,8 +2506,8 @@ fn verified_structured_lines(
             "line_ranges",
             ranges_match,
             format!(
-                "recorded={:?}; recomputed_from_normalized_bytes={:?}",
-                recorded_ranges, actual_ranges
+                "recorded={:?}; recomputed_from_normalized_bytes={:?}; duplicate_boundary_alignment={duplicate_boundary_match}",
+                recorded_ranges, actual_ranges,
             ),
         ),
         explain_check(
@@ -2509,7 +2532,7 @@ fn verified_structured_lines(
         ),
     ];
     if checks.iter().any(|check| !check.passed) {
-        return (Vec::new(), checks);
+        return (Vec::new(), Vec::new(), checks);
     }
     let old = commit_split_lines(normalized_before);
     let new = commit_split_lines(normalized_after);
@@ -2526,9 +2549,13 @@ fn verified_structured_lines(
         format!("verified_added_line_count={}", added.len()),
     ));
     if nonempty {
-        (added, checks)
+        let line_numbers = actual_ranges
+            .iter()
+            .flat_map(|[start, end]| *start..=*end)
+            .collect();
+        (added, line_numbers, checks)
     } else {
-        (Vec::new(), checks)
+        (Vec::new(), Vec::new(), checks)
     }
 }
 
@@ -2538,6 +2565,92 @@ fn explain_check(condition: &str, passed: bool, compared: String) -> ExplainChec
         passed,
         compared,
     }
+}
+
+fn ranges_match_at_duplicate_boundary(
+    recorded: &[[usize; 2]],
+    actual: &[[usize; 2]],
+    after: &[u8],
+) -> bool {
+    if recorded.len() != actual.len() {
+        return false;
+    }
+    let lines = commit_split_lines(after);
+    let mut differing_range = None;
+    for (index, (recorded, actual)) in recorded.iter().zip(actual).enumerate() {
+        if recorded == actual {
+            continue;
+        }
+        if differing_range.replace(index).is_some() {
+            return false;
+        }
+        let boundary = if recorded[0] == actual[0] && recorded[1].abs_diff(actual[1]) == 1 {
+            recorded[1].max(actual[1])
+        } else if recorded[1] == actual[1] && recorded[0].abs_diff(actual[0]) == 1 {
+            recorded[0].min(actual[0])
+        } else if recorded[0].abs_diff(actual[0]) == 1
+            && recorded[1].abs_diff(actual[1]) == 1
+            && (recorded[0] < actual[0]) == (recorded[1] < actual[1])
+        {
+            let Some(start_text) = recorded[0].checked_sub(1).and_then(|line| lines.get(line))
+            else {
+                return false;
+            };
+            let Some(end_text) = actual[1].checked_sub(1).and_then(|line| lines.get(line)) else {
+                return false;
+            };
+            if lines
+                .iter()
+                .filter(|candidate| *candidate == start_text)
+                .count()
+                < 2
+                || lines
+                    .iter()
+                    .filter(|candidate| *candidate == end_text)
+                    .count()
+                    < 2
+            {
+                return false;
+            }
+            continue;
+        } else {
+            return false;
+        };
+        let Some(text) = boundary.checked_sub(1).and_then(|line| lines.get(line)) else {
+            return false;
+        };
+        if lines.iter().filter(|candidate| *candidate == text).count() < 2 {
+            return false;
+        }
+    }
+    differing_range.is_some()
+}
+
+fn duplicate_competing_candidates(line: &[u8], evidence: &Evidence) -> String {
+    let candidates = evidence
+        .steps
+        .iter()
+        .filter(|step| matches!(step.kind, StepKind::Ai { .. }))
+        .filter_map(|step| {
+            let attribution = step.attribution.as_ref()?;
+            let matching_lines = split_normalized_lines(&step.after)
+                .iter()
+                .enumerate()
+                .filter_map(|(index, candidate)| (*candidate == line).then_some(index + 1))
+                .collect::<Vec<_>>();
+            (!matching_lines.is_empty()).then(|| {
+                serde_json::json!({
+                    "event_index": attribution.event_index,
+                    "tool_use_id": attribution.run_id,
+                    "session": attribution.session_id,
+                    "why_competes": format!(
+                        "the AI snapshot contains identical text at lines {matching_lines:?}"
+                    ),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&candidates).unwrap_or_else(|_| "[]".into())
 }
 
 fn missing_snapshot_trace(
@@ -2868,6 +2981,8 @@ fn missing_snapshot_time_cut_fallback(
             supporting_basis: Vec::new(),
             limiting_basis: vec!["X_TIME_CUT".into(), "INCOMPLETE_SOURCE".into()],
             direct_lines: Vec::new(),
+            direct_line_numbers: Vec::new(),
+            event_index: Some(event.order),
         }),
     })
 }
@@ -3955,6 +4070,8 @@ mod tests {
             supporting_basis: Vec::new(),
             limiting_basis: Vec::new(),
             direct_lines: Vec::new(),
+            direct_line_numbers: Vec::new(),
+            event_index: None,
         };
         assert_eq!(
             score_for_label(derive::Label::AiStrong, Some(&exact), &[]),

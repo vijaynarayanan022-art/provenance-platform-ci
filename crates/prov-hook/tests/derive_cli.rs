@@ -2938,6 +2938,163 @@ fn sidecar_hashes_added_nonblank_lines_and_matches_summary_counts() {
 }
 
 #[test]
+fn r28_duplicate_lines_fixture_attributes_verified_structured_positions_directly() {
+    let _guard = FixtureTestGuard::new();
+    let fixture_root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/r28_duplicate_lines");
+    let root = std::env::temp_dir().join(format!("prov-r28-{}-{}", std::process::id(), now()));
+    let repo = root.join("repository");
+    let home = root.join("store");
+    fs::create_dir_all(&root).unwrap();
+    let clone = isolated_command("git")
+        .arg("clone")
+        .arg(fixture_root.join("tasktrack-demo.bundle"))
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        clone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+
+    fn copy_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap().flatten() {
+            let from = entry.path();
+            let to = target.join(entry.file_name());
+            if from.is_dir() {
+                copy_tree(&from, &to);
+            } else {
+                fs::copy(from, to).unwrap();
+            }
+        }
+    }
+    copy_tree(&fixture_root.join("repos"), &home.join("repos"));
+    let expected: Value =
+        serde_json::from_slice(&fs::read(fixture_root.join("expected-labels.json")).unwrap())
+            .unwrap();
+    let fixture = Fixture {
+        root,
+        repo,
+        home,
+        _test_guard: FixtureTestGuard::new(),
+    };
+    let commit = expected["commit"].as_str().unwrap();
+    let result = derive(&fixture, commit);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let sidecar = fixture.sidecar_value(commit);
+    for (path, lines) in expected["files"].as_object().unwrap() {
+        let summary = fixture.cli(&[
+            "summary",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--commit",
+            commit,
+            "--file",
+            path,
+            "--format",
+            "json",
+        ]);
+        assert!(
+            summary.status.success(),
+            "{}",
+            String::from_utf8_lossy(&summary.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&summary.stdout).unwrap();
+        for (line, category) in lines.as_object().unwrap() {
+            let line: usize = line.parse().unwrap();
+            let attribution = sidecar["attributions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|range| {
+                    range["path"] == *path
+                        && range["startLine"].as_u64().unwrap() as usize <= line
+                        && range["endLine"].as_u64().unwrap() as usize >= line
+                })
+                .unwrap_or_else(|| panic!("missing attribution for {path}:{line}"));
+            assert_eq!(attribution["category"], *category, "{path}:{line}");
+            assert!(
+                summary["file_ranges"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|range| {
+                        range["file"] == *path
+                            && range["category"] == *category
+                            && range["startLine"].as_u64().unwrap() as usize <= line
+                            && range["endLine"].as_u64().unwrap() as usize >= line
+                    }),
+                "summary missed {path}:{line}"
+            );
+
+            let explanation = explain_json(&fixture, commit, path, Some(line));
+            assert_eq!(
+                explanation["lines"][0]["category"], *category,
+                "{path}:{line}"
+            );
+            assert!(explanation["lines"][0]["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |check| check["condition"] == "duplicate_ambiguity" && check["passed"] == true
+                ));
+        }
+    }
+    fixture.drop_root();
+}
+
+#[test]
+fn explain_duplicate_ambiguity_lists_the_competing_ai_event() {
+    let fixture = Fixture::new("explain-duplicate-candidates");
+    fixture.hook("PreToolUse", "duplicate-source");
+    fs::write(fixture.repo.join("tracked.txt"), b"base\nsame line\n").unwrap();
+    fixture.hook("PostToolUse", "duplicate-source");
+    fixture.hook("PreToolUse", "duplicate-copy");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"base\nsame line\nsame line\n",
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "duplicate-copy");
+    mark_event_external(&fixture, "duplicate-copy");
+    let commit = fixture.commit("explain duplicate candidate");
+    assert!(derive(&fixture, &commit).status.success());
+
+    let explanation = explain_json(&fixture, &commit, "tracked.txt", Some(3));
+    let checks = explanation["lines"][0]["checks"].as_array().unwrap();
+    let duplicate = checks
+        .iter()
+        .find(|check| check["condition"] == "duplicate_ambiguity")
+        .unwrap();
+    assert_eq!(duplicate["passed"], false);
+    let candidates: Value = serde_json::from_str(
+        duplicate["compared"]
+            .as_str()
+            .unwrap()
+            .split_once("competing_candidates=")
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    assert!(candidates.as_array().unwrap().iter().any(|candidate| {
+        candidate["tool_use_id"] == "duplicate-source"
+            && candidate["session"] == "derive-test-session"
+            && candidate["event_index"].is_number()
+            && candidate["why_competes"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("identical text"))
+    }));
+    fixture.drop_root();
+}
+
+#[test]
 fn patch_id_matches_git_and_identical_patches_match_each_other() {
     let fixture = Fixture::new("patch-id");
     let base = git_text(&fixture.repo, &["rev-parse", "HEAD"]);

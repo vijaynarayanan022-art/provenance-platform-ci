@@ -1,0 +1,32 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { isOverdue, parseDueDate, parsePriority, sortTasks } = require('../index');
+
+test('accepts valid due dates and rejects malformed or impossible dates', () => {
+  assert.equal(parseDueDate('2024-02-29'), '2024-02-29');
+  assert.throws(() => parseDueDate('2025-02-29'), /valid calendar date/);
+  assert.throws(() => parseDueDate('2024-2-09'), /YYYY-MM-DD/);
+});
+
+test('accepts only supported priorities', () => {
+  assert.equal(parsePriority('high'), 'high');
+  assert.throws(() => parsePriority('urgent'), /low, medium, or high/);
+});
+
+test('sorts tasks by priority and then ID without mutating the input', () => {
+  const tasks = [
+    { id: 3, priority: 'low' },
+    { id: 2, priority: 'high' },
+    { id: 1 },
+    { id: 4, priority: 'medium' },
+  ];
+
+  assert.deepEqual(sortTasks(tasks).map((task) => task.id), [2, 1, 4, 3]);
+  assert.deepEqual(tasks.map((task) => task.id), [3, 2, 1, 4]);
+});
+
+test('marks only unfinished tasks with earlier due dates as overdue', () => {
+  assert.equal(isOverdue({ due: '2026-11-10', done: false }, '2026-11-11'), true);
+  assert.equal(isOverdue({ due: '2026-11-11', done: false }, '2026-11-11'), false);
+  assert.equal(isOverdue({ due: '2026-11-10', done: true }, '2026-11-11'), false);
+});

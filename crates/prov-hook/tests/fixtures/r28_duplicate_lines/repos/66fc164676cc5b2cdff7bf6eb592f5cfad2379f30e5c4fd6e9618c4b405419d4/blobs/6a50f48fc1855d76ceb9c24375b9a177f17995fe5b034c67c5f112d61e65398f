@@ -1,0 +1,19 @@
+﻿{
+  "name": "tasktrack-demo",
+  "version": "1.0.0",
+  "description": "A small command-line task tracker",
+  "main": "index.js",
+  "bin": {
+    "tasktrack": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "keywords": ["tasks", "cli"],
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "commander": "^14.0.0"
+  }
+}

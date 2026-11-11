@@ -1,0 +1,62 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const {
+  normalizePriority,
+  validateDueDate,
+  isOverdue,
+  sortTasks,
+} = require('../taskUtils');
+
+test('normalizePriority accepts valid priorities and lowercases them', () => {
+  assert.equal(normalizePriority('HIGH'), 'high');
+  assert.equal(normalizePriority('medium'), 'medium');
+  assert.equal(normalizePriority('low'), 'low');
+});
+
+test('normalizePriority rejects invalid priorities', () => {
+  assert.throws(() => normalizePriority('urgent'), /Priority/);
+});
+
+test('validateDueDate accepts valid YYYY-MM-DD dates and rejects invalid ones', () => {
+  assert.equal(validateDueDate('2026-11-10'), '2026-11-10');
+  assert.throws(() => validateDueDate('2026-02-30'), /Invalid due date/);
+  assert.throws(() => validateDueDate('2026-13-01'), /Invalid due date/);
+  assert.throws(() => validateDueDate('2026/11/10'), /Invalid due date/);
+});
+
+test('isOverdue marks tasks due before today as overdue', () => {
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const tomorrow = new Date(today);
+  tomorrow.setDate(today.getDate() + 1);
+
+  assert.equal(isOverdue({ dueDate: formatDate(yesterday), done: false }), true);
+  assert.equal(isOverdue({ dueDate: formatDate(tomorrow), done: false }), false);
+  assert.equal(isOverdue({ dueDate: formatDate(yesterday), done: true }), false);
+});
+
+test('sortTasks orders tasks by priority descending and keeps overdue work first when priority matches', () => {
+  const tasks = [
+    { id: 1, description: 'Low', priority: 'low', dueDate: '2026-11-12', done: false },
+    { id: 2, description: 'High', priority: 'high', dueDate: '2026-11-15', done: false },
+    { id: 3, description: 'Medium', priority: 'medium', dueDate: '2026-11-11', done: false },
+    { id: 4, description: 'Another High', priority: 'high', dueDate: '2026-11-10', done: false },
+  ];
+
+  const sorted = sortTasks(tasks);
+  assert.deepEqual(sorted.map((task) => task.description), [
+    'High',
+    'Another High',
+    'Medium',
+    'Low',
+  ]);
+});
+
+function formatDate(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}

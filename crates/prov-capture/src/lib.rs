@@ -6,7 +6,7 @@ pub mod rewrite;
 use fd_lock::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use similar::{ChangeTag, TextDiff};
+use similar::{capture_diff_slices, Algorithm, DiffTag};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -2444,27 +2444,43 @@ pub fn diff_changes_and_deletions(before: &[u8], after: &[u8]) -> (Vec<[usize; 2
     let (Some(old), Some(new)) = (normalized(before), normalized(after)) else {
         return (Vec::new(), Vec::new());
     };
-    let diff = TextDiff::from_lines(&old, &new);
-    let mut new_line = 0usize;
+    let old_lines = split_diff_lines(old.as_bytes());
+    let new_lines = split_diff_lines(new.as_bytes());
+    let diff = capture_diff_slices(Algorithm::Myers, &old_lines, &new_lines);
     let mut changed = Vec::new();
     let mut deleted = Vec::new();
-    for item in diff.iter_all_changes() {
-        match item.tag() {
-            ChangeTag::Equal => {
-                new_line += 1;
+    let mut new_line = 0usize;
+    for op in diff {
+        match op.tag() {
+            DiffTag::Equal => new_line += op.new_range().len(),
+            DiffTag::Insert => {
+                changed.extend(op.new_range().map(|index| index + 1));
+                new_line += op.new_range().len();
             }
-            ChangeTag::Insert => {
-                new_line += 1;
-                changed.push(new_line);
-            }
-            ChangeTag::Delete => {
-                deleted.push(new_line);
+            DiffTag::Delete => deleted.extend(op.old_range().map(|_| new_line)),
+            DiffTag::Replace => {
+                changed.extend(op.new_range().map(|index| index + 1));
+                deleted.extend(op.old_range().map(|_| new_line));
+                new_line += op.new_range().len();
             }
         }
     }
     deleted.sort_unstable();
     deleted.dedup();
     (ranges(changed), deleted)
+}
+fn split_diff_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<_> = bytes
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect();
+    if bytes.last() == Some(&b'\n') {
+        lines.pop();
+    }
+    lines
 }
 pub fn changed_line_ranges(before: &[u8], after: &[u8]) -> Vec<[usize; 2]> {
     diff_changes_and_deletions(before, after).0
