@@ -1,0 +1,17 @@
+﻿# TaskTrack
+
+A small command-line task tracker built with Node.js and Commander.
+
+```sh
+npm install
+node index.js add "Buy groceries"
+node index.js add "Submit report" --due 2026-11-20 --priority high
+node index.js list
+node index.js done 1
+node index.js clear --done
+```
+
+Due dates must be valid `YYYY-MM-DD` dates. Priorities can be `low`, `medium`, or `high`; tasks are listed from highest to lowest priority, and overdue tasks are shown in red.
+Use `node index.js clear --done` to remove completed tasks.
+
+Run the unit tests with `npm test`. Tasks are stored in `tasks.json` in the project directory. Use `npm link` to install the `tasktrack` command globally from this checkout.

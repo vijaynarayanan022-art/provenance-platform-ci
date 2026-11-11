@@ -30,6 +30,10 @@ pub struct StepAttribution {
     pub supporting_basis: Vec<String>,
     pub limiting_basis: Vec<String>,
     pub direct_lines: Vec<Vec<u8>>,
+    /// One-based line numbers in this step's verified after snapshot.
+    pub direct_line_numbers: Vec<usize>,
+    /// Event position in the session JSONL, for explain diagnostics.
+    pub event_index: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +170,10 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
             step.kind,
             step_index,
             direct_lines,
+            step.attribution
+                .as_ref()
+                .map(|attribution| attribution.direct_line_numbers.as_slice())
+                .unwrap_or_default(),
         );
         previous = next;
     }
@@ -177,6 +185,7 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
         &committed_lines,
         StepKind::Unknown,
         ev.steps.len(),
+        &[],
         &[],
     );
     let added = added_lines(&parent, &committed_lines);
@@ -290,6 +299,10 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
             step.kind,
             step_index,
             direct_lines,
+            step.attribution
+                .as_ref()
+                .map(|attribution| attribution.direct_line_numbers.as_slice())
+                .unwrap_or_default(),
         );
         previous = next;
     }
@@ -635,6 +648,7 @@ fn replay(
     kind: StepKind,
     source_step: usize,
     direct_lines: &[Vec<u8>],
+    direct_line_numbers: &[usize],
 ) -> Vec<OwnedLine> {
     let ops = capture_diff_slices(Algorithm::Myers, old, new);
     let mut next_owners = vec![
@@ -857,6 +871,20 @@ fn replay(
             }
         }
     }
+    for &line_number in direct_line_numbers {
+        let Some(line_index) = line_number.checked_sub(1) else {
+            continue;
+        };
+        let Some(owner) = next_owners.get_mut(line_index) else {
+            continue;
+        };
+        *owner = OwnedLine {
+            owner: Owner::Direct,
+            candidates: owner_candidate(Owner::Direct),
+            source_step: Some(source_step),
+            ambiguous: false,
+        };
+    }
     next_owners
 }
 
@@ -907,6 +935,8 @@ mod tests {
             supporting_basis: Vec::new(),
             limiting_basis: Vec::new(),
             direct_lines: Vec::new(),
+            direct_line_numbers: Vec::new(),
+            event_index: None,
         });
         result
     }
@@ -1017,6 +1047,8 @@ mod tests {
             supporting_basis: Vec::new(),
             limiting_basis: Vec::new(),
             direct_lines: vec![b"new ai edit".to_vec()],
+            direct_line_numbers: Vec::new(),
+            event_index: None,
         });
         // The discarded AI snapshot is omitted from replay; the retained sequence
         // starts with the human edit made after the reset.
@@ -1629,6 +1661,8 @@ mod tests {
             supporting_basis: Vec::new(),
             limiting_basis: Vec::new(),
             direct_lines: split_lines(&ai),
+            direct_line_numbers: Vec::new(),
+            event_index: None,
         });
         let ev = evidence(b"", vec![ai_step, step(StepKind::External, &external)]);
         let lines = derive_lines_with_attribution(&ev, &committed);

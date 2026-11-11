@@ -211,6 +211,12 @@ The existing assertions updated for this change are: `prov_capture::commit::unob
 
 PR report JSON now carries `file_ranges` from the same stored sidecars and range serializer as summary output; the range parity integration test compares both reports.
 
+## Round 28: verified duplicate lines and boundary alignment
+
+Verified structured edits now retain one-based line positions from their hash-checked snapshots through replay. Repeated text elsewhere in the same snapshot no longer makes those positionally verified additions unknown. Duplicate ambiguity remains active for candidates without verified positions, including human/external copies and independent AI evidence. `explain` includes competing AI event indices, tool-use IDs, sessions, and matching snapshot line locations when duplicate ambiguity fails; its candidate list is derived from the already filtered event sequence, so consumed and discarded events are omitted.
+
+Capture line ranges now use the same Myers line alignment as attribution. For legacy evidence whose recorded range differs only by a one-line offset at a duplicated block boundary, explain accepts the alternate alignment only when both shifted boundary lines are repeated in the hash-verified after snapshot; direct positions use the recomputed range so the added-line set and attribution positions agree. This narrow compatibility rule is a spec deviation: the current design does not define how to reconcile historically recorded line ranges when identical boundary lines admit multiple alignments. It should be reviewed by the spec owner.
+
 The existing table assertion in `prov-hook/tests/commands_cli.rs::summary_marks_missing_reports_and_zero_eligible_percentages` was also changed from `none` to `unknown`, keeping the `n/a` percentage expectation.
 
 The exact PR-report key assertion in `prov-hook/tests/pr_report_cli.rs::two_commit_report_sums_stored_reports_and_out_matches_stdout` now includes the additive `file_ranges` field.
