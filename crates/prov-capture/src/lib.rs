@@ -339,42 +339,53 @@ pub fn process_json(input: &[u8]) {
 }
 
 pub fn process_vscode_json(input: &[u8]) {
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(input) else {
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(input) else {
         return;
     };
-    let Some(event_name) = payload.get("hook_event_name").and_then(|v| v.as_str()) else {
+    let Some(event_name) = payload
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+    else {
         return;
     };
     if event_name == "SessionStart" {
         return;
     }
-    if !matches!(event_name, "PreToolUse" | "PostToolUse" | "Stop") {
+    if !matches!(event_name.as_str(), "PreToolUse" | "PostToolUse" | "Stop") {
         return;
     }
-    let tool_name = payload.get("tool_name").and_then(|v| v.as_str());
+    let tool_name = payload
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     let mut target_paths = None;
-    let require_window = match (event_name, tool_name) {
+    let require_window = match (event_name.as_str(), tool_name.as_deref()) {
         ("Stop", _) => false,
         ("PreToolUse" | "PostToolUse", Some("create_file")) => {
-            target_paths = Some(
-                payload
-                    .get("tool_input")
-                    .and_then(|v| v.get("filePath"))
-                    .and_then(|v| v.as_str())
-                    .map(|path| vec![path.to_owned()])
-                    .unwrap_or_default(),
-            );
+            if let Some(path) = payload
+                .get("tool_input")
+                .and_then(|v| v.get("filePath"))
+                .and_then(|v| v.as_str())
+                .filter(|path| !path.trim().is_empty())
+            {
+                target_paths = Some(vec![path.to_owned()]);
+            } else if let Some(input) = payload.get_mut("tool_input") {
+                *input = serde_json::Value::Null;
+            }
             true
         }
         ("PreToolUse" | "PostToolUse", Some("apply_patch")) => {
-            target_paths = Some(
-                payload
-                    .get("tool_input")
-                    .and_then(|v| v.get("input"))
-                    .and_then(|v| v.as_str())
-                    .map(parse_apply_patch_paths)
-                    .unwrap_or_default(),
-            );
+            if let Some(paths) = vscode_apply_patch_paths(payload.get("tool_input")) {
+                target_paths = Some(paths);
+            } else {
+                // Some VS Code versions wrap or reshape structured inputs. Keep the
+                // snapshot window unscoped so its diff is still captured as AI evidence.
+                // Without a verified payload, derive can credit at most ai_strong.
+                if let Some(input) = payload.get_mut("tool_input") {
+                    *input = serde_json::Value::Null;
+                }
+            }
             true
         }
         (
@@ -401,7 +412,7 @@ pub fn process_vscode_json(input: &[u8]) {
         _ => return,
     };
     let hook = HookInput {
-        hook_event_name: Some(event_name.to_owned()),
+        hook_event_name: Some(event_name),
         session_id: payload
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -415,7 +426,7 @@ pub fn process_vscode_json(input: &[u8]) {
             .get("model")
             .and_then(|v| v.as_str())
             .map(str::to_owned),
-        tool_name: tool_name.map(str::to_owned),
+        tool_name,
         tool_use_id: payload
             .get("tool_use_id")
             .and_then(|v| v.as_str())
@@ -475,6 +486,15 @@ fn parse_apply_patch_paths(patch: &str) -> Vec<String> {
         .filter(|path| !path.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn vscode_apply_patch_paths(tool_input: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    let patch = tool_input?
+        .get("input")
+        .or_else(|| tool_input?.get("patch"))?
+        .as_str()?;
+    let paths = parse_apply_patch_paths(patch);
+    (!paths.is_empty()).then_some(paths)
 }
 
 fn structured_edit_allowed(adapter: &str, operation: Option<&str>) -> bool {
@@ -567,6 +587,27 @@ fn structured_input(
         _ => return None,
     };
     input.get(field)?.as_str().map(str::to_owned)
+}
+
+fn structured_input_is_direct_eligible(
+    adapter: &str,
+    operation: Option<&str>,
+    input: Option<&serde_json::Value>,
+) -> bool {
+    let Some(operation) = operation else {
+        return false;
+    };
+    let Some(input) = input else {
+        return false;
+    };
+    let Some(payload) = structured_input(adapter, Some(operation), input) else {
+        return false;
+    };
+    if operation == "create_file" {
+        return true;
+    }
+    structured_added_lines(adapter, Some(operation), input).is_some_and(|lines| !lines.is_empty())
+        && !payload.is_empty()
 }
 
 fn append_vscode_diagnostic(cwd: Option<&Path>, tool_name: &str, pre_event: bool) {
@@ -938,10 +979,14 @@ fn process_hook(
                 e.model = hook.model.clone();
                 e.tool = Some(tool_label.into());
                 e.operation = hook.tool_name.clone();
-                e.structured_edit = Some(structured_edit_allowed(
-                    tool_label,
-                    hook.tool_name.as_deref(),
-                ));
+                e.structured_edit = Some(
+                    structured_edit_allowed(tool_label, hook.tool_name.as_deref())
+                        && structured_input_is_direct_eligible(
+                            tool_label,
+                            hook.tool_name.as_deref(),
+                            hook.tool_input.as_ref(),
+                        ),
+                );
                 e.structured_added_lines = hook
                     .tool_input
                     .as_ref()
@@ -2082,6 +2127,24 @@ fn append_marker(ctx: &MarkerContext, event: &Event) {
         append_line(&ctx.home.join("inbox.jsonl"), event);
     }
 }
+fn record_write_failure_marker(reason: &str) {
+    let Some(ctx) = MARKER_CONTEXT
+        .lock()
+        .ok()
+        .and_then(|context| context.clone())
+    else {
+        return;
+    };
+    let mut event = Event::new(
+        "write_failure",
+        ctx.hook_event_name.as_deref(),
+        ctx.repo_id.as_deref(),
+        ctx.session_id.as_deref(),
+        ctx.tool_use_id.as_deref(),
+    );
+    event.reason = Some(reason.into());
+    append_marker(&ctx, &event);
+}
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     fs::read(path)
         .ok()
@@ -2089,12 +2152,16 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 }
 fn atomic_json<T: Serialize>(path: &Path, value: &T, sync: bool) -> std::io::Result<()> {
     let start = Instant::now();
-    atomic_bytes(
+    let result = atomic_bytes(
         path,
         &serde_json::to_vec(value).map_err(std::io::Error::other)?,
         sync,
-    )
-    .inspect(|_| add_ns(&TIMINGS.writes_ns, start.elapsed()))
+    );
+    add_ns(&TIMINGS.writes_ns, start.elapsed());
+    if result.is_err() {
+        record_write_failure_marker("atomic_write_failed");
+    }
+    result
 }
 fn write_once(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let start = Instant::now();
@@ -2115,6 +2182,9 @@ fn write_once(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64)
     {
         return Ok(());
+    }
+    if result.is_err() {
+        record_write_failure_marker("snapshot_write_failed");
     }
     result
 }
@@ -2191,6 +2261,34 @@ fn append_line(path: &Path, event: &Event) -> bool {
     append_events(path, std::slice::from_ref(event))
 }
 fn append_events(path: &Path, events: &[Event]) -> bool {
+    if append_events_raw(path, events) {
+        return true;
+    }
+    if path.file_name().is_some_and(|name| name == "markers.jsonl") {
+        return false;
+    }
+    let Some(first) = events.first() else {
+        return false;
+    };
+    let mut marker = Event::new(
+        "write_failure",
+        first.hook_event_name.as_deref(),
+        first.repo_id.as_deref(),
+        first.session_id.as_deref(),
+        first.tool_use_id.as_deref(),
+    );
+    marker.reason = Some("event_log_write_failed".into());
+    let marker_path = path
+        .parent()
+        .and_then(Path::parent)
+        .map(|store| store.join("markers.jsonl"));
+    if let Some(path) = marker_path {
+        let _ = append_events_raw(&path, std::slice::from_ref(&marker));
+    }
+    false
+}
+
+fn append_events_raw(path: &Path, events: &[Event]) -> bool {
     let start = Instant::now();
     let mut bytes = Vec::new();
     for event in events {
@@ -2202,7 +2300,7 @@ fn append_events(path: &Path, events: &[Event]) -> bool {
     }
     if bytes.is_empty() {
         add_ns(&TIMINGS.log_work_ns, start.elapsed());
-        return false;
+        return true;
     }
     if let Some(parent) = path.parent() {
         if ensure_private_dir(parent).is_err() {
@@ -2454,6 +2552,49 @@ pub fn process_json_timed(input: &[u8]) -> TimingSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_patch_payload_without_parsed_paths_falls_back_to_unscoped_capture() {
+        let valid = serde_json::json!({"input":"*** Update File: src/app.js\n+value"});
+        assert_eq!(
+            vscode_apply_patch_paths(Some(&valid)),
+            Some(vec!["src/app.js".to_owned()])
+        );
+        let malformed = serde_json::json!({"input":{"patch":"changed"}});
+        assert_eq!(vscode_apply_patch_paths(Some(&malformed)), None);
+        let pathless = serde_json::json!({"input":"+changed\n"});
+        assert_eq!(vscode_apply_patch_paths(Some(&pathless)), None);
+    }
+
+    #[test]
+    fn event_log_write_failure_attempts_a_stable_marker() {
+        let store = std::env::temp_dir().join(format!(
+            "prov-event-write-failure-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("events"), b"").unwrap();
+        let event = Event::new(
+            "ai_change",
+            Some("PostToolUse"),
+            Some("repo"),
+            Some("session"),
+            None,
+        );
+        assert!(!append_line(&store.join("events/session.jsonl"), &event));
+        let marker: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(store.join("markers.jsonl"))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["event"], "write_failure");
+        assert_eq!(marker["reason"], "event_log_write_failed");
+        let _ = fs::remove_dir_all(store);
+    }
 
     #[test]
     fn overlap_requires_a_recent_other_tool_window() {

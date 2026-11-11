@@ -727,6 +727,53 @@ fn create_file_and_patch_replay_derive_exact_vscode_labels_and_report_tool() {
 }
 
 #[test]
+fn unparsable_apply_patch_payload_uses_snapshot_diff_without_direct_credit() {
+    let fixture = Fixture::new("unparsed-apply-patch");
+    let mut pre = fixture.repo_payload("pre-apply-patch");
+    pre["tool_input"] = json!({"input":{"patches":[{"target":"tracked.txt"}]}});
+    assert_hook_response(&fixture.hook(&pre, "vscode"));
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        "base\nsnapshot fallback\n",
+    )
+    .unwrap();
+    let mut post = fixture.repo_payload("post-apply-patch");
+    post["tool_input"] = pre["tool_input"].clone();
+    assert_hook_response(&fixture.hook(&post, "vscode"));
+
+    let ai_change = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["path"] == "tracked.txt")
+        .unwrap();
+    assert_eq!(ai_change["structured_edit"], false);
+    assert!(ai_change["structured_added_lines"].is_null());
+
+    let commit = fixture.commit("fallback snapshot edit");
+    let derived = fixture.cli(&[
+        "derive",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+    ]);
+    assert!(
+        derived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&derived.stderr)
+    );
+    let report = file_report(&fixture, &commit);
+    let tracked = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "tracked.txt")
+        .unwrap();
+    assert_eq!(tracked["ai_strong"], 1, "{tracked}");
+    assert_eq!(tracked["ai_direct"], 0, "{tracked}");
+    fixture.drop_root();
+}
+
+#[test]
 fn missing_pre_snapshot_is_degraded_and_never_ai_credited() {
     let fixture = Fixture::new("missing-pre");
     fs::write(

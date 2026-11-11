@@ -1,0 +1,58 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+
+const { addTask, formatTasks, isValidDueDate, readTasks } = require('../index');
+
+test('validates real YYYY-MM-DD dates, including leap days', () => {
+  assert.equal(isValidDueDate('2024-02-29'), true);
+  assert.equal(isValidDueDate('2025-02-29'), false);
+  assert.equal(isValidDueDate('2026-13-01'), false);
+  assert.equal(isValidDueDate('2026-1-01'), false);
+});
+
+test('persists due date and priority and defaults priority to medium', (context) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tasktrack-'));
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'tasks.json');
+
+  const urgent = addTask('Submit report', { due: '2026-11-15', priority: 'high' }, file);
+  const ordinary = addTask('Buy groceries', {}, file);
+
+  assert.deepEqual(urgent, {
+    id: 1,
+    description: 'Submit report',
+    done: false,
+    priority: 'high',
+    due: '2026-11-15',
+  });
+  assert.equal(ordinary.priority, 'medium');
+  assert.deepEqual(readTasks(file), [urgent, ordinary]);
+});
+
+test('rejects invalid dates without writing a task', (context) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tasktrack-'));
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'tasks.json');
+
+  assert.throws(() => addTask('Invalid date', { due: '2026-02-30' }, file), /valid date/);
+  assert.deepEqual(readTasks(file), []);
+});
+
+test('lists tasks by priority and highlights only overdue unfinished tasks', () => {
+  const lines = formatTasks([
+    { id: 1, description: 'Medium overdue', priority: 'medium', due: '2026-11-09', done: false },
+    { id: 2, description: 'High due today', priority: 'high', due: '2026-11-10', done: false },
+    { id: 3, description: 'Low completed', priority: 'low', due: '2026-11-01', done: true },
+    { id: 4, description: 'High second', priority: 'high', done: false },
+  ], '2026-11-10');
+
+  assert.deepEqual(lines, [
+    '[ ] #2 High due today',
+    '[ ] #4 High second',
+    '\u001b[31m[ ] #1 Medium overdue\u001b[0m',
+    '[x] #3 Low completed',
+  ]);
+});
