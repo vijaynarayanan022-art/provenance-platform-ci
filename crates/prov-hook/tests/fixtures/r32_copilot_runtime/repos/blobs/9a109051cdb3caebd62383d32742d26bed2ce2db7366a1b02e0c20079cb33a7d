@@ -1,0 +1,50 @@
+def celsius_to_fahrenheit(celsius):
+    """Convert Celsius degrees to Fahrenheit."""
+    return celsius * 9 / 5 + 32
+
+
+def fahrenheit_to_celsius(fahrenheit):
+    """Convert Fahrenheit degrees to Celsius."""
+    return (fahrenheit - 32) * 5 / 9
+
+
+def main():
+    print("Temperature Converter")
+    print("1. Celsius to Fahrenheit")
+    print("2. Fahrenheit to Celsius")
+    choice = input("Choose 1 or 2: ").strip()
+    if choice not in {"1", "2"}:
+        print("Please choose 1 or 2.")
+        return
+    try:
+        temperature = float(input("Temperature: "))
+    except ValueError:
+        print("Please enter a numeric temperature.")
+        return
+    if choice == "1":
+        converted = celsius_to_fahrenheit(temperature)
+        print(f"{temperature:g} C = {converted:.1f} F")
+    else:
+        converted = fahrenheit_to_celsius(temperature)
+        print(f"{temperature:g} F = {converted:.1f} C")
+    print("Conversion complete.")
+
+
+if __name__ == "__main__":
+    main()
+
+# Celsius and Fahrenheit scales meet at -40 degrees.
+# Water freezes at 0 C, or 32 F.
+# Water boils at 100 C, or 212 F.
+# Conversion functions can also be imported by other programs.
+# The menu accepts only the two listed options.
+# Decimal temperatures are supported.
+# Results are shown to one decimal place.
+# This example needs no third-party packages.
+# Run with: python temperature_converter.py
+# Try converting 25 C as a quick check.
+# The result should be 77 F.
+# Try converting 68 F, which is 20 C.
+# Below-zero temperatures are valid inputs.
+# Decimal values are accepted by both conversions.
+# The conversion helpers can be imported elsewhere.

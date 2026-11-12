@@ -1,0 +1,46 @@
+import random
+
+
+CHOICES = ("rock", "paper", "scissors")
+
+
+def decide(player, computer):
+    """Return win, lose, or tie for one round."""
+    if player == computer:
+        return "tie"
+    beats = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
+    return "win" if beats[player] == computer else "lose"
+
+
+def main():
+    print("Rock, Paper, Scissors")
+    wins = losses = ties = 0
+    while True:
+        player = input("Choose rock, paper, or scissors: ").lower().strip()
+        if player == "q":
+            break
+        if player not in CHOICES:
+            print("That choice is not on the list. Try again.")
+            continue
+        computer = random.choice(CHOICES)
+        result = decide(player, computer)
+        print(f"You chose {player}; computer chose {computer}.")
+        if result == "win":
+            wins += 1
+            print("You win this round!")
+        elif result == "lose":
+            losses += 1
+            print("Computer wins this round.")
+        else:
+            ties += 1
+            print("This round is a tie.")
+        print(f"Score: {wins} wins, {losses} losses, {ties} ties.")
+    print("Final score:")
+    print(f"Wins: {wins}")
+    print(f"Losses: {losses}")
+    print(f"Ties: {ties}")
+    print("Thanks for playing!")
+
+
+if __name__ == "__main__":
+    main()

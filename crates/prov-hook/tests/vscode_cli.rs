@@ -3,7 +3,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static HOOK_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
 fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -61,6 +64,9 @@ impl Fixture {
     }
 
     fn hook(&self, payload: &Value, adapter: &str) -> Output {
+        let _guard = HOOK_PROCESS_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut child = isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
             .arg(adapter)
             .env("PROV_HOME", &self.store)
@@ -774,6 +780,70 @@ fn unparsable_apply_patch_payload_uses_snapshot_diff_without_direct_credit() {
 }
 
 #[test]
+fn runtime_edit_with_unparseable_input_uses_strong_snapshot_fallback() {
+    let fixture = Fixture::new("runtime-edit-unparsed");
+    let pre = json!({
+        "hook_event_name":"PreToolUse",
+        "session_id":"runtime-session",
+        "cwd":fixture.repo,
+        "tool_name":"eDiT",
+        "tool_use_id":"custom_call_runtime_unparsed",
+        "tool_input":"not a recognized patch payload"
+    });
+    assert_hook_response(&fixture.hook(&pre, "vscode"));
+    fs::write(fixture.repo.join("tracked.txt"), "base\nruntime fallback\n").unwrap();
+    let mut post = pre.clone();
+    post["hook_event_name"] = json!("PostToolUse");
+    assert_hook_response(&fixture.hook(&post, "vscode"));
+
+    let change = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["path"] == "tracked.txt")
+        .unwrap();
+    assert_eq!(change["structured_edit"], false);
+    assert_eq!(change["operation"], "apply_patch");
+
+    let commit = fixture.commit("runtime fallback edit");
+    let derived = fixture.cli(&[
+        "derive",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+    ]);
+    assert!(derived.status.success());
+    let report = file_report(&fixture, &commit);
+    let file = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "tracked.txt")
+        .unwrap();
+    assert_eq!(file["ai_direct"], 0);
+    assert_eq!(file["ai_strong"], 1);
+
+    let explain = fixture.cli(&[
+        "explain",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+        "--file",
+        "tracked.txt",
+        "--format",
+        "json",
+    ]);
+    assert!(explain.status.success());
+    let explain: Value = serde_json::from_slice(&explain.stdout).unwrap();
+    assert!(explain["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| line["category"] == "ai_strong"));
+    fixture.drop_root();
+}
+
+#[test]
 fn missing_pre_snapshot_is_degraded_and_never_ai_credited() {
     let fixture = Fixture::new("missing-pre");
     fs::write(
@@ -782,7 +852,7 @@ fn missing_pre_snapshot_is_degraded_and_never_ai_credited() {
     )
     .unwrap();
     let mut post = fixture.repo_payload("post-create-file");
-    post["cwd"] = json!(fixture.root);
+    post["cwd"] = json!(fixture.repo);
     post["tool_input"]["filePath"] = json!(fixture.repo.join("tracked.txt"));
     post["tool_use_id"] = json!("missing-pre-id");
     assert_hook_response(&fixture.hook(&post, "vscode"));
@@ -1007,7 +1077,7 @@ fn setup_is_idempotent_preserves_foreign_entries_and_doctor_checks_binary() {
     let document: Value = serde_json::from_slice(&first).unwrap();
     assert_eq!(document["version"], 1);
     assert_eq!(document["other"], "keep");
-    for event in ["preToolUse", "postToolUse", "agentStop"] {
+    for event in ["PreToolUse", "PostToolUse", "Stop"] {
         let entries = document["hooks"][event].as_array().unwrap();
         let ours: Vec<_> = entries
             .iter()
@@ -1020,9 +1090,9 @@ fn setup_is_idempotent_preserves_foreign_entries_and_doctor_checks_binary() {
         assert_eq!(ours.len(), 1);
         assert_eq!(ours[0]["type"], "command");
         assert_eq!(ours[0]["timeoutSec"], 5);
-        assert!(ours[0]["bash"].as_str().unwrap().ends_with(" vscode"));
+        assert!(ours[0]["command"].as_str().unwrap().ends_with(" vscode"));
     }
-    assert_eq!(document["hooks"]["preToolUse"].as_array().unwrap().len(), 2);
+    assert_eq!(document["hooks"]["preToolUse"].as_array().unwrap().len(), 1);
     let repeated = fixture.cli(&["install", "--tool", "vscode"]);
     assert!(repeated.status.success());
     assert_eq!(fs::read(&hooks_file).unwrap(), first);
@@ -1037,7 +1107,7 @@ fn setup_is_idempotent_preserves_foreign_entries_and_doctor_checks_binary() {
         String::from_utf8_lossy(&doctor.stdout)
     );
     let doctor = String::from_utf8(doctor.stdout).unwrap();
-    assert_eq!(doctor.matches("PASS ").count(), 3);
+    assert_eq!(doctor.matches("PASS ").count(), 4);
 
     let removed = fixture.cli(&["uninstall", "--tool", "vscode"]);
     assert!(
@@ -1051,13 +1121,62 @@ fn setup_is_idempotent_preserves_foreign_entries_and_doctor_checks_binary() {
         document["hooks"]["preToolUse"],
         json!([{"type":"command","command":"other"}])
     );
+    assert!(document["hooks"].get("postToolUse").is_none());
+    let failed_doctor = fixture.cli(&["doctor", "--tool", "vscode"]);
+    assert!(!failed_doctor.status.success());
+    assert!(String::from_utf8_lossy(&failed_doctor.stdout).contains("FAIL command path"));
+    fixture.drop_root();
+}
+
+#[test]
+fn vscode_setup_migrates_legacy_events_and_doctor_explains_them() {
+    let fixture = Fixture::new("setup-legacy");
+    let hooks_file = fixture.copilot_home.join("hooks").join("prov-hook.json");
+    fs::create_dir_all(hooks_file.parent().unwrap()).unwrap();
+    fs::write(
+        &hooks_file,
+        r#"{"version":1,"foreign":true,"hooks":{"preToolUse":[{"type":"command","powershell":"& 'prov-hook.exe' vscode","bash":"'prov-hook.exe' vscode"},{"type":"command","command":"keep me"}],"postToolUse":[{"type":"command","powershell":"& 'prov-hook.exe' vscode","bash":"'prov-hook.exe' vscode"}],"agentStop":[{"type":"command","powershell":"& 'prov-hook.exe' vscode","bash":"'prov-hook.exe' vscode"}]}}"#,
+    )
+    .unwrap();
+
+    let doctor = fixture.cli(&["doctor", "--tool", "vscode"]);
+    assert!(!doctor.status.success());
+    let doctor = String::from_utf8_lossy(&doctor.stdout);
+    assert!(doctor.contains("only camelCase events are installed"));
+    assert!(doctor.contains("PascalCase PreToolUse, PostToolUse, and Stop"));
+
+    let installed = fixture.cli(&["setup", "--tool", "vscode"]);
+    assert!(installed.status.success());
+    let document: Value = serde_json::from_slice(&fs::read(&hooks_file).unwrap()).unwrap();
+    assert!(document["foreign"].as_bool().unwrap());
+    assert_eq!(document["hooks"]["preToolUse"].as_array().unwrap().len(), 1);
     assert!(document["hooks"]["postToolUse"]
         .as_array()
         .unwrap()
         .is_empty());
-    let failed_doctor = fixture.cli(&["doctor", "--tool", "vscode"]);
-    assert!(!failed_doctor.status.success());
-    assert!(String::from_utf8_lossy(&failed_doctor.stdout).contains("FAIL command path"));
+    assert!(document["hooks"]["agentStop"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    for event in ["PreToolUse", "PostToolUse", "Stop"] {
+        let entries = document["hooks"][event].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]["command"].is_string());
+        assert!(entries[0]["powershell"].is_string());
+        assert_eq!(entries[0]["timeoutSec"], 5);
+    }
+
+    let removed = fixture.cli(&["uninstall", "--tool", "vscode"]);
+    assert!(removed.status.success());
+    let document: Value = serde_json::from_slice(&fs::read(&hooks_file).unwrap()).unwrap();
+    assert_eq!(
+        document["hooks"]["preToolUse"],
+        json!([{"type":"command","command":"keep me"}])
+    );
+    assert!(document["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     fixture.drop_root();
 }
 
@@ -1083,4 +1202,171 @@ fn vscode_doctor_reports_missing_and_invalid_hooks_file() {
     assert!(output.contains("FAIL valid JSON"));
     assert!(output.contains("FAIL command path"));
     fixture.drop_root();
+}
+
+#[test]
+fn r32_copilot_runtime_actions_flow_through_summary_and_explain() {
+    let fixture_root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/r32_copilot_runtime");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("prov-vscode-r32-{nonce}"));
+    let repo = root.join("work");
+    let store = root.join("store");
+    let copilot_home = root.join("copilot");
+    fs::create_dir_all(&root).unwrap();
+    let clone = isolated_command("git")
+        .args([
+            "clone",
+            fixture_root.join("work.bundle").to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        clone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    fs::create_dir_all(&store).unwrap();
+    fs::create_dir_all(store.join("repos")).unwrap();
+    copy_dir(&fixture_root.join("repos"), &store.join("repos"));
+    let fixture = Fixture {
+        root: root.clone(),
+        repo: repo.clone(),
+        store: store.clone(),
+        copilot_home,
+    };
+
+    let captured: Vec<Value> = fs::read_to_string(fixture_root.join("probe-out.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(captured.len(), 10);
+    assert_eq!(captured[4]["tool_name"], "Edit");
+    assert_eq!(
+        captured[4]["tool_input"].as_str().unwrap().lines().next(),
+        Some("*** Begin Patch")
+    );
+
+    let probe_a = repo.join("string_tools/probe_a.py");
+    fs::create_dir_all(probe_a.parent().unwrap()).unwrap();
+    let mut pre = captured[4].clone();
+    pre["cwd"] = json!(fs::canonicalize(&repo).unwrap());
+    pre["tool_use_id"] = json!("custom_call_r32_create");
+    assert_hook_response(&fixture.hook(&pre, "vscode"));
+    fs::write(
+        &probe_a,
+        "def add(a, b):\n    \"\"\"Return the sum of two values.\"\"\"\n    return a + b\n",
+    )
+    .unwrap();
+    let mut post = captured[5].clone();
+    post["cwd"] = json!(fs::canonicalize(&repo).unwrap());
+    post["tool_use_id"] = json!("custom_call_r32_create");
+    assert_hook_response(&fixture.hook(&post, "vscode"));
+
+    let verify_action = |message: &str, path: &str, expected: &str| {
+        let commit = fixture.commit(message);
+        let commit_output = fixture.cli(&[
+            "derive",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--commit",
+            &commit,
+        ]);
+        assert!(
+            commit_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&commit_output.stderr)
+        );
+        let summary = fixture.cli(&[
+            "show",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--commit",
+            &commit,
+            "--json",
+        ]);
+        assert!(
+            summary.status.success(),
+            "{}",
+            String::from_utf8_lossy(&summary.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&summary.stdout).unwrap();
+        assert_eq!(summary["commit"], commit);
+        assert!(summary["totals"][expected].as_u64().unwrap_or_default() > 0);
+        let explain = fixture.cli(&[
+            "explain",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--commit",
+            &commit,
+            "--file",
+            path,
+            "--format",
+            "json",
+        ]);
+        assert!(
+            explain.status.success(),
+            "{}",
+            String::from_utf8_lossy(&explain.stderr)
+        );
+        let explain: Value = serde_json::from_slice(&explain.stdout).unwrap();
+        let lines = explain["lines"].as_array().unwrap();
+        assert!(!lines.is_empty(), "{message}: {explain}");
+        assert!(
+            lines.iter().any(|line| line["category"] == expected),
+            "{message}: {explain}"
+        );
+    };
+
+    verify_action("r32 edit create", "string_tools/probe_a.py", "ai_direct");
+
+    let mut pre = captured[6].clone();
+    pre["cwd"] = json!(fs::canonicalize(&repo).unwrap());
+    pre["tool_use_id"] = json!("custom_call_r32_edit_one");
+    assert_hook_response(&fixture.hook(&pre, "vscode"));
+    fs::write(
+        &probe_a,
+        "def add(a, b):\n    \"\"\"Add two values and return the result.\"\"\"\n    return a + b\n\n\ndef sub(a, b):\n    \"\"\"Return the difference of two values.\"\"\"\n    return a - b\n",
+    )
+    .unwrap();
+    let mut post = captured[7].clone();
+    post["cwd"] = json!(fs::canonicalize(&repo).unwrap());
+    post["tool_use_id"] = json!("custom_call_r32_edit_one");
+    assert_hook_response(&fixture.hook(&post, "vscode"));
+    verify_action("r32 edit", "string_tools/probe_a.py", "ai_direct");
+
+    let mut pre = captured[8].clone();
+    pre["cwd"] = json!(fs::canonicalize(&repo).unwrap());
+    pre["tool_use_id"] = json!("call_r32_terminal");
+    assert_hook_response(&fixture.hook(&pre, "vscode"));
+    fs::write(repo.join("string_tools/probe_b.txt"), "hello").unwrap();
+    fs::remove_file(&probe_a).unwrap();
+    let mut post = captured[9].clone();
+    post["cwd"] = json!(fs::canonicalize(&repo).unwrap());
+    post["tool_use_id"] = json!("call_r32_terminal");
+    assert_hook_response(&fixture.hook(&post, "vscode"));
+    verify_action(
+        "r32 terminal create and delete",
+        "string_tools/probe_b.txt",
+        "ai_strong",
+    );
+    fixture.drop_root();
+}
+
+fn copy_dir(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap().flatten() {
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to);
+        } else {
+            fs::copy(from, to).unwrap();
+        }
+    }
 }

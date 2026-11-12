@@ -1,0 +1,50 @@
+import secrets
+import string
+
+
+def make_password(length=16):
+    """Create a password using letters, digits, and punctuation."""
+    if length < 4:
+        raise ValueError("Choose a length of at least four.")
+    alphabet = string.ascii_letters + string.digits + string.punctuation
+    while True:
+        password = "".join(secrets.choice(alphabet) for _ in range(length))
+        if (any(char.islower() for char in password)
+                and any(char.isupper() for char in password)
+                and any(char.isdigit() for char in password)
+                and any(char in string.punctuation for char in password)):
+            return password
+
+
+def main():
+    print("Random Password Generator")
+    try:
+        length = int(input("Password length (at least 4): "))
+        password = make_password(length)
+    except ValueError as error:
+        print(f"Invalid length: {error}")
+        return
+    print("Your password is:")
+    print(password)
+    print("Store it in a trusted password manager.")
+
+
+if __name__ == "__main__":
+    main()
+
+# This example uses the secrets module for randomness.
+# It guarantees lowercase, uppercase, digit, and punctuation.
+# Longer passwords are generally harder to guess.
+# Avoid reusing a password across different accounts.
+# Do not share generated passwords in public messages.
+# The password is shown once in the terminal.
+# Nothing is saved to a file by this script.
+# You can import make_password from another program.
+# Run it with: python password_generator.py
+# The default generated length is sixteen characters.
+# Changing the length does not change the character groups.
+# Each call to make_password returns a fresh result.
+# Invalid lengths are handled with a readable message.
+# Use a password manager to keep credentials organized.
+# This program needs no third-party packages.
+# Keep your computer and terminal session private.

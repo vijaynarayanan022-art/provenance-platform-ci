@@ -1,0 +1,8 @@
+def add(a, b):
+    """Add two values and return the result."""
+    return a + b
+
+
+def sub(a, b):
+    """Return the difference of two values."""
+    return a - b
