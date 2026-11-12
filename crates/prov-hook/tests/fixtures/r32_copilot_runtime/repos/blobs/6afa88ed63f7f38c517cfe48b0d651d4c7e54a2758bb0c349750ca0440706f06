@@ -1,0 +1,4 @@
+def count_vowels(text: str) -> int:
+    """Return the number of English vowels in text, ignoring case."""
+    vowels = "aeiou"
+    return sum(char in vowels for char in text.lower())

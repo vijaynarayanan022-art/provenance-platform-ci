@@ -355,10 +355,35 @@ pub fn process_vscode_json(input: &[u8]) {
     if !matches!(event_name.as_str(), "PreToolUse" | "PostToolUse" | "Stop") {
         return;
     }
-    let tool_name = payload
+    let raw_tool_name = payload
         .get("tool_name")
         .and_then(|v| v.as_str())
         .map(str::to_owned);
+    let mut tool_name = raw_tool_name.clone();
+    if let Some(name) = raw_tool_name.as_deref() {
+        if name.eq_ignore_ascii_case("edit") {
+            tool_name = Some("apply_patch".into());
+            if let Some(patch) = payload.get("tool_input").and_then(|input| input.as_str()) {
+                payload["tool_input"] = serde_json::json!({"input": patch});
+            } else if let Some(input) = payload.get_mut("tool_input") {
+                *input = serde_json::Value::Null;
+            }
+        } else if name.eq_ignore_ascii_case("bash") {
+            tool_name = Some("run_in_terminal".into());
+        } else if let Some(canonical) = [
+            "create_file",
+            "apply_patch",
+            "insert_edit_into_file",
+            "replace_string_in_file",
+            "multi_replace_string_in_file",
+            "run_in_terminal",
+        ]
+        .into_iter()
+        .find(|known| name.eq_ignore_ascii_case(known))
+        {
+            tool_name = Some(canonical.into());
+        }
+    }
     let mut target_paths = None;
     let require_window = match (event_name.as_str(), tool_name.as_deref()) {
         ("Stop", _) => false,
@@ -461,17 +486,18 @@ fn vscode_file_paths(input: Option<&serde_json::Value>) -> Vec<String> {
 }
 
 fn is_read_only_vscode_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "file_search"
-            | "get_errors"
-            | "grep_search"
-            | "list_dir"
-            | "read_file"
-            | "memory"
-            | "vscode_askQuestions"
-            | "semantic_search"
-    )
+    [
+        "file_search",
+        "get_errors",
+        "grep_search",
+        "list_dir",
+        "read_file",
+        "memory",
+        "vscode_askQuestions",
+        "semantic_search",
+    ]
+    .iter()
+    .any(|known| name.eq_ignore_ascii_case(known))
 }
 
 fn parse_apply_patch_paths(patch: &str) -> Vec<String> {

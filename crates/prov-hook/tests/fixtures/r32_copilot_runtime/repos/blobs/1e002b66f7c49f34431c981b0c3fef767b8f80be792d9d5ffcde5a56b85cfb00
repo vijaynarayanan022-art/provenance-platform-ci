@@ -1,0 +1,51 @@
+def show_tasks(tasks):
+    """Print every task with a simple checkbox."""
+    if not tasks:
+        print("Your task list is empty.")
+        return
+    for number, task in enumerate(tasks, start=1):
+        mark = "x" if task["done"] else " "
+        print(f"{number}. [{mark}] {task['title']}")
+
+
+def main():
+    tasks = []
+    print("Simple To-Do List")
+    while True:
+        print("\n[a]dd  [d]one  [l]ist  [q]uit")
+        command = input("Command: ").strip().lower()
+        if command == "a":
+            title = input("Task: ").strip()
+            if title:
+                tasks.append({"title": title, "done": False})
+                print("Task added.")
+            else:
+                print("A task needs a title.")
+        elif command == "d":
+            show_tasks(tasks)
+            try:
+                number = int(input("Task number to complete: "))
+                tasks[number - 1]["done"] = True
+            except (ValueError, IndexError):
+                print("That task number is not on the list.")
+        elif command == "l":
+            show_tasks(tasks)
+        elif command == "q":
+            break
+        else:
+            print("Choose a, d, l, or q.")
+    print(f"You finished {sum(task['done'] for task in tasks)} task(s).")
+    print("Good luck with the rest of your day!")
+
+
+if __name__ == "__main__":
+    main()
+
+# Tasks stay in memory only while this program is running.
+# Add another task by choosing the a command.
+# Mark a task done by entering its displayed number.
+# The list numbering starts at one for convenience.
+# Empty task titles are ignored.
+# Invalid numbers show a short error instead of crashing.
+# Run it with: python todo_list.py
+# Choose q when you are ready to leave.

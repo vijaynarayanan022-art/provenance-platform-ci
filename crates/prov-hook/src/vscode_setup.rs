@@ -2,7 +2,8 @@ use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const EVENTS: [&str; 3] = ["preToolUse", "postToolUse", "agentStop"];
+const EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "Stop"];
+const LEGACY_EVENTS: [&str; 3] = ["preToolUse", "postToolUse", "agentStop"];
 
 pub fn install(
     home: Option<&Path>,
@@ -22,6 +23,11 @@ pub fn install(
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
         .ok_or("hooks must be a JSON object")?;
+    for event in LEGACY_EVENTS {
+        if let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) {
+            entries.retain(|entry| !is_ours(entry));
+        }
+    }
     for event in EVENTS {
         let entries = hooks
             .entry(event)
@@ -62,7 +68,7 @@ pub fn uninstall(home: Option<&Path>, dry_run: bool) -> Result<String, String> {
         return Ok(format!("No prov-hook hooks in {}\n", hooks_file.display()));
     };
     let mut changed = false;
-    for event in EVENTS {
+    for event in EVENTS.into_iter().chain(LEGACY_EVENTS) {
         if let Some(entries) = hooks.get_mut(event).and_then(Value::as_array_mut) {
             let before = entries.len();
             entries.retain(|entry| !is_ours(entry));
@@ -116,10 +122,31 @@ pub fn doctor(home: Option<&Path>) -> Result<DoctorReport, String> {
                                 && same_file(bash, &current_binary)
                         })
                 })
+        }) && !LEGACY_EVENTS.iter().any(|event| {
+            hooks
+                .get(*event)
+                .and_then(Value::as_array)
+                .is_some_and(|entries| entries.iter().any(is_ours))
         })
     });
     let json_ok = parsed.is_some();
     let mut failed = false;
+    let legacy_only = parsed.as_ref().is_some_and(|document| {
+        let Some(hooks) = document.get("hooks").and_then(Value::as_object) else {
+            return false;
+        };
+        LEGACY_EVENTS.iter().any(|event| {
+            hooks
+                .get(*event)
+                .and_then(Value::as_array)
+                .is_some_and(|entries| entries.iter().any(is_ours))
+        }) && !EVENTS.iter().any(|event| {
+            hooks
+                .get(*event)
+                .and_then(Value::as_array)
+                .is_some_and(|entries| entries.iter().any(is_ours))
+        })
+    });
     let lines = [
         check(
             &mut failed,
@@ -139,6 +166,16 @@ pub fn doctor(home: Option<&Path>) -> Result<DoctorReport, String> {
             "command path",
             "configured command exists and points to this executable",
         ),
+        check(
+            &mut failed,
+            !legacy_only,
+            "hook event format",
+            if legacy_only {
+                "only camelCase events are installed; VS Code Copilot CLI selects its VS Code payload format with PascalCase PreToolUse, PostToolUse, and Stop events"
+            } else {
+                "PascalCase VS Code event names are configured"
+            },
+        ),
     ]
     .into_iter()
     .collect();
@@ -156,8 +193,8 @@ fn command_entry(binary: &Path) -> Value {
     let bash_path = path.replace('\'', "'\\''");
     json!({
         "type": "command",
+        "command": format!("'{bash_path}' vscode"),
         "powershell": format!("& '{powershell_path}' vscode"),
-        "bash": format!("'{bash_path}' vscode"),
         "timeoutSec": 5,
     })
 }
@@ -165,15 +202,23 @@ fn command_entry(binary: &Path) -> Value {
 fn is_ours(entry: &Value) -> bool {
     entry.get("type").and_then(Value::as_str) == Some("command")
         && command_paths(entry)
-            .is_some_and(|(powershell, bash)| is_prov_hook(powershell) && is_prov_hook(bash))
+            .is_some_and(|(powershell, command)| is_prov_hook(powershell) && is_prov_hook(command))
 }
 
 fn command_paths(entry: &Value) -> Option<(&Path, &Path)> {
     let powershell = entry.get("powershell")?.as_str()?;
-    let bash = entry.get("bash")?.as_str()?;
+    let command = entry
+        .get("command")
+        .or_else(|| entry.get("bash"))?
+        .as_str()?;
     let powershell = powershell.strip_prefix("& '")?.strip_suffix("' vscode")?;
-    let bash = bash.strip_prefix('\'')?.strip_suffix("' vscode")?;
-    Some((Path::new(powershell), Path::new(bash)))
+    let command = command
+        .strip_prefix('\'')
+        .or_else(|| command.strip_prefix("prov-hook.exe "))?;
+    let command = command
+        .strip_suffix("' vscode")
+        .or_else(|| command.strip_suffix(" vscode"))?;
+    Some((Path::new(powershell), Path::new(command)))
 }
 
 fn is_prov_hook(path: &Path) -> bool {
@@ -193,7 +238,8 @@ fn only_empty_prov_document(document: &Value) -> bool {
         return true;
     };
     hooks.iter().all(|(event, entries)| {
-        EVENTS.contains(&event.as_str()) && entries.as_array().is_some_and(Vec::is_empty)
+        (EVENTS.contains(&event.as_str()) || LEGACY_EVENTS.contains(&event.as_str()))
+            && entries.as_array().is_some_and(Vec::is_empty)
     })
 }
 

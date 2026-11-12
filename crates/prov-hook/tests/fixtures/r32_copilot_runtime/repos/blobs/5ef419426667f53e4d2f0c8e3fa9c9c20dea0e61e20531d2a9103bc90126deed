@@ -1,0 +1,50 @@
+import random
+
+
+def roll_die(sides=6):
+    """Return one random result for a die with the given sides."""
+    if sides < 2:
+        raise ValueError("A die needs at least two sides.")
+    return random.randint(1, sides)
+
+
+def main():
+    print("Dice Roller")
+    while True:
+        try:
+            count = int(input("How many dice? "))
+            sides = int(input("How many sides per die? "))
+        except ValueError:
+            print("Please enter whole numbers.")
+            continue
+        if count < 1:
+            print("Roll at least one die.")
+            continue
+        if sides < 2:
+            print("A die must have at least two sides.")
+            continue
+        break
+    results = [roll_die(sides) for _ in range(count)]
+    print("Results:", ", ".join(map(str, results)))
+    print("Total:", sum(results))
+    print("Lowest:", min(results))
+    print("Highest:", max(results))
+    print("Average:", f"{sum(results) / count:.2f}")
+
+
+if __name__ == "__main__":
+    main()
+
+# A regular cube has six sides.
+# Try entering 2 dice with 20 sides each.
+# The roller uses Python's random number generator.
+# Every die result starts at one.
+# The largest possible result equals the side count.
+# Rolling several dice displays each result separately.
+# The total is useful for tabletop games.
+# The average gives a quick summary of the roll.
+# This program validates both requested numbers.
+# Invalid input returns to the questions.
+# For a ten-sided die, use roll_die(10).
+# Dice are independent random rolls.
+# Run with: python dice_roller.py
