@@ -1579,41 +1579,16 @@ pub fn explain_commit(
         derive::derive_lines_with_attribution(&evidence_input, &normalized_committed)
     };
     let ranges = attribution_ranges(&path, &attributed_lines, &evidence_input.steps);
-    let stored_ranges = fs::read(store.join("commits").join(format!("{commit}.lines.json")))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|value| {
-            value
-                .get("attributions")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-        })
-        .unwrap_or_default();
     let report_lines = attributed_lines
         .iter()
         .filter(|attributed| attributed.line.added && !attributed.line.blank)
         .filter(|attributed| line_filter.is_none_or(|wanted| wanted == attributed.line.line))
         .map(|attributed| {
-            let stored_range = stored_ranges.iter().find(|range| {
-                range["path"] == path
-                    && range["startLine"]
-                        .as_u64()
-                        .is_some_and(|start| start as usize <= attributed.line.line)
-                    && range["endLine"]
-                        .as_u64()
-                        .is_some_and(|end| attributed.line.line <= end as usize)
-            });
             let range = ranges.iter().find(|range| {
                 range.start_line <= attributed.line.line && attributed.line.line <= range.end_line
             });
-            let category = stored_range
-                .and_then(|range| range["category"].as_str())
-                .map(str::to_owned)
-                .or_else(|| range.map(|range| range.category.clone()))
-                .unwrap_or_else(|| category_name(attributed.line.label).to_owned());
-            let score = stored_range
-                .and_then(|range| range["score"].as_f64())
-                .or_else(|| range.and_then(|range| range.score));
+            let category = category_name(attributed.line.label).to_owned();
+            let score = range.and_then(|range| range.score);
             let source_trace = attributed
                 .source_step
                 .and_then(|index| event_traces.get(index));
@@ -1636,6 +1611,27 @@ pub fn explain_commit(
                 attributed.line.label != derive::Label::Unknown && attributed.source_step.is_some(),
                 format!(
                     "source_step={:?}; final_category={category}",
+                    attributed.source_step
+                ),
+            ));
+            let unknown_step = if attributed.line.label != derive::Label::Unknown {
+                "final label retained AI ownership".to_owned()
+            } else if !attributed.line.added {
+                "committed_alignment: line is not added relative to the parent".to_owned()
+            } else if attributed.ambiguous {
+                "duplicate_ambiguity: competing line owners prevent attribution".to_owned()
+            } else if let Some(index) = attributed.source_step {
+                format!(
+                    "committed_alignment after source_step={index}: AI ownership did not survive"
+                )
+            } else {
+                "committed_alignment: no source step owns the added line".to_owned()
+            };
+            checks.push(explain_check(
+                "final_attribution",
+                attributed.line.label != derive::Label::Unknown,
+                format!(
+                    "final_category={category}; source_step={:?}; decision={unknown_step}",
                     attributed.source_step
                 ),
             ));
@@ -1668,10 +1664,14 @@ pub fn explain_commit(
                 true,
                 "file passed path and content exclusion checks".into(),
             ));
-            let first_failed_condition = checks
-                .iter()
-                .find(|check| !check.passed)
-                .map(|check| check.condition.clone());
+            let first_failed_condition = if attributed.line.label == derive::Label::Unknown {
+                Some("final_attribution".into())
+            } else {
+                checks
+                    .iter()
+                    .find(|check| !check.passed)
+                    .map(|check| check.condition.clone())
+            };
             ExplainLine {
                 line: attributed.line.line,
                 category,

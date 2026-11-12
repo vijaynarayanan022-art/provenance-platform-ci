@@ -477,7 +477,7 @@ fn carry_matching_lines(
                 .min_by_key(|(source, _, _)| source.sha.as_str());
             let current = Label::parse(&target_line.label).unwrap_or(Label::Unknown);
             let next = if method == "patch_id" {
-                Some(weakest)
+                (current <= weakest).then_some(weakest)
             } else if weakest != Label::Unknown && current < weakest {
                 Some(weakest.min(Label::Probable))
             } else {

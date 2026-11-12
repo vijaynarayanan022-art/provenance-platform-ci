@@ -220,3 +220,9 @@ Capture line ranges now use the same Myers line alignment as attribution. For le
 The existing table assertion in `prov-hook/tests/commands_cli.rs::summary_marks_missing_reports_and_zero_eligible_percentages` was also changed from `none` to `unknown`, keeping the `n/a` percentage expectation.
 
 The exact PR-report key assertion in `prov-hook/tests/pr_report_cli.rs::two_commit_report_sums_stored_reports_and_out_matches_stdout` now includes the additive `file_ranges` field.
+
+## Round 30: reset-away identical patch and explain parity
+
+Patch-ID rewrite carry-over is now monotonic: it may promote a weaker target label from a matching source, but it cannot replace a stronger target label with a weaker one. This closes a case where a fresh, exact shell AI event was first derived as `ai_strong`, then overwritten by `unknown` labels from an identical patch that had been reset out of the target commit's ancestry. Existing candidate ancestry, overlap, and duplicate ambiguity rules for discarded or copied text remain in force.
+
+`explain` now reports category and score from its current line attribution decision, rather than mixing a stored post-rewrite category with a recomputed score. Unknown lines add a `final_attribution` check that identifies the committed-alignment step and source step that failed to retain AI ownership. The r30 fixture carries the real bundle and store with `* -text`; tests cover summary and explain output, reset without repeated content, and repeated content without reset. This intentionally narrows the prior patch-ID carry behavior that could downgrade labels, resolving an unspecified conflict between exact patch reuse and stronger current evidence.

@@ -1,0 +1,56 @@
+QUESTIONS = [
+    ("What is the capital of Japan?", "tokyo"),
+    ("How many sides has a hexagon?", "6"),
+    ("Which planet is known as the Red Planet?", "mars"),
+    ("What is 9 multiplied by 7?", "63"),
+    ("What language is this quiz written in?", "python"),
+]
+
+
+def ask_question(prompt, answer):
+    """Ask one question and return whether it was answered correctly."""
+    response = input(prompt + " ").strip().lower()
+    if response == answer:
+        print("Correct!")
+        return True
+    print(f"Not quite. The answer is {answer}.")
+    return False
+
+
+def main():
+    print("Quick Quiz")
+    score = 0
+    for number, (prompt, answer) in enumerate(QUESTIONS, start=1):
+        print(f"\nQuestion {number} of {len(QUESTIONS)}")
+        if ask_question(prompt, answer):
+            score += 1
+    total = len(QUESTIONS)
+    percent = score / total * 100
+    print(f"\nYour score: {score}/{total} ({percent:.0f}%)")
+    if score == total:
+        print("Perfect score. Excellent work!")
+    elif score >= total // 2:
+        print("Nice job. Keep learning!")
+    else:
+        print("Good try. Have another go soon!")
+
+
+if __name__ == "__main__":
+    main()
+
+# Answers are matched without regard to letter case.
+# Leading and trailing spaces are ignored.
+# Edit QUESTIONS to write a quiz of your own.
+# Each question is stored with its expected answer.
+# The score is calculated after all questions are asked.
+# This program works in a standard terminal.
+# No external packages are required.
+# Run it with: python quiz_game.py
+# You can add more pairs to the QUESTIONS list.
+# Keep each answer as a string.
+# Numerical answers should also be written as strings.
+# The question number starts at one for players.
+# A percentage makes different quiz lengths easy to compare.
+# Try changing one answer to see the incorrect response.
+# The quiz always asks every question in the list.
+# Have fun making a topic-specific version!

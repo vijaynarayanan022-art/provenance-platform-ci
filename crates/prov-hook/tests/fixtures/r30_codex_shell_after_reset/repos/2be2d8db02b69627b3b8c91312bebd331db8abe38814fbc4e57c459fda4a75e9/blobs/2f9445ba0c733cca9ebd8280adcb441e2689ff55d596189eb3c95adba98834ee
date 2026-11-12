@@ -1,0 +1,50 @@
+def read_amount(prompt):
+    """Read a non-negative decimal amount."""
+    while True:
+        try:
+            amount = float(input(prompt))
+        except ValueError:
+            print("Enter a valid number, such as 24.50.")
+            continue
+        if amount >= 0:
+            return amount
+        print("The amount cannot be negative.")
+
+
+def main():
+    print("Tip Calculator")
+    bill = read_amount("Bill total: $")
+    rate = read_amount("Tip percentage: ")
+    people = int(read_amount("Number of people: "))
+    if people < 1:
+        print("There must be at least one person.")
+        return
+    tip = bill * rate / 100
+    total = bill + tip
+    share = total / people
+    print()
+    print(f"Bill:       ${bill:,.2f}")
+    print(f"Tip ({rate:g}%):  ${tip:,.2f}")
+    print(f"Total:      ${total:,.2f}")
+    print(f"Each pays:  ${share:,.2f}")
+    print("Thanks for using the calculator!")
+
+
+if __name__ == "__main__":
+    main()
+
+# Example calculation:
+# A $40 bill with a 15% tip totals $46.
+# Split between two people, that is $23 each.
+# Enter percentages as numbers, not fractions.
+# The dollar sign is included in displayed results.
+# Values are rounded to the nearest cent.
+# Negative bill and tip values are rejected.
+# This small program uses only the Python standard library.
+# Run it with: python tip_calculator.py
+# Press Ctrl+C to exit while entering a value.
+# The calculator starts again when you rerun the file.
+# Rates are entered as ordinary percentages.
+# For example, enter 20 for a twenty percent tip.
+# The split includes both the bill and the tip.
+# Results use comma separators for large amounts.

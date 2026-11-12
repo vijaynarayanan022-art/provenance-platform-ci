@@ -1,0 +1,55 @@
+import re
+
+
+def analyze_text(text):
+    """Return basic word, sentence, and character statistics."""
+    words = re.findall(r"\b[\w'-]+\b", text)
+    sentences = re.findall(r"[.!?]+", text)
+    non_space = sum(not char.isspace() for char in text)
+    counts = {}
+    for word in words:
+        key = word.lower()
+        counts[key] = counts.get(key, 0) + 1
+    return words, sentences, non_space, counts
+
+
+def main():
+    print("Word Counter")
+    print("Enter a paragraph, then submit an empty line to finish.")
+    lines = []
+    while True:
+        line = input()
+        if not line:
+            break
+        lines.append(line)
+    text = " ".join(lines)
+    words, sentences, characters, counts = analyze_text(text)
+    print(f"Words: {len(words)}")
+    print(f"Sentences: {len(sentences)}")
+    print(f"Characters (excluding spaces): {characters}")
+    print("Most common words:")
+    for word, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:5]:
+        print(f"  {word}: {count}")
+    if not words:
+        print("No words were entered.")
+
+
+if __name__ == "__main__":
+    main()
+
+# Words are compared without regard to capitalization.
+# Apostrophes and hyphens can appear inside a word.
+# Punctuation marks help estimate the sentence count.
+# The character count excludes spaces and line breaks.
+# The five most frequent words are displayed first.
+# Ties are sorted alphabetically for stable output.
+# Paste multiple lines into the terminal if needed.
+# Submit an empty line when your text is complete.
+# No text is saved after the program exits.
+# This script uses only the Python standard library.
+# Run with: python word_counter.py
+# Edit the regular expression to adjust what counts as a word.
+# Empty input is valid and produces zero counts.
+# Try the program with a sentence you wrote yourself.
+# The analysis function can be reused by other scripts.
+# Keep source text private if it contains sensitive information.
