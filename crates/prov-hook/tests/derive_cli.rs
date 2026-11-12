@@ -1899,6 +1899,21 @@ fn explain_reports_direct_shell_mixed_unknown_and_excluded_decisions_read_only()
     assert!(derive(&unknown, &unknown_commit).status.success());
     let unknown_result = explain_json(&unknown, &unknown_commit, "unknown.txt", None);
     assert_eq!(unknown_result["lines"][0]["category"], "unknown");
+    assert_eq!(
+        unknown_result["lines"][0]["firstFailedCondition"],
+        "final_attribution"
+    );
+    assert!(unknown_result["lines"][0]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| {
+            check["condition"] == "final_attribution"
+                && check["compared"]
+                    .as_str()
+                    .unwrap()
+                    .contains("committed_alignment")
+        }));
     unknown.drop_root();
 
     let excluded = Fixture::new("explain-excluded");
@@ -3047,6 +3062,171 @@ fn r28_duplicate_lines_fixture_attributes_verified_structured_positions_directly
                 ));
         }
     }
+    fixture.drop_root();
+}
+
+#[test]
+fn r30_codex_shell_after_reset_keeps_current_ai_evidence_over_discarded_patch_match() {
+    let _guard = FixtureTestGuard::new();
+    let fixture_root =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/r30_codex_shell_after_reset");
+    let root = std::env::temp_dir().join(format!("prov-r30-{}-{}", std::process::id(), now()));
+    let repo = root.join("repository");
+    let home = root.join("store");
+    fs::create_dir_all(&root).unwrap();
+    let clone = isolated_command("git")
+        .arg("clone")
+        .arg(fixture_root.join("work.bundle"))
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        clone.status.success(),
+        "{}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+
+    fn copy_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap().flatten() {
+            let from = entry.path();
+            let to = target.join(entry.file_name());
+            if from.is_dir() {
+                copy_tree(&from, &to);
+            } else {
+                fs::copy(from, to).unwrap();
+            }
+        }
+    }
+    copy_tree(&fixture_root.join("repos"), &home.join("repos"));
+    let commit = fs::read_to_string(fixture_root.join("commits.txt"))
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            line.split_once(' ')
+                .filter(|(_, message)| *message == "smoke test codex")
+                .map(|(sha, _)| sha.to_owned())
+        })
+        .expect("fixture lists the reset-following shell commit");
+    let fixture = Fixture {
+        root,
+        repo,
+        home,
+        _test_guard: FixtureTestGuard::new(),
+    };
+    let repo_id = fs::read_dir(fixture.home.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let repo_store = fixture.home.join("repos").join(repo_id);
+
+    for suffix in ["json", "lines.json"] {
+        let path = repo_store
+            .join("commits")
+            .join(format!("{commit}.{suffix}"));
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+    let result = derive(&fixture, &commit);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let summary = fixture.cli(&[
+        "summary",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+        "--file",
+        "smoke_test.txt",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        summary.status.success(),
+        "{}",
+        String::from_utf8_lossy(&summary.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    assert_eq!(summary["totals"]["ai_strong"], 3);
+    assert_eq!(summary["totals"]["unknown"], 0);
+    assert_eq!(summary["totals"]["coverage"], "high");
+
+    let explanation = explain_json(&fixture, &commit, "smoke_test.txt", None);
+    for line in explanation["lines"].as_array().unwrap() {
+        assert_eq!(line["category"], "ai_strong");
+        assert_eq!(line["score"], 0.92);
+        assert_eq!(line["firstFailedCondition"], "structured_edit");
+    }
+    fixture.drop_root();
+}
+
+#[test]
+fn reset_without_identical_committed_text_keeps_new_shell_lines_strong() {
+    let fixture = Fixture::new("reset-distinct-content");
+    let parent = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    fs::write(
+        fixture.repo.join("smoke_test.txt"),
+        b"discarded one\ndiscarded two\n",
+    )
+    .unwrap();
+    let discarded = fixture.commit("discarded distinct text");
+    assert!(derive(&fixture, &discarded).status.success());
+
+    git(&fixture.repo, &["reset", "--hard", &parent]);
+    fixture.hook("PreToolUse", "reset-fresh-shell");
+    fs::write(
+        fixture.repo.join("smoke_test.txt"),
+        b"fresh one\nfresh two\n",
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "reset-fresh-shell");
+    let target = fixture.commit("fresh shell text after reset");
+    assert!(derive(&fixture, &target).status.success());
+    let sidecar = fixture.sidecar_value(&target);
+    assert!(sidecar["files"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|line| line["label"] == "s"));
+    fixture.drop_root();
+}
+
+#[test]
+fn identical_committed_text_without_reset_keeps_current_shell_lines_strong() {
+    let fixture = Fixture::new("identical-text-no-reset");
+    let parent = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    git(&fixture.repo, &["switch", "-c", "discarded-content-source"]);
+    fs::write(
+        fixture.repo.join("smoke_test.txt"),
+        b"identical one\nidentical two\n",
+    )
+    .unwrap();
+    let discarded = fixture.commit("unobserved identical content");
+    assert!(derive(&fixture, &discarded).status.success());
+
+    git(&fixture.repo, &["switch", "--detach", &parent]);
+    fixture.hook("PreToolUse", "identical-shell-current");
+    fs::write(
+        fixture.repo.join("smoke_test.txt"),
+        b"identical one\nidentical two\n",
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "identical-shell-current");
+    let target = fixture.commit("same text with current shell evidence");
+    assert!(derive(&fixture, &target).status.success());
+    let sidecar = fixture.sidecar_value(&target);
+    assert!(sidecar["files"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|line| line["label"] == "s"));
     fixture.drop_root();
 }
 
