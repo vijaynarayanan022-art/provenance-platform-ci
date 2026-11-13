@@ -236,3 +236,7 @@ The dispatcher compares known tool names case-insensitively. Evidence-backed `Ed
 The `r32_copilot_runtime` test fixture includes sanitized raw probe records, the captured store, and its work bundle, with `* -text`. Integration coverage replays the observed file create, structured update, terminal create, and delete through summary and explain. Deleted files have no surviving added lines, and `explain` currently rejects deleted-only paths even though the commit summary records the deletion. The integration test therefore explains the terminal-created file and verifies the combined create/delete commit summary; direct explain output for a deletion is a current command limitation, not a new attribution claim.
 
 The `vscode_cli` test helper serializes hook subprocess calls to keep default-parallel test runs from starving the production two-second hook budget; the Cargo test runner remains in its default parallel mode. This avoids spurious `time_cap` markers in otherwise unrelated adapter tests.
+
+## Round 33
+
+Malformed or unrecognized Codex and VS Code hook payloads remain fail-open with their existing host-visible output. The capture store records one `unrecognized_payload` marker per session, event-name spelling, and sorted top-level key set; marker contents exclude payload values and paths. Both Codex and VS Code doctor commands warn about markers from the last seven days without changing their exit status. The 1.4-second watchdog is unchanged.

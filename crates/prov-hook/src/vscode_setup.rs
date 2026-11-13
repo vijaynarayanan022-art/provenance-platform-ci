@@ -147,7 +147,7 @@ pub fn doctor(home: Option<&Path>) -> Result<DoctorReport, String> {
                 .is_some_and(|entries| entries.iter().any(is_ours))
         })
     });
-    let lines = [
+    let mut lines: Vec<String> = [
         check(
             &mut failed,
             exists,
@@ -179,6 +179,7 @@ pub fn doctor(home: Option<&Path>) -> Result<DoctorReport, String> {
     ]
     .into_iter()
     .collect();
+    lines.extend(prov_capture::recent_unrecognized_payload_warnings_from_env());
     Ok(DoctorReport { lines, failed })
 }
 
