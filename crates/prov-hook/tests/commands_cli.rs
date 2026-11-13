@@ -419,7 +419,10 @@ fn summary_range_matches_pr_report_and_expands_full_category_names() {
     assert_eq!(summary["schema"], "prov.summary/0.1");
     assert!(summary["created_at"].as_str().is_some());
     assert!(summary["versions"].is_object());
-    assert_eq!(summary["versions"]["line_survival"], "unobserved-mixed-v1");
+    assert_eq!(
+        summary["versions"]["line_survival"],
+        "unobserved-mixed-cross-commit-v2"
+    );
     assert_eq!(summary["versions"]["min_mixed_overlap"], 0.5);
     assert_eq!(summary["commits"].as_array().unwrap().len(), 3);
     assert!(summary["commits"]

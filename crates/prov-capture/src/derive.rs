@@ -120,6 +120,7 @@ pub enum UnobservedEditKind {
     ExactSurvivorInChangedFile,
     MixedByTokenOverlap,
     MixedBySimilarity,
+    MixedByPriorAiEdit,
     UnmatchedUnknown,
 }
 
@@ -537,7 +538,7 @@ fn sufficiently_informative(line: &[u8]) -> bool {
     String::from_utf8_lossy(line).trim().chars().count() >= 8
 }
 
-fn token_overlap(left: &[u8], right: &[u8]) -> f64 {
+pub(crate) fn token_overlap(left: &[u8], right: &[u8]) -> f64 {
     let left_tokens = lexical_tokens(left);
     let right_tokens = lexical_tokens(right);
     if left_tokens.is_empty() || right_tokens.is_empty() {

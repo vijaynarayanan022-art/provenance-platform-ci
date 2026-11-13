@@ -3936,3 +3936,320 @@ fn rewrite_scan_with_two_hundred_twenty_derived_commits_stays_bounded() {
     assert_eq!(line_label(&sidecar, "tracked.txt", &line_hash(phrase)), "s");
     fixture.drop_root();
 }
+
+fn prior_ai_origin(fixture: &Fixture, structured: bool) -> String {
+    let original = "alpha beta gamma delta";
+    fixture.hook("PreToolUse", "prior-ai-origin");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        format!("{original}\ntwo\n"),
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "prior-ai-origin");
+    configure_structured_apply_patch(
+        fixture,
+        "tracked.txt",
+        Some(structured),
+        false,
+        json!([[1, 1]]),
+    );
+    let origin = fixture.commit("AI writes origin line");
+    assert!(derive(fixture, &origin).status.success());
+    origin
+}
+
+#[test]
+fn prior_ai_line_human_edits_carry_mixed_for_direct_and_strong_origins() {
+    for (name, structured, expected_category) in [
+        ("prior-ai-direct", true, "ai_direct"),
+        ("prior-ai-strong", false, "ai_strong"),
+    ] {
+        let fixture = Fixture::new(name);
+        let origin = prior_ai_origin(&fixture, structured);
+        assert_eq!(
+            file(&fixture.derived_value(&origin), "tracked.txt")[expected_category],
+            1
+        );
+        // The un-derived bridge makes the target depend on the line's actual blame origin.
+        git(
+            &fixture.repo,
+            &["commit", "--allow-empty", "-m", "un-derived bridge"],
+        );
+
+        fs::write(
+            fixture.repo.join("tracked.txt"),
+            b"alpha beta gamma epsilon\ntwo\n",
+        )
+        .unwrap();
+        let edit = fixture.commit("human changes one word");
+        assert!(derive(&fixture, &edit).status.success());
+        let report = fixture.derived_value(&edit);
+        let sidecar = fixture.sidecar_value(&edit);
+        assert_eq!(file(&report, "tracked.txt")["mixed"], 1);
+        assert_eq!(file(&report, "tracked.txt")["unknown"], 0);
+        let mixed = attribution_for(&sidecar, "tracked.txt", "mixed");
+        assert_eq!(
+            mixed["primaryBasis"], "HUMAN_EDIT_OF_PRIOR_AI_LINE",
+            "{sidecar}"
+        );
+        assert_eq!(mixed["score"], 0.84);
+        assert_eq!(mixed["priorAiOrigin"]["originCommit"], origin);
+        assert_eq!(mixed["priorAiOrigin"]["originLine"], 1);
+        assert_eq!(mixed["priorAiOrigin"]["originCategory"], expected_category);
+        assert!(mixed["priorAiOrigin"]["overlap"].as_f64().unwrap() >= 0.5);
+
+        let explain = explain_json(&fixture, &edit, "tracked.txt", Some(1));
+        let line = &explain["lines"][0];
+        assert_eq!(line["category"], "mixed");
+        let checks = line["checks"].as_array().unwrap();
+        let prior_gate = checks
+            .iter()
+            .find(|check| check["condition"] == "prior_ai_line_edit")
+            .unwrap();
+        let prior_detail = prior_gate["compared"].as_str().unwrap();
+        assert!(prior_detail.contains(&origin));
+        assert!(prior_detail.contains(expected_category));
+        assert!(prior_detail.contains("overlap="));
+        let final_gate = checks
+            .iter()
+            .find(|check| check["condition"] == "final_attribution")
+            .unwrap();
+        assert!(final_gate["compared"]
+            .as_str()
+            .unwrap()
+            .contains("decision=carry_human_edit_of_prior_ai"));
+
+        let summary = fixture.cli(&[
+            "summary",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+            "--commit",
+            &edit,
+            "--file",
+            "tracked.txt",
+            "--format",
+            "json",
+        ]);
+        assert!(summary.status.success());
+        let summary: Value = serde_json::from_slice(&summary.stdout).unwrap();
+        let summary_range = summary["file_ranges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|range| range["commit"] == edit && range["category"] == "mixed")
+            .unwrap_or_else(|| panic!("summary has no carried range: {summary}"));
+        assert_eq!(summary_range["primaryBasis"], "HUMAN_EDIT_OF_PRIOR_AI_LINE");
+        assert_eq!(summary_range["priorAiOrigin"]["originCommit"], origin);
+
+        let repeated = derive(&fixture, &edit);
+        assert!(repeated.status.success());
+        assert_eq!(fixture.derived_value(&edit), report);
+        assert_eq!(fixture.sidecar_value(&edit), sidecar);
+        fixture.drop_root();
+    }
+}
+
+#[test]
+fn prior_ai_line_rewrite_stays_unknown_and_missing_origin_is_explained() {
+    let rewritten = Fixture::new("prior-ai-rewrite");
+    let _origin = prior_ai_origin(&rewritten, true);
+    fs::write(
+        rewritten.repo.join("tracked.txt"),
+        b"unrelated replacement\ntwo\n",
+    )
+    .unwrap();
+    let edit = rewritten.commit("human rewrites line");
+    assert!(derive(&rewritten, &edit).status.success());
+    assert_eq!(
+        file(&rewritten.derived_value(&edit), "tracked.txt")["unknown"],
+        1
+    );
+    let explain = explain_json(&rewritten, &edit, "tracked.txt", Some(1));
+    assert_eq!(explain["lines"][0]["category"], "unknown");
+    let rewrite_gate = explain["lines"][0]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["condition"] == "prior_ai_line_edit")
+        .unwrap();
+    assert!(rewrite_gate["compared"]
+        .as_str()
+        .unwrap()
+        .contains("below min_mixed_overlap"));
+    rewritten.drop_root();
+
+    let missing = Fixture::new("prior-ai-missing-origin");
+    let origin = prior_ai_origin(&missing, true);
+    fs::remove_file(missing.derived_path(&origin)).unwrap();
+    fs::remove_file(missing.lines_path(&origin)).unwrap();
+    fs::write(
+        missing.repo.join("tracked.txt"),
+        b"alpha beta gamma epsilon\ntwo\n",
+    )
+    .unwrap();
+    let edit = missing.commit("human edits without stored origin");
+    assert!(derive(&missing, &edit).status.success());
+    assert_eq!(
+        file(&missing.derived_value(&edit), "tracked.txt")["unknown"],
+        1
+    );
+    let explain = explain_json(&missing, &edit, "tracked.txt", Some(1));
+    let missing_gate = explain["lines"][0]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["condition"] == "prior_ai_line_edit")
+        .unwrap();
+    assert!(missing_gate["compared"]
+        .as_str()
+        .unwrap()
+        .contains("origin commit not derived locally"));
+    missing.drop_root();
+}
+
+#[test]
+fn prior_ai_line_blank_replacement_and_pure_insertion_stay_unknown() {
+    let fixture = Fixture::new("prior-ai-blank-insert");
+    fs::write(fixture.repo.join("tracked.txt"), b"\nbase phrase stays\n").unwrap();
+    let _scaffold = fixture.commit("add blank and base line");
+    fixture.hook("PreToolUse", "prior-ai-blank-source");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"\nalpha beta gamma delta\n",
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "prior-ai-blank-source");
+    configure_structured_apply_patch(&fixture, "tracked.txt", Some(true), false, json!([[2, 2]]));
+    let origin = fixture.commit("AI adds prior line");
+    assert!(derive(&fixture, &origin).status.success());
+
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"new text\nalpha beta gamma delta\npure insertion\n",
+    )
+    .unwrap();
+    let edit = fixture.commit("blank replacement and insertion");
+    assert!(derive(&fixture, &edit).status.success());
+    let sidecar = fixture.sidecar_value(&edit);
+    assert_eq!(
+        line_label(&sidecar, "tracked.txt", &line_hash("new text")),
+        "u"
+    );
+    assert_eq!(
+        line_label(&sidecar, "tracked.txt", &line_hash("pure insertion")),
+        "u"
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn prior_ai_mixed_origin_chains_and_own_window_evidence_wins() {
+    let fixture = Fixture::new("prior-ai-mixed-chain");
+    let _origin = prior_ai_origin(&fixture, true);
+    git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "un-derived bridge"],
+    );
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"alpha beta gamma epsilon\ntwo\n",
+    )
+    .unwrap();
+    let first_edit = fixture.commit("human edits direct AI line");
+    assert!(derive(&fixture, &first_edit).status.success());
+
+    git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "second un-derived bridge"],
+    );
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"alpha beta gamma zeta\ntwo\n",
+    )
+    .unwrap();
+    let second_edit = fixture.commit("human edits carried mixed line");
+    assert!(derive(&fixture, &second_edit).status.success());
+    let sidecar = fixture.sidecar_value(&second_edit);
+    let mixed = attribution_for(&sidecar, "tracked.txt", "mixed");
+    assert_eq!(mixed["priorAiOrigin"]["originCommit"], first_edit);
+    assert_eq!(mixed["priorAiOrigin"]["originCategory"], "mixed");
+
+    fixture.hook("PreToolUse", "same-window-ai");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"alpha beta gamma eta\ntwo\n",
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "same-window-ai");
+    configure_structured_apply_patch(&fixture, "tracked.txt", Some(true), false, json!([[1, 1]]));
+    let own_window = fixture.commit("AI evidence in current window");
+    assert!(derive(&fixture, &own_window).status.success());
+    assert_eq!(
+        file(&fixture.derived_value(&own_window), "tracked.txt")["ai_direct"],
+        1
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn prior_ai_synthetic_real_case_shape_preserves_linked_and_deterministic_percentages() {
+    let fixture = Fixture::new("prior-ai-48-line-shape");
+    fixture.hook("PreToolUse", "shape-cross-origin");
+    fs::write(
+        fixture.repo.join("cross.txt"),
+        b"alpha beta gamma delta\nomega psi chi phi\n",
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "shape-cross-origin");
+    configure_structured_apply_patch(&fixture, "cross.txt", Some(true), false, json!([[1, 2]]));
+    let origin = fixture.commit("synthetic cross-file AI source");
+    assert!(derive(&fixture, &origin).status.success());
+    git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "un-derived bridge"],
+    );
+
+    fixture.hook("PreToolUse", "shape-direct-source");
+    let direct = (0..26)
+        .map(|index| format!("direct symbol {index} alpha"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(fixture.repo.join("direct.txt"), format!("{direct}\n")).unwrap();
+    fixture.hook("PostToolUse", "shape-direct-source");
+    configure_structured_apply_patch(&fixture, "direct.txt", Some(true), false, json!([[1, 26]]));
+
+    fixture.hook("PreToolUse", "shape-strong-source");
+    let strong = (0..18)
+        .map(|index| format!("strong symbol {index} beta"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(fixture.repo.join("strong.txt"), format!("{strong}\n")).unwrap();
+    fixture.hook("PostToolUse", "shape-strong-source");
+    configure_structured_apply_patch(&fixture, "strong.txt", Some(false), false, json!([[1, 18]]));
+
+    fs::write(
+        fixture.repo.join("cross.txt"),
+        b"alpha beta gamma epsilon\nomega psi chi tau\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.repo.join("unknown.txt"),
+        b"rewrite unknown\npure insert\n",
+    )
+    .unwrap();
+    let target = fixture.commit("synthetic mixed cross-commit attribution shape");
+    assert!(derive(&fixture, &target).status.success());
+    let report = fixture.derived_value(&target);
+    assert_eq!(report["totals"]["e"], 48);
+    assert_eq!(report["totals"]["ai_direct"], 26);
+    assert_eq!(report["totals"]["ai_strong"], 18);
+    assert_eq!(report["totals"]["mixed"], 2);
+    assert_eq!(report["totals"]["unknown"], 2);
+    assert_eq!(report["totals"]["ai_deterministic_pct"], 91.7);
+    assert_eq!(report["totals"]["ai_linked_pct"], 95.8);
+    assert_eq!(report["coverage_unobserved_lines"], 2);
+    assert_eq!(file(&report, "direct.txt")["ai_direct"], 26);
+    assert_eq!(file(&report, "strong.txt")["ai_strong"], 18);
+    assert_ne!(origin, target);
+    fixture.drop_root();
+}

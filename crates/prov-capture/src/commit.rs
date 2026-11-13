@@ -19,11 +19,13 @@ const MIN_PARENT_EDIT_SIMILARITY: f64 = 0.5;
 const MAX_PARENT_MATCH_CELLS: usize = 1_000_000;
 const MAX_DELAYED_EVENTS_PER_PATH: usize = 64;
 const MIXED_SCORE_MILLI: u16 = 840;
+const PRIOR_AI_EDIT_LOOKUP_BUDGET: Duration = Duration::from_secs(2);
+pub const LINE_SURVIVAL_VERSION: &str = "unobserved-mixed-cross-commit-v2";
 const UNOBSERVED_COVERAGE_MEDIUM_PERCENT: usize = 5;
 const UNOBSERVED_COVERAGE_LOW_PERCENT: usize = 20;
 const UNOBSERVED_COVERAGE_BASIS: [&str; 2] = ["X_UNOBSERVED_EDIT", "X_UNOBSERVED_EDIT_IN_FILE"];
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 struct StoredParentLine {
     category: String,
     score: Option<f64>,
@@ -32,6 +34,24 @@ struct StoredParentLine {
     operation: Option<String>,
     exclusion_classifier: Option<String>,
     exclusion_reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct BlameOrigin {
+    commit: String,
+    original_line: usize,
+    path: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PriorAiEditTrace {
+    origin_commit: Option<String>,
+    origin_line: Option<usize>,
+    origin_category: Option<String>,
+    overlap: f64,
+    source: Option<StoredParentLine>,
+    passed: bool,
+    reason: String,
 }
 
 impl StoredParentLine {
@@ -69,6 +89,7 @@ struct MergeOutput {
 #[derive(Serialize)]
 struct LinesOutput {
     schema: &'static str,
+    line_survival_version: &'static str,
     repo_id: String,
     commit: String,
     totals: LineTotals,
@@ -132,6 +153,17 @@ pub(crate) struct AttributionRange {
     pub exclusion_classifier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclusion_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_ai_origin: Option<PriorAiOrigin>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PriorAiOrigin {
+    pub origin_commit: String,
+    pub origin_line: usize,
+    pub origin_category: String,
+    pub overlap: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -675,6 +707,7 @@ fn derive_resolved_commit(
         let lines_path = store.join("commits").join(format!("{commit}.lines.json"));
         let lines_bytes = serde_json::to_vec(&LinesOutput {
             schema: "prov.lines/0.1",
+            line_survival_version: LINE_SURVIVAL_VERSION,
             repo_id: repo_id.to_owned(),
             commit: commit.clone(),
             totals: LineTotals {
@@ -778,6 +811,7 @@ fn derive_resolved_commit(
     let mut attributions = Vec::new();
     let mut parent_fallback_lines = HashMap::<String, usize>::new();
     let mut unreadable_files = 0;
+    let prior_ai_deadline = Instant::now() + PRIOR_AI_EDIT_LOOKUP_BUDGET;
     for file in files {
         let old_size = file
             .old_blob
@@ -993,6 +1027,14 @@ fn derive_resolved_commit(
         } else {
             derive::derive_lines_with_attribution(&evidence_input, &normalized_committed)
         };
+        let has_ai_source_step: Vec<_> = attributed_lines
+            .iter()
+            .map(|line| {
+                line.source_step
+                    .and_then(|index| evidence_input.steps.get(index))
+                    .is_some_and(|step| matches!(step.kind, StepKind::Ai { .. }))
+            })
+            .collect();
         let committed_line_bytes = split_normalized_lines(&normalized_committed);
         let parent_lines = parent_line_labels.get(&file.path);
         let fallback_matches = parent_lines
@@ -1117,6 +1159,89 @@ fn derive_resolved_commit(
                 }
             }
         }
+        let eligible_unknown_lines: HashSet<_> = attributed_lines
+            .iter()
+            .enumerate()
+            .filter(|(index, line)| {
+                !has_ai_source_step.get(*index).copied().unwrap_or(false)
+                    && line.line.added
+                    && !line.line.blank
+                    && line.line.label == derive::Label::Unknown
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let prior_ai_traces = prior_ai_edit_traces(
+            PriorAiEditContext {
+                root: &repo.root,
+                store,
+                repo_id,
+                parent: parent.as_deref().unwrap_or_default(),
+                commit: &commit,
+                old_path: file.old_path.as_deref(),
+                path: &file.path,
+                parent_content: &normalized_parent,
+                committed_content: &normalized_committed,
+                deadline: prior_ai_deadline,
+            },
+            &eligible_unknown_lines,
+        );
+        let mut prior_ai_origins = HashMap::new();
+        for (line_index, trace) in prior_ai_traces {
+            if !trace.passed {
+                continue;
+            }
+            let (Some(origin_commit), Some(origin_line), Some(origin_category), Some(source)) = (
+                trace.origin_commit,
+                trace.origin_line,
+                trace.origin_category,
+                trace.source,
+            ) else {
+                continue;
+            };
+            let Some(attributed) = attributed_lines.get_mut(line_index) else {
+                continue;
+            };
+            let origin = PriorAiOrigin {
+                origin_commit,
+                origin_line,
+                origin_category,
+                overlap: trace.overlap,
+            };
+            let mixed_step = evidence_input.steps.len();
+            evidence_input.steps.push(Step {
+                kind: StepKind::Unknown,
+                after: Vec::new(),
+                attribution: Some(derive::StepAttribution {
+                    adapter_id: source
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.adapter_id.clone()),
+                    tool_id: source
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.tool_id.clone()),
+                    run_id: source
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.session_ref.clone()),
+                    session_id: None,
+                    operation: source.operation,
+                    primary_basis: Some("HUMAN_EDIT_OF_PRIOR_AI_LINE".into()),
+                    score_milli: MIXED_SCORE_MILLI,
+                    penalties_milli: Vec::new(),
+                    supporting_basis: Vec::new(),
+                    limiting_basis: vec!["X_UNOBSERVED_EDIT".into()],
+                    direct_lines: Vec::new(),
+                    direct_line_numbers: Vec::new(),
+                    event_index: None,
+                }),
+            });
+            attributed.line.label = derive::Label::Mixed;
+            attributed.source_step = Some(mixed_step);
+            attributed.ambiguous = false;
+            attributed.unobserved_edit = Some(derive::UnobservedEditKind::MixedByPriorAiEdit);
+            prior_ai_origins.insert(attributed.line.line, origin);
+        }
         if fallback_count > 0 {
             parent_fallback_lines.insert(file.path.clone(), fallback_count);
         }
@@ -1144,10 +1269,11 @@ fn derive_resolved_commit(
                 })
             })
             .collect();
-        attributions.extend(attribution_ranges(
+        attributions.extend(attribution_ranges_with_prior_origin(
             &file.path,
             &attributed_lines,
             &evidence_input.steps,
+            &prior_ai_origins,
         ));
         if let Some(old_path) = &file.old_path {
             if let Some(labels) = parent_line_labels.get(old_path) {
@@ -1226,6 +1352,7 @@ fn derive_resolved_commit(
         .collect();
     let lines_bytes = serde_json::to_vec(&LinesOutput {
         schema: "prov.lines/0.1",
+        line_survival_version: LINE_SURVIVAL_VERSION,
         repo_id: repo_id.to_owned(),
         commit: commit.clone(),
         totals: LineTotals {
@@ -1279,6 +1406,7 @@ fn write_empty_commit(
     let lines_path = commits_dir.join(format!("{commit}.lines.json"));
     let lines_bytes = serde_json::to_vec(&LinesOutput {
         schema: "prov.lines/0.1",
+        line_survival_version: LINE_SURVIVAL_VERSION,
         repo_id: repo_id.to_owned(),
         commit: commit.clone(),
         totals: LineTotals {
@@ -1569,16 +1697,112 @@ pub fn explain_commit(
     } else {
         None
     };
-    let evidence_input = Evidence {
-        parent: normalized_parent,
+    let mut evidence_input = Evidence {
+        parent: normalized_parent.clone(),
         steps: survival_steps.unwrap_or(steps),
     };
-    let attributed_lines = if evidence == "time_cut" {
+    let mut attributed_lines = if evidence == "time_cut" {
         derive::derive_lines_with_unobserved_edits(&evidence_input, &normalized_committed)
     } else {
         derive::derive_lines_with_attribution(&evidence_input, &normalized_committed)
     };
-    let ranges = attribution_ranges(&path, &attributed_lines, &evidence_input.steps);
+    let has_ai_source_step: Vec<_> = attributed_lines
+        .iter()
+        .map(|line| {
+            line.source_step
+                .and_then(|index| evidence_input.steps.get(index))
+                .is_some_and(|step| matches!(step.kind, StepKind::Ai { .. }))
+        })
+        .collect();
+    let eligible_unknown_lines: HashSet<_> = attributed_lines
+        .iter()
+        .enumerate()
+        .filter(|(index, line)| {
+            !has_ai_source_step.get(*index).copied().unwrap_or(false)
+                && line.line.added
+                && !line.line.blank
+                && line.line.label == derive::Label::Unknown
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let prior_ai_traces = prior_ai_edit_traces(
+        PriorAiEditContext {
+            root: &root,
+            store: &store,
+            repo_id: &_repo_id,
+            parent: parent.unwrap_or_default(),
+            commit: &commit,
+            old_path: file.old_path.as_deref(),
+            path: &path,
+            parent_content: &normalized_parent,
+            committed_content: &normalized_committed,
+            deadline: Instant::now() + PRIOR_AI_EDIT_LOOKUP_BUDGET,
+        },
+        &eligible_unknown_lines,
+    );
+    let mut prior_ai_origins = HashMap::new();
+    for (&line_index, trace) in &prior_ai_traces {
+        if !trace.passed {
+            continue;
+        }
+        let (Some(origin_commit), Some(origin_line), Some(origin_category), Some(source)) = (
+            trace.origin_commit.clone(),
+            trace.origin_line,
+            trace.origin_category.clone(),
+            trace.source.clone(),
+        ) else {
+            continue;
+        };
+        let Some(attributed) = attributed_lines.get_mut(line_index) else {
+            continue;
+        };
+        let origin = PriorAiOrigin {
+            origin_commit,
+            origin_line,
+            origin_category,
+            overlap: trace.overlap,
+        };
+        let mixed_step = evidence_input.steps.len();
+        evidence_input.steps.push(Step {
+            kind: StepKind::Unknown,
+            after: Vec::new(),
+            attribution: Some(derive::StepAttribution {
+                adapter_id: source
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.adapter_id.clone()),
+                tool_id: source
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.tool_id.clone()),
+                run_id: source
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.session_ref.clone()),
+                session_id: None,
+                operation: source.operation,
+                primary_basis: Some("HUMAN_EDIT_OF_PRIOR_AI_LINE".into()),
+                score_milli: MIXED_SCORE_MILLI,
+                penalties_milli: Vec::new(),
+                supporting_basis: Vec::new(),
+                limiting_basis: vec!["X_UNOBSERVED_EDIT".into()],
+                direct_lines: Vec::new(),
+                direct_line_numbers: Vec::new(),
+                event_index: None,
+            }),
+        });
+        attributed.line.label = derive::Label::Mixed;
+        attributed.source_step = Some(mixed_step);
+        attributed.ambiguous = false;
+        attributed.unobserved_edit = Some(derive::UnobservedEditKind::MixedByPriorAiEdit);
+        prior_ai_origins.insert(attributed.line.line, origin);
+    }
+    let ranges = attribution_ranges_with_prior_origin(
+        &path,
+        &attributed_lines,
+        &evidence_input.steps,
+        &prior_ai_origins,
+    );
     let report_lines = attributed_lines
         .iter()
         .filter(|attributed| attributed.line.added && !attributed.line.blank)
@@ -1589,6 +1813,7 @@ pub fn explain_commit(
             });
             let category = category_name(attributed.line.label).to_owned();
             let score = range.and_then(|range| range.score);
+            let prior_trace = prior_ai_traces.get(&attributed.line.line.saturating_sub(1));
             let source_trace = attributed
                 .source_step
                 .and_then(|index| event_traces.get(index));
@@ -1614,6 +1839,22 @@ pub fn explain_commit(
                     attributed.source_step
                 ),
             ));
+            if let Some(trace) = prior_trace {
+                checks.push(explain_check(
+                    "prior_ai_line_edit",
+                    trace.passed,
+                    format!(
+                        "origin_commit={}; origin_line={}; origin_category={}; overlap={:.3}; {}",
+                        trace.origin_commit.as_deref().unwrap_or("unavailable"),
+                        trace
+                            .origin_line
+                            .map_or_else(|| "unavailable".into(), |line| line.to_string()),
+                        trace.origin_category.as_deref().unwrap_or("unavailable"),
+                        trace.overlap,
+                        trace.reason
+                    ),
+                ));
+            }
             let unknown_step = if attributed.line.label != derive::Label::Unknown {
                 "final label retained AI ownership".to_owned()
             } else if !attributed.line.added {
@@ -1624,6 +1865,8 @@ pub fn explain_commit(
                 format!(
                     "committed_alignment after source_step={index}: AI ownership did not survive"
                 )
+            } else if prior_trace.is_some_and(|trace| !trace.passed) {
+                prior_trace.unwrap().reason.clone()
             } else {
                 "committed_alignment: no source step owns the added line".to_owned()
             };
@@ -1631,8 +1874,13 @@ pub fn explain_commit(
                 "final_attribution",
                 attributed.line.label != derive::Label::Unknown,
                 format!(
-                    "final_category={category}; source_step={:?}; decision={unknown_step}",
-                    attributed.source_step
+                    "final_category={category}; source_step={:?}; decision={}",
+                    attributed.source_step,
+                    if prior_trace.is_some_and(|trace| trace.passed) {
+                        "carry_human_edit_of_prior_ai"
+                    } else {
+                        &unknown_step
+                    }
                 ),
             ));
             checks.push(explain_check(
@@ -1664,7 +1912,11 @@ pub fn explain_commit(
                 true,
                 "file passed path and content exclusion checks".into(),
             ));
-            let first_failed_condition = if attributed.line.label == derive::Label::Unknown {
+            let first_failed_condition = if prior_trace.is_some_and(|trace| trace.passed) {
+                None
+            } else if prior_trace.is_some_and(|trace| !trace.passed) {
+                Some("prior_ai_line_edit".into())
+            } else if attributed.line.label == derive::Label::Unknown {
                 Some("final_attribution".into())
             } else {
                 checks
@@ -1921,6 +2173,362 @@ fn commit_files(
         });
     }
     Ok((files, has_changes))
+}
+
+struct PriorAiEditContext<'a> {
+    root: &'a Path,
+    store: &'a Path,
+    repo_id: &'a str,
+    parent: &'a str,
+    commit: &'a str,
+    old_path: Option<&'a str>,
+    path: &'a str,
+    parent_content: &'a [u8],
+    committed_content: &'a [u8],
+    deadline: Instant,
+}
+
+fn prior_ai_edit_traces(
+    context: PriorAiEditContext<'_>,
+    eligible_new_lines: &HashSet<usize>,
+) -> HashMap<usize, PriorAiEditTrace> {
+    let PriorAiEditContext {
+        root,
+        store,
+        repo_id,
+        parent,
+        commit,
+        old_path,
+        path,
+        parent_content,
+        committed_content,
+        deadline,
+    } = context;
+    if eligible_new_lines.is_empty() || Instant::now() >= deadline {
+        return HashMap::new();
+    }
+    let old_path = old_path.unwrap_or(path);
+    let old_blob = format!("{parent}:{old_path}");
+    let new_blob = format!("{commit}:{path}");
+    let Ok(diff) = git_output_until(
+        root,
+        &[
+            "diff",
+            "--no-renames",
+            "--unified=0",
+            "--no-ext-diff",
+            "--no-color",
+            &old_blob,
+            &new_blob,
+        ],
+        deadline,
+    ) else {
+        return HashMap::new();
+    };
+    if !diff.status.success() {
+        return HashMap::new();
+    }
+    let hunks = parse_zero_context_hunks(&diff.stdout);
+    let old_lines = split_normalized_lines(parent_content);
+    let new_lines = split_normalized_lines(committed_content);
+    let mut pairs = Vec::<(usize, usize, f64)>::new();
+    for hunk in hunks {
+        let old_indices: Vec<_> = hunk
+            .removed
+            .iter()
+            .filter_map(|(line, _)| line.checked_sub(1))
+            .collect();
+        let new_indices: Vec<_> = hunk
+            .added
+            .iter()
+            .filter_map(|(line, _)| line.checked_sub(1))
+            .collect();
+        if old_indices.is_empty() || new_indices.is_empty() {
+            continue;
+        }
+        if old_indices.len() == new_indices.len() {
+            pairs.extend(old_indices.into_iter().zip(new_indices).map(|(old, new)| {
+                let overlap = old_lines
+                    .get(old)
+                    .zip(new_lines.get(new))
+                    .map_or(0.0, |(left, right)| derive::token_overlap(left, right));
+                (old, new, overlap)
+            }));
+            continue;
+        }
+        if old_indices.len().saturating_mul(new_indices.len()) > MAX_PARENT_MATCH_CELLS {
+            continue;
+        }
+        let mut candidates = Vec::with_capacity(old_indices.len() * new_indices.len());
+        for &old in &old_indices {
+            for &new in &new_indices {
+                let overlap = old_lines
+                    .get(old)
+                    .zip(new_lines.get(new))
+                    .map_or(0.0, |(left, right)| derive::token_overlap(left, right));
+                candidates.push((old, new, overlap));
+            }
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .2
+                .total_cmp(&left.2)
+                .then_with(|| left.0.cmp(&right.0))
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        let mut used_old = HashSet::new();
+        let mut used_new = HashSet::new();
+        for pair in candidates {
+            if used_old.len() >= old_indices.len().min(new_indices.len()) {
+                break;
+            }
+            if used_old.insert(pair.0) && used_new.insert(pair.1) {
+                pairs.push(pair);
+            }
+        }
+    }
+    let relevant: Vec<_> = pairs
+        .into_iter()
+        .filter(|(_, new, _)| eligible_new_lines.contains(new))
+        .collect();
+    if relevant.is_empty() || Instant::now() >= deadline {
+        return HashMap::new();
+    }
+    let Ok(blame_output) = git_output_until(
+        root,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "blame",
+            "--line-porcelain",
+            "--follow",
+            parent,
+            "--",
+            old_path,
+        ],
+        deadline,
+    ) else {
+        return HashMap::new();
+    };
+    if !blame_output.status.success() {
+        return HashMap::new();
+    }
+    let blame = parse_blame_origins(&blame_output.stdout, old_path);
+    let mut traces = HashMap::new();
+    for (old_index, new_index, overlap) in relevant {
+        let mut trace = PriorAiEditTrace {
+            overlap,
+            reason: "origin commit not derived locally or stored derivation is stale".into(),
+            ..PriorAiEditTrace::default()
+        };
+        let Some(old_text) = old_lines.get(old_index) else {
+            traces.insert(new_index, trace);
+            continue;
+        };
+        if old_text.iter().all(u8::is_ascii_whitespace) {
+            trace.reason = "blank-to-text replacement has no prior AI line origin".into();
+            traces.insert(new_index, trace);
+            continue;
+        }
+        let Some(origin) = blame.get(&(old_index + 1)) else {
+            trace.reason = "Git blame did not provide an origin line".into();
+            traces.insert(new_index, trace);
+            continue;
+        };
+        trace.origin_commit = Some(origin.commit.clone());
+        trace.origin_line = Some(origin.original_line);
+        let Some(source) = read_derived_origin_line(
+            store,
+            repo_id,
+            &origin.commit,
+            &origin.path,
+            origin.original_line,
+        ) else {
+            traces.insert(new_index, trace);
+            continue;
+        };
+        trace.origin_category = Some(source.category.clone());
+        trace.source = Some(source.clone());
+        if overlap < derive::MIN_MIXED_OVERLAP {
+            trace.reason = "token overlap is below min_mixed_overlap".into();
+        } else if !source.is_ai() {
+            trace.reason = "origin category is not AI-attributed".into();
+        } else {
+            trace.passed = true;
+            trace.reason = "prior AI origin and token overlap passed".into();
+        }
+        traces.insert(new_index, trace);
+    }
+    traces
+}
+
+struct ZeroContextHunk {
+    removed: Vec<(usize, Vec<u8>)>,
+    added: Vec<(usize, Vec<u8>)>,
+}
+
+fn parse_zero_context_hunks(diff: &[u8]) -> Vec<ZeroContextHunk> {
+    let mut hunks = Vec::new();
+    let mut active: Option<(ZeroContextHunk, usize, usize)> = None;
+    for line in diff.split(|byte| *byte == b'\n') {
+        if line.starts_with(b"@@ ") {
+            if let Some((hunk, _, _)) = active.take() {
+                hunks.push(hunk);
+            }
+            let Some((old_line, new_line)) = parse_hunk_start(line) else {
+                continue;
+            };
+            active = Some((
+                ZeroContextHunk {
+                    removed: Vec::new(),
+                    added: Vec::new(),
+                },
+                old_line,
+                new_line,
+            ));
+            continue;
+        }
+        let Some((hunk, old_line, new_line)) = active.as_mut() else {
+            continue;
+        };
+        if line.first() == Some(&b'-') {
+            hunk.removed.push((*old_line, line[1..].to_vec()));
+            *old_line += 1;
+        } else if line.first() == Some(&b'+') {
+            hunk.added.push((*new_line, line[1..].to_vec()));
+            *new_line += 1;
+        } else if line.first() == Some(&b' ') {
+            *old_line += 1;
+            *new_line += 1;
+        }
+    }
+    if let Some((hunk, _, _)) = active {
+        hunks.push(hunk);
+    }
+    hunks
+}
+
+fn parse_hunk_start(line: &[u8]) -> Option<(usize, usize)> {
+    let text = std::str::from_utf8(line).ok()?;
+    let ranges = text.strip_prefix("@@ ")?.split(" @@").next()?;
+    let mut ranges = ranges.split_whitespace();
+    let old = parse_diff_range(ranges.next()?.strip_prefix('-')?)?;
+    let new = parse_diff_range(ranges.next()?.strip_prefix('+')?)?;
+    Some((old.0, new.0))
+}
+
+fn parse_diff_range(range: &str) -> Option<(usize, usize)> {
+    let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+    Some((start.parse().ok()?, count.parse().ok()?))
+}
+
+fn parse_blame_origins(output: &[u8], fallback_path: &str) -> HashMap<usize, BlameOrigin> {
+    let mut origins = HashMap::new();
+    let mut current: Option<(String, usize, usize, String)> = None;
+    for line in output.split(|byte| *byte == b'\n') {
+        if line.first().is_some_and(u8::is_ascii_hexdigit) {
+            let fields: Vec<_> = line.split(|byte| byte.is_ascii_whitespace()).collect();
+            if fields.len() >= 3 && fields[0].len() >= 40 {
+                let commit = String::from_utf8_lossy(fields[0]).into_owned();
+                let original = std::str::from_utf8(fields[1])
+                    .ok()
+                    .and_then(|v| v.parse().ok());
+                let final_line = std::str::from_utf8(fields[2])
+                    .ok()
+                    .and_then(|v| v.parse().ok());
+                if let (Some(original), Some(final_line)) = (original, final_line) {
+                    current = Some((commit, original, final_line, fallback_path.to_owned()));
+                    continue;
+                }
+            }
+        }
+        let Some((_, _, _, path)) = current.as_mut() else {
+            continue;
+        };
+        if let Some(filename) = line.strip_prefix(b"filename ") {
+            *path = String::from_utf8_lossy(filename).into_owned();
+        } else if line.first() == Some(&b'\t') {
+            if let Some((commit, original_line, final_line, path)) = current.take() {
+                origins.insert(
+                    final_line,
+                    BlameOrigin {
+                        commit,
+                        original_line,
+                        path,
+                    },
+                );
+            }
+        }
+    }
+    origins
+}
+
+fn git_output_until(root: &Path, args: &[&str], deadline: Instant) -> Result<Output, String> {
+    if Instant::now() >= deadline {
+        return Err("prior AI edit lookup timed out".into());
+    }
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    crate::configure_process_command(&mut command, false);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("prior AI edit lookup timed out".into());
+            }
+        }
+    }
+}
+
+fn read_derived_origin_line(
+    store: &Path,
+    repo_id: &str,
+    commit: &str,
+    path: &str,
+    line: usize,
+) -> Option<StoredParentLine> {
+    let report_bytes = fs::read(store.join("commits").join(format!("{commit}.json"))).ok()?;
+    let report: serde_json::Value = serde_json::from_slice(&report_bytes).ok()?;
+    let sidecar_bytes =
+        fs::read(store.join("commits").join(format!("{commit}.lines.json"))).ok()?;
+    let sidecar: serde_json::Value = serde_json::from_slice(&sidecar_bytes).ok()?;
+    if report["schema"] != "prov.commit/0.1"
+        || sidecar["schema"] != "prov.lines/0.1"
+        || report["repo_id"] != repo_id
+        || sidecar["repo_id"] != repo_id
+        || report["commit"] != commit
+        || sidecar["commit"] != commit
+        || sidecar["line_survival_version"].as_str() != Some(LINE_SURVIVAL_VERSION)
+    {
+        return None;
+    }
+    for metric in [
+        "e",
+        "ai_direct",
+        "ai_strong",
+        "ai_probable",
+        "mixed",
+        "unknown",
+    ] {
+        if report["totals"][metric].as_u64() != sidecar["totals"][metric].as_u64() {
+            return None;
+        }
+    }
+    read_parent_line_labels(store, commit)
+        .remove(path)?
+        .remove(&line)
 }
 
 fn numstat_additions(
@@ -2794,6 +3402,15 @@ fn attribution_ranges(
     lines: &[derive::AttributedLine],
     steps: &[Step],
 ) -> Vec<AttributionRange> {
+    attribution_ranges_with_prior_origin(path, lines, steps, &HashMap::new())
+}
+
+fn attribution_ranges_with_prior_origin(
+    path: &str,
+    lines: &[derive::AttributedLine],
+    steps: &[Step],
+    prior_ai_origins: &HashMap<usize, PriorAiOrigin>,
+) -> Vec<AttributionRange> {
     let mut ranges = Vec::new();
     for attributed in lines
         .iter()
@@ -2820,6 +3437,7 @@ fn attribution_ranges(
                 Some(
                     derive::UnobservedEditKind::MixedByTokenOverlap
                         | derive::UnobservedEditKind::MixedBySimilarity
+                        | derive::UnobservedEditKind::MixedByPriorAiEdit
                 )
             )
         {
@@ -2831,6 +3449,9 @@ fn attribution_ranges(
             }
             Some(derive::UnobservedEditKind::MixedByTokenOverlap)
             | Some(derive::UnobservedEditKind::UnmatchedUnknown) => {
+                push_basis(&mut limiting_basis, "X_UNOBSERVED_EDIT");
+            }
+            Some(derive::UnobservedEditKind::MixedByPriorAiEdit) => {
                 push_basis(&mut limiting_basis, "X_UNOBSERVED_EDIT");
             }
             Some(derive::UnobservedEditKind::MixedBySimilarity) => {
@@ -2862,6 +3483,10 @@ fn attribution_ranges(
                 || attributed.unobserved_edit == Some(derive::UnobservedEditKind::MixedBySimilarity)
             {
                 Some("CONFLICTING_EVIDENCE".into())
+            } else if attributed.unobserved_edit
+                == Some(derive::UnobservedEditKind::MixedByPriorAiEdit)
+            {
+                Some("HUMAN_EDIT_OF_PRIOR_AI_LINE".into())
             } else {
                 step.and_then(|step| step.primary_basis.clone())
             },
@@ -2888,6 +3513,7 @@ fn attribution_ranges(
             score_profile: "score-v1".into(),
             exclusion_classifier: None,
             exclusion_reason: None,
+            prior_ai_origin: prior_ai_origins.get(&attributed.line.line).cloned(),
         };
         push_attribution_range(&mut ranges, attribution);
     }
@@ -3351,6 +3977,7 @@ fn excluded_attributions(
                 score_profile: "score-v1".into(),
                 exclusion_classifier: Some(crate::exclusion::CLASSIFIER_ID.into()),
                 exclusion_reason: Some(reason.into()),
+                prior_ai_origin: None,
             },
         );
     }
@@ -3397,6 +4024,7 @@ fn rename_line_attributions(
                 score_profile: "score-v1".into(),
                 exclusion_classifier: stored.exclusion_classifier.clone(),
                 exclusion_reason: stored.exclusion_reason.clone(),
+                prior_ai_origin: None,
             });
         }
     }
