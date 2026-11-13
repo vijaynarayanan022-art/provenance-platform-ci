@@ -66,6 +66,7 @@ struct FileRange {
     operation: Option<String>,
     exclusion_classifier: Option<String>,
     exclusion_reason: Option<String>,
+    prior_ai_origin: Option<Value>,
 }
 
 pub fn command(args: impl Iterator<Item = String>) -> Result<String, String> {
@@ -794,6 +795,10 @@ fn collect_file_ranges_filtered(
                         .as_str()
                         .map(str::to_owned),
                     exclusion_reason: attribution["exclusionReason"].as_str().map(str::to_owned),
+                    prior_ai_origin: attribution
+                        .get("priorAiOrigin")
+                        .filter(|origin| origin.is_object())
+                        .cloned(),
                 });
             }
         } else if let Some(file_rows) = document["files"].as_array() {
@@ -832,6 +837,7 @@ fn collect_file_ranges_filtered(
                             operation: None,
                             exclusion_classifier: None,
                             exclusion_reason: None,
+                            prior_ai_origin: None,
                         });
                     }
                 }
@@ -873,6 +879,7 @@ fn file_range_json(range: &FileRange) -> Value {
         },
         "sourceTool": source_tool(range),
         "operation": range.operation,
+        "priorAiOrigin": range.prior_ai_origin,
         "algorithmProfile": range.algorithm_profile,
         "scoreProfile": range.score_profile,
         "exclusionClassifier": range.exclusion_classifier,

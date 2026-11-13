@@ -1,12 +1,49 @@
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static HOOK_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+static FIXTURE_TEST_GATE: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static FIXTURE_TEST_GATE_STATE: RefCell<(usize, Option<MutexGuard<'static, ()>>)> = const { RefCell::new((0, None)) };
+}
+
+struct FixtureTestGuard;
+
+impl FixtureTestGuard {
+    fn new() -> Self {
+        FIXTURE_TEST_GATE_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.0 == 0 {
+                state.1 = Some(
+                    FIXTURE_TEST_GATE
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+            }
+            state.0 += 1;
+        });
+        Self
+    }
+}
+
+impl Drop for FixtureTestGuard {
+    fn drop(&mut self) {
+        FIXTURE_TEST_GATE_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.0 -= 1;
+            if state.0 == 0 {
+                drop(state.1.take());
+            }
+        });
+    }
+}
 
 fn isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -25,10 +62,12 @@ struct Fixture {
     repo: PathBuf,
     store: PathBuf,
     copilot_home: PathBuf,
+    _test_guard: FixtureTestGuard,
 }
 
 impl Fixture {
     fn new(name: &str) -> Self {
+        let test_guard = FixtureTestGuard::new();
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -50,6 +89,7 @@ impl Fixture {
             repo,
             store,
             copilot_home,
+            _test_guard: test_guard,
         }
     }
 
@@ -1322,6 +1362,7 @@ fn vscode_doctor_reports_missing_and_invalid_hooks_file() {
 
 #[test]
 fn r32_copilot_runtime_actions_flow_through_summary_and_explain() {
+    let test_guard = FixtureTestGuard::new();
     let fixture_root =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/r32_copilot_runtime");
     let nonce = SystemTime::now()
@@ -1354,6 +1395,7 @@ fn r32_copilot_runtime_actions_flow_through_summary_and_explain() {
         repo: repo.clone(),
         store: store.clone(),
         copilot_home,
+        _test_guard: test_guard,
     };
 
     let captured: Vec<Value> = fs::read_to_string(fixture_root.join("probe-out.jsonl"))

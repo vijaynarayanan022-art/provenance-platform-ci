@@ -633,6 +633,9 @@ fn carried_attribution(
         exclusion_reason: source
             .as_ref()
             .and_then(|range| range.exclusion_reason.clone()),
+        prior_ai_origin: source
+            .as_ref()
+            .and_then(|range| range.prior_ai_origin.clone()),
     }
 }
 

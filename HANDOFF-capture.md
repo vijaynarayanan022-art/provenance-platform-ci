@@ -240,3 +240,9 @@ The `vscode_cli` test helper serializes hook subprocess calls to keep default-pa
 ## Round 33
 
 Malformed or unrecognized Codex and VS Code hook payloads remain fail-open with their existing host-visible output. The capture store records one `unrecognized_payload` marker per session, event-name spelling, and sorted top-level key set; marker contents exclude payload values and paths. Both Codex and VS Code doctor commands warn about markers from the last seven days without changing their exit status. The 1.4-second watchdog is unchanged.
+
+## Round 34
+
+When an eligible unknown added line replaces a nonblank parent line, derivation follows Git blame to the line's writing commit and consults only that origin's stored derivation. If its stored category is `ai_direct`, `ai_strong`, `ai_probable`, or `mixed`, and the existing token overlap is at least `min_mixed_overlap` (0.5), the edit is `mixed` with `HUMAN_EDIT_OF_PRIOR_AI_LINE`, score 0.84, and origin commit, line, category, and overlap in the attribution. Insertions, blank-line replacements, rewrites below threshold, missing or stale origin reports, and lookup errors stay unknown. The one-blame-per-file lookup has a two-second cap; it never derives origins on demand. Carried lines retain `X_UNOBSERVED_EDIT` and count toward the existing coverage-v3 caps. The line-survival version changes to `unobserved-mixed-cross-commit-v2`; an origin sidecar without this version is stale for this rule and must be re-derived locally.
+
+This is a **proposed spec change pending sign-off** on three decisions: use `mixed` for the human edit of prior AI text; follow the line to its origin without a fixed ancestry depth; and count carried lines toward unobserved-edit coverage. Known limit: the origin commit must already have a current stored derivation in the local provenance store.
