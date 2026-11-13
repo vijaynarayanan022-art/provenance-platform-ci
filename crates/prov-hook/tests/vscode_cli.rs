@@ -64,6 +64,10 @@ impl Fixture {
     }
 
     fn hook(&self, payload: &Value, adapter: &str) -> Output {
+        self.hook_bytes(&serde_json::to_vec(payload).unwrap(), adapter)
+    }
+
+    fn hook_bytes(&self, payload: &[u8], adapter: &str) -> Output {
         let _guard = HOOK_PROCESS_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -76,12 +80,7 @@ impl Fixture {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&serde_json::to_vec(payload).unwrap())
-            .unwrap();
+        child.stdin.take().unwrap().write_all(payload).unwrap();
         child.wait_with_output().unwrap()
     }
 
@@ -112,6 +111,123 @@ impl Fixture {
     fn drop_root(&self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn unrecognized_payloads_fail_open_are_rate_limited_and_doctor_warns() {
+    let fixture = Fixture::new("unrecognized-payload");
+    let cwd = fs::canonicalize(&fixture.repo).unwrap();
+    let missing_event = json!({
+        "session_id":"r33-session",
+        "cwd":cwd,
+        "tool_name":"Edit",
+        "tool_input":{"filePath":"secret/path.txt","contents":"secret-file-content"},
+        "private_value":"tool-input-secret"
+    });
+    for adapter in ["vscode", "codex"] {
+        let output = fixture.hook(&missing_event, adapter);
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            if adapter == "vscode" { "{}" } else { "" }
+        );
+    }
+
+    let malformed = b"this is not json";
+    for adapter in ["vscode", "codex"] {
+        let output = fixture.hook_bytes(malformed, adapter);
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            if adapter == "vscode" { "{}" } else { "" }
+        );
+    }
+    let array = fixture.hook_bytes(b"[1,2,3]", "vscode");
+    assert!(array.status.success());
+    assert_eq!(array.stdout, b"{}");
+
+    for _ in 0..3 {
+        let output = fixture.hook(&missing_event, "vscode");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"{}");
+    }
+    let casing = json!({
+        "hook_event_name":"PostToolUse",
+        "session_id":"r33-casing-session",
+        "cwd":cwd,
+        "tool_input":{"private":"input-secret"}
+    });
+    assert_hook_response(&fixture.hook(&casing, "vscode"));
+
+    let markers_path = fs::read_dir(fixture.store.join("repos"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("markers.jsonl");
+    let markers = fs::read_to_string(&markers_path).unwrap();
+    let repo_markers: Vec<Value> = markers
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let repeated: Vec<_> = repo_markers
+        .iter()
+        .filter(|marker| {
+            marker["event"] == "unrecognized_payload" && marker["session_id"] == "r33-session"
+        })
+        .collect();
+    assert_eq!(repeated.len(), 1);
+    assert_eq!(repeated[0]["hook_event_name"], Value::Null);
+    assert_eq!(
+        repeated[0]["keys"],
+        json!([
+            "cwd",
+            "private_value",
+            "session_id",
+            "tool_input",
+            "tool_name"
+        ])
+    );
+    assert!(!markers.contains("secret-file-content"));
+    assert!(!markers.contains("tool-input-secret"));
+    assert!(!markers.contains("secret/path.txt"));
+    assert!(repo_markers.iter().any(|marker| {
+        marker["event"] == "unrecognized_payload"
+            && marker["session_id"] == "r33-casing-session"
+            && marker["hook_event_name"] == "PostToolUse"
+            && marker["keys"] == json!(["cwd", "hook_event_name", "session_id", "tool_input"])
+    }));
+
+    assert!(fixture.cli(&["setup", "--tool", "vscode"]).status.success());
+    let doctor = fixture.cli(&["doctor", "--tool", "vscode"]);
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stdout)
+    );
+    let doctor = String::from_utf8_lossy(&doctor.stdout);
+    assert!(doctor.contains("WARN unrecognized payload: event <missing>, keys [cwd, private_value, session_id, tool_input, tool_name]"));
+    let codex_home = fixture.root.join("codex home");
+    let install = fixture.cli(&[
+        "install",
+        "--codex-home",
+        codex_home.to_str().unwrap(),
+        "--enable-hooks-feature",
+    ]);
+    assert!(install.status.success());
+    let codex_doctor = fixture.cli(&["doctor", "--codex-home", codex_home.to_str().unwrap()]);
+    assert!(codex_doctor.status.success());
+    assert!(String::from_utf8_lossy(&codex_doctor.stdout)
+        .contains("WARN unrecognized payload: event <missing>, keys [cwd, private_value, session_id, tool_input, tool_name]"));
+
+    let clean = Fixture::new("unrecognized-clean");
+    assert!(clean.cli(&["setup", "--tool", "vscode"]).status.success());
+    let clean_doctor = clean.cli(&["doctor", "--tool", "vscode"]);
+    assert!(clean_doctor.status.success());
+    assert!(!String::from_utf8_lossy(&clean_doctor.stdout).contains("unrecognized payload"));
+    clean.drop_root();
+    fixture.drop_root();
 }
 
 fn git(repo: &Path, args: &[&str]) {

@@ -332,23 +332,64 @@ struct FileChange {
 
 /// Contain all hook work. The executable wraps this in catch_unwind and has a process watchdog.
 pub fn process_json(input: &[u8]) {
+    let value = serde_json::from_slice::<serde_json::Value>(input).ok();
+    let shape_ok = value.as_ref().is_some_and(|value| {
+        let Some(event) = value
+            .get("hook_event_name")
+            .and_then(|value| value.as_str())
+        else {
+            return false;
+        };
+        value.is_object()
+            && (!matches!(event, "PreToolUse" | "PostToolUse")
+                || value
+                    .get("tool_name")
+                    .and_then(|value| value.as_str())
+                    .is_some())
+    });
     let Ok(hook) = serde_json::from_slice::<HookInput>(input) else {
+        record_unrecognized_payload(value.as_ref());
         return;
     };
+    if !shape_ok {
+        record_unrecognized_payload(value.as_ref());
+        return;
+    }
+    if hook.hook_event_name.is_none()
+        || (matches!(
+            hook.hook_event_name.as_deref(),
+            Some("PreToolUse" | "PostToolUse")
+        ) && hook.tool_name.is_none())
+    {
+        record_unrecognized_payload(value.as_ref());
+        return;
+    }
     process_hook(hook, "codex", None, false);
 }
 
 pub fn process_vscode_json(input: &[u8]) {
     let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(input) else {
+        record_unrecognized_payload(None);
         return;
     };
+    if !payload.is_object() {
+        record_unrecognized_payload(Some(&payload));
+        return;
+    }
     let Some(event_name) = payload
         .get("hook_event_name")
         .and_then(|v| v.as_str())
         .map(str::to_owned)
     else {
+        record_unrecognized_payload(Some(&payload));
         return;
     };
+    if matches!(event_name.as_str(), "PreToolUse" | "PostToolUse")
+        && payload.get("tool_name").and_then(|v| v.as_str()).is_none()
+    {
+        record_unrecognized_payload(Some(&payload));
+        return;
+    }
     if event_name == "SessionStart" {
         return;
     }
@@ -459,6 +500,153 @@ pub fn process_vscode_json(input: &[u8]) {
         tool_input: payload.get("tool_input").cloned(),
     };
     process_hook(hook, "vscode-copilot", target_paths, require_window);
+}
+
+fn record_unrecognized_payload(value: Option<&serde_json::Value>) {
+    let keys = value
+        .and_then(serde_json::Value::as_object)
+        .map(|object| {
+            let mut keys: Vec<_> = object.keys().cloned().collect();
+            keys.sort();
+            keys
+        })
+        .unwrap_or_default();
+    let event_name = value
+        .and_then(|value| value.get("hook_event_name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let session_id = value
+        .and_then(|value| value.get("session_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let cwd = value
+        .and_then(|value| value.get("cwd"))
+        .and_then(serde_json::Value::as_str)
+        .map(Path::new)
+        .filter(|cwd| cwd.is_dir());
+    let Some(home) = store_home() else { return };
+    if ensure_private_dir(&home).is_err() {
+        return;
+    }
+    let Ok(lock_file) = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(home.join("unrecognized-payload.lock"))
+    else {
+        return;
+    };
+    let mut lock = RwLock::new(lock_file);
+    let Ok(_guard) = lock.write() else { return };
+    let path = cwd
+        .and_then(|cwd| repo_info(cwd, &home))
+        .and_then(|repo| {
+            repo.repo_id
+                .map(|id| home.join("repos").join(id).join("markers.jsonl"))
+        })
+        .unwrap_or_else(|| home.join("inbox.jsonl"));
+    let mut marker_files = vec![home.join("inbox.jsonl")];
+    if let Ok(entries) = fs::read_dir(home.join("repos")) {
+        marker_files.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path().join("markers.jsonl")),
+        );
+    }
+    if marker_files.iter().any(|marker_path| {
+        fs::read_to_string(marker_path)
+            .ok()
+            .is_some_and(|contents| {
+                contents.lines().any(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .ok()
+                        .is_some_and(|marker| {
+                            marker["event"] == "unrecognized_payload"
+                                && marker
+                                    .get("hook_event_name")
+                                    .and_then(serde_json::Value::as_str)
+                                    == event_name.as_deref()
+                                && marker.get("session_id").and_then(serde_json::Value::as_str)
+                                    == session_id.as_deref()
+                                && marker["keys"].as_array().is_some_and(|existing| {
+                                    existing
+                                        .iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .eq(keys.iter().map(String::as_str))
+                                })
+                        })
+                })
+            })
+    }) {
+        return;
+    }
+    let Some(parent) = path.parent() else { return };
+    if ensure_private_dir(parent).is_err() {
+        return;
+    }
+    let mut bytes = serde_json::to_vec(&serde_json::json!({
+        "event": "unrecognized_payload",
+        "timestamp": now_ns(),
+        "hook_event_name": event_name,
+        "session_id": session_id,
+        "keys": keys,
+    }))
+    .unwrap_or_default();
+    bytes.push(b'\n');
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(&bytes);
+    }
+}
+
+pub fn recent_unrecognized_payload_warnings(home: &Path) -> Vec<String> {
+    let cutoff = now_ns().saturating_sub(7 * 24 * 60 * 60 * 1_000_000_000);
+    let mut files = vec![home.join("inbox.jsonl")];
+    if let Ok(entries) = fs::read_dir(home.join("repos")) {
+        files.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path().join("markers.jsonl")),
+        );
+    }
+    let mut warnings = Vec::new();
+    for path in files {
+        let Ok(contents) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let Ok(marker) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if marker["event"] != "unrecognized_payload"
+                || (marker["timestamp"].as_u64().unwrap_or_default() as u128) < cutoff
+            {
+                continue;
+            }
+            let event = marker["hook_event_name"].as_str().unwrap_or("<missing>");
+            let keys = marker["keys"]
+                .as_array()
+                .map(|keys| {
+                    keys.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            warnings.push(format!(
+                "WARN unrecognized payload: event {event}, keys [{keys}]"
+            ));
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
+    warnings
+}
+
+pub fn recent_unrecognized_payload_warnings_from_env() -> Vec<String> {
+    store_home()
+        .map(|home| recent_unrecognized_payload_warnings(&home))
+        .unwrap_or_default()
 }
 
 fn vscode_file_paths(input: Option<&serde_json::Value>) -> Vec<String> {

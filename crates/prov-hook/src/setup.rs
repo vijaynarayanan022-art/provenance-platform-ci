@@ -170,12 +170,20 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
             let mut command = Command::new(binary);
             command
                 .arg("codex")
-                .stdin(Stdio::null())
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             prov_capture::configure_process_command(&mut command, false);
-            command.output().is_ok_and(|output| {
-                output.status.success() && output.stdout.is_empty() && output.stderr.is_empty()
+            command.spawn().is_ok_and(|mut child| {
+                let input_written = child.stdin.take().is_some_and(|mut stdin| {
+                    stdin.write_all(br#"{"hook_event_name":"Stop"}"#).is_ok()
+                });
+                input_written
+                    && child.wait_with_output().is_ok_and(|output| {
+                        output.status.success()
+                            && output.stdout.is_empty()
+                            && output.stderr.is_empty()
+                    })
             })
         });
     if let Some(binary) = configured_binary.as_ref() {
@@ -340,6 +348,8 @@ pub fn doctor(codex_home: Option<&Path>, repo: Option<&Path>) -> Result<DoctorRe
             default_store.display()
         ));
     }
+
+    lines.extend(prov_capture::recent_unrecognized_payload_warnings_from_env());
 
     Ok(DoctorReport { lines, failed })
 }

@@ -194,6 +194,11 @@ fn select<'a>(events: &'a [Value], event: &str) -> Vec<&'a Value> {
 fn malformed_stdin_is_silent_and_successful() {
     let _serial = test_guard();
     let exe = env!("CARGO_BIN_EXE_prov-hook");
+    let marker_store = std::env::temp_dir().join(format!(
+        "prov-malformed-stdin-{}-{}",
+        std::process::id(),
+        now()
+    ));
     for input in [
         Vec::new(),
         b"garbage".to_vec(),
@@ -202,6 +207,7 @@ fn malformed_stdin_is_silent_and_successful() {
     ] {
         let mut child = isolated_command(exe)
             .arg("codex")
+            .env("PROV_HOME", &marker_store)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -213,6 +219,9 @@ fn malformed_stdin_is_silent_and_successful() {
         assert!(out.stdout.is_empty());
         assert!(out.stderr.is_empty());
     }
+    let markers = fs::read_to_string(marker_store.join("inbox.jsonl")).unwrap();
+    assert_eq!(markers.lines().count(), 2);
+    let _ = fs::remove_dir_all(marker_store);
 }
 
 #[test]
@@ -1118,7 +1127,7 @@ fn a_slow_scan_hits_the_process_time_cap_and_records_degraded() {
     let sep = if cfg!(windows) { ";" } else { ":" };
     let path = format!("{}{}{}", bin.display(), sep, old_path.to_string_lossy());
     let payload = json!({"hook_event_name":"PreToolUse", "session_id":"slow", "turn_id":"t", "cwd":f.repo,
-        "tool_use_id":"slow-tool", "tool_input":{"command":"slow"}});
+        "tool_name":"PowerShell", "tool_use_id":"slow-tool", "tool_input":{"command":"slow"}});
     let start = Instant::now();
     let mut child = isolated_command(env!("CARGO_BIN_EXE_prov-hook"))
         .arg("codex")
