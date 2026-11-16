@@ -1950,14 +1950,14 @@ pub fn explain_commit(
                 .filter(|mapping| mapping.committed_line == Some(attributed.line.line))
                 .collect();
             checks.push(explain_check(
-                "position_mapping",
-                attributed.unobserved_edit == Some(derive::UnobservedEditKind::PositionMapped),
-                if line_mappings.is_empty() {
-                    format!(
-                        "snapshot_line=unavailable; committed_line={}; equal_region_bounds=unavailable; decision=no_position_mapping",
-                        attributed.line.line
-                    )
-                } else {
+                "exclusion_rules",
+                true,
+                "file passed path and content exclusion checks".into(),
+            ));
+            if !line_mappings.is_empty() {
+                checks.push(explain_check(
+                    "position_mapping",
+                    attributed.unobserved_edit == Some(derive::UnobservedEditKind::PositionMapped),
                     line_mappings
                         .iter()
                         .map(|mapping| {
@@ -1979,14 +1979,9 @@ pub fn explain_commit(
                             )
                         })
                         .collect::<Vec<_>>()
-                        .join(" | ")
-                },
-            ));
-            checks.push(explain_check(
-                "exclusion_rules",
-                true,
-                "file passed path and content exclusion checks".into(),
-            ));
+                        .join(" | "),
+                ));
+            }
             let first_failed_condition = if prior_trace.is_some_and(|trace| trace.passed) {
                 None
             } else if prior_trace.is_some_and(|trace| !trace.passed) {
