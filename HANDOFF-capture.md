@@ -246,3 +246,22 @@ Malformed or unrecognized Codex and VS Code hook payloads remain fail-open with 
 When an eligible unknown added line replaces a nonblank parent line, derivation follows Git blame to the line's writing commit and consults only that origin's stored derivation. If its stored category is `ai_direct`, `ai_strong`, `ai_probable`, or `mixed`, and the existing token overlap is at least `min_mixed_overlap` (0.5), the edit is `mixed` with `HUMAN_EDIT_OF_PRIOR_AI_LINE`, score 0.84, and origin commit, line, category, and overlap in the attribution. Insertions, blank-line replacements, rewrites below threshold, missing or stale origin reports, and lookup errors stay unknown. The one-blame-per-file lookup has a two-second cap; it never derives origins on demand. Carried lines retain `X_UNOBSERVED_EDIT` and count toward the existing coverage-v3 caps. The line-survival version changes to `unobserved-mixed-cross-commit-v2`; an origin sidecar without this version is stale for this rule and must be re-derived locally.
 
 This is a **proposed spec change pending sign-off** on three decisions: use `mixed` for the human edit of prior AI text; follow the line to its origin without a fixed ancestry depth; and count carried lines toward unobserved-edit coverage. Known limit: the origin commit must already have a current stored derivation in the local provenance store.
+
+## Round 35: discard-boundary characterization
+
+No behavior change is proposed in this round. The characterization uses synthetic snapshot-diff edits with real Git operations and the existing Codex helpers; structured-edit (`ai_direct`) discard cases are not covered here and will be covered by the live pass.
+
+| Scenario | Main label/result today | Characterization |
+| --- | --- | --- |
+| S1 restore F, then write similar human text | `mixed` (0.84) | Known limit: indistinguishable from an in-place human edit of an AI line |
+| S2 restore F, then make a new AI edit | `ai_strong` from the second edit | The later event's content is credited |
+| S3 edit F and G, checkout G, commit F | F `ai_strong`; G absent | Discarded G evidence does not leak into F |
+| S4 stash AI F, commit an unrelated human change, leave stash | No AI credit in the commit; F absent | Stashed text is not part of the committed change |
+| S5 stash/pop unchanged, then commit F | `ai_strong`, not `ai_direct` | Restored snapshot bytes remain eligible for strong credit |
+| S6 force-checkout another branch, then write similar human text | `mixed` (0.84) | Known limit: indistinguishable from an in-place human edit of an AI line |
+| S7 restore staged content only | `ai_strong` | Worktree evidence is retained |
+| S8 restore F from an older commit, then write similar human text | `mixed` (0.84) | Known limit: indistinguishable from an in-place human edit of an AI line |
+| S9 hard-reset regression | Fresh post-reset edit `ai_strong` | Existing r27 behavior remains correct |
+| S10 restore, then human retypes identical text | `ai_strong` | Known limit: identical retyping is indistinguishable from unchanged AI bytes |
+
+Git restore and stash operations leave no hook-visible trace. The system observes snapshots and subsequent hook events, not the Git operation that changed the worktree. Consequently, S1/S6/S8 cannot be reliably distinguished from ordinary same-window human edits that the existing policy labels `mixed`; S10 cannot distinguish a human retype from unchanged identical bytes. S4 and S5 show the current outcomes for an unrestored stash and an unchanged stash/pop respectively. These are known limits, not behavior changes for this round.
