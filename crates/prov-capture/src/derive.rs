@@ -633,8 +633,8 @@ fn position_map_lines(
 
     let mut active_positions = vec![None; pending.len()];
     let mut previous = Vec::new();
-    for step_index in 0..=last_ai_step {
-        let current = split_lines(&ev.steps[step_index].after);
+    for (step_index, step) in ev.steps.iter().enumerate().take(last_ai_step + 1) {
+        let current = split_lines(&step.after);
         if step_index > 0 && active_positions.iter().any(Option::is_some) {
             let Some(diff) = bounded_line_diff(&previous, &current, &mut work) else {
                 return capped_position_map(pending);
