@@ -2458,10 +2458,35 @@ fn is_transient_result_io_error(error: &std::io::Error, path: &Path) -> bool {
         return false;
     }
     match error.raw_os_error() {
-        Some(2 | 3) => path.parent().is_some_and(|parent| parent.is_dir()),
-        Some(5 | 32 | 33 | 1175 | 1176 | 1177) => true,
+        Some(5) => path.is_file(),
+        Some(32 | 33 | 1175 | 1176 | 1177) => true,
         _ => false,
     }
+}
+#[cfg(windows)]
+fn extended_length_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    let wide: Vec<_> = path.as_os_str().encode_wide().collect();
+    const EXTENDED_PREFIX: [u16; 4] = [92, 92, 63, 92];
+    const DEVICE_PREFIX: [u16; 4] = [92, 92, 46, 92];
+    if wide.starts_with(&EXTENDED_PREFIX) || wide.starts_with(&DEVICE_PREFIX) {
+        return path.to_path_buf();
+    }
+
+    let mut extended = Vec::with_capacity(wide.len() + 8);
+    if wide.starts_with(&[92, 92]) {
+        extended.extend_from_slice(&[92, 92, 63, 92, 85, 78, 67, 92]);
+        extended.extend_from_slice(&wide[2..]);
+    } else {
+        extended.extend_from_slice(&EXTENDED_PREFIX);
+        extended.extend_from_slice(&wide);
+    }
+    PathBuf::from(std::ffi::OsString::from_wide(&extended))
 }
 fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     let parent = path
@@ -2489,8 +2514,18 @@ fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     #[cfg(windows)]
     if path.exists() {
         use std::os::windows::ffi::OsStrExt;
-        let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let source_path = extended_length_path(&temp);
+        let destination_path = extended_length_path(path);
+        let source: Vec<u16> = source_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let destination: Vec<u16> = destination_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
         // ReplaceFile preserves an atomic replacement for existing state/cache files.
         #[link(name = "Kernel32")]
         unsafe extern "system" {
@@ -2858,7 +2893,7 @@ mod tests {
         let path = dir.join("result.json");
         fs::write(&path, b"result").unwrap();
 
-        for code in [2, 3, 5, 32, 33, 1175, 1176, 1177] {
+        for code in [5, 32, 33, 1175, 1176, 1177] {
             assert!(
                 is_transient_result_io_error(&std::io::Error::from_raw_os_error(code), &path),
                 "expected error {code} to be transient for an existing file"
@@ -2894,6 +2929,10 @@ mod tests {
         let dir = result_io_test_dir("unknown-code");
         let path = dir.join("result.json");
         fs::write(&path, b"result").unwrap();
+        assert!(!is_transient_result_io_error(
+            &std::io::Error::from_raw_os_error(3),
+            &path
+        ));
         assert!(!is_transient_result_io_error(
             &std::io::Error::from_raw_os_error(87),
             &path
@@ -3131,6 +3170,36 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn atomic_bytes_overwrites_long_windows_path() {
+        let root = std::env::temp_dir().join(format!(
+            "prov-long-path-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let mut destination = root.clone();
+        for _ in 0..4 {
+            destination.push("a".repeat(70));
+        }
+        destination.push("result.json");
+        let parent = destination.parent().unwrap();
+        assert!(destination.to_string_lossy().len() >= 300);
+        let parent_text = parent.to_string_lossy();
+        let verbatim_parent = if let Some(unc_path) = parent_text.strip_prefix(r"\\") {
+            PathBuf::from(format!(r"\\?\UNC\{unc_path}"))
+        } else {
+            PathBuf::from(format!(r"\\?\{parent_text}"))
+        };
+        fs::create_dir_all(verbatim_parent).unwrap();
+
+        atomic_bytes(&destination, b"old bytes", false).unwrap();
+        atomic_bytes(&destination, b"new bytes", false).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new bytes");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn failed_replace_file_w_cleans_temp_file() {
         use std::os::windows::ffi::OsStrExt;
         let dir = std::env::temp_dir().join(format!(
@@ -3154,6 +3223,7 @@ mod tests {
             ) -> *mut std::ffi::c_void;
             fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
         }
+        let file = extended_length_path(&file);
         let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
         let handle = unsafe {
             CreateFileW(
