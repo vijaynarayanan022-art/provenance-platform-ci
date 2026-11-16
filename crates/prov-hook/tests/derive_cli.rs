@@ -1718,7 +1718,13 @@ fn position_mapping_results_are_deterministic_and_match_summary_and_explain() {
     );
     let first_report = fs::read(fixture.derived_path(&commit)).unwrap();
     let first_sidecar = fs::read(fixture.lines_path(&commit)).unwrap();
-    assert!(derive(&fixture, &commit).status.success());
+    let result = derive(&fixture, &commit);
+    assert!(
+        result.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&result.stderr),
+        String::from_utf8_lossy(&result.stdout)
+    );
     assert_eq!(
         first_report,
         fs::read(fixture.derived_path(&commit)).unwrap()
