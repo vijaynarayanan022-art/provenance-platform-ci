@@ -160,12 +160,12 @@ pub(crate) fn apply(root: &Path, store: &Path, commit: &str) -> Result<(), Strin
     let sidecar_path = commits_dir.join(format!("{commit}.lines.json"));
     let mut report: CommitReport = serde_json::from_slice(
         &crate::read_derive_result(&report_path)
-            .map_err(|error| format!("{}: {error}", report_path.display()))?,
+            .map_err(|error| format!("read {}: {error}", report_path.display()))?,
     )
     .map_err(|error| error.to_string())?;
     let mut sidecar: LinesSidecar = serde_json::from_slice(
         &crate::read_derive_result(&sidecar_path)
-            .map_err(|error| format!("{}: {error}", sidecar_path.display()))?,
+            .map_err(|error| format!("read {}: {error}", sidecar_path.display()))?,
     )
     .map_err(|error| error.to_string())?;
 
@@ -202,9 +202,9 @@ pub(crate) fn apply(root: &Path, store: &Path, commit: &str) -> Result<(), Strin
         return Ok(());
     }
     crate::atomic_derive_result(&sidecar_path, &sidecar_bytes, false)
-        .map_err(|error| format!("{}: {error}", sidecar_path.display()))?;
+        .map_err(|error| format!("write {}: {error}", sidecar_path.display()))?;
     crate::atomic_derive_result(&report_path, &report_bytes, false)
-        .map_err(|error| format!("{}: {error}", report_path.display()))?;
+        .map_err(|error| format!("write {}: {error}", report_path.display()))?;
     Ok(())
 }
 

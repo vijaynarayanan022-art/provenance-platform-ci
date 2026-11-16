@@ -2439,12 +2439,7 @@ fn retry_derive_result_io<T>(
         match operation() {
             Ok(value) => return Ok(value),
             Err(error) => {
-                let retryable = match error.raw_os_error() {
-                    Some(32 | 33) => true,
-                    Some(5) => fs::metadata(path).is_ok_and(|metadata| metadata.is_file()),
-                    _ => false,
-                };
-                if !retryable {
+                if !is_transient_result_io_error(&error, path) {
                     return Err(error);
                 }
                 let remaining = RETRY_BUDGET.saturating_sub(started.elapsed());
@@ -2455,6 +2450,17 @@ fn retry_derive_result_io<T>(
                 delay = (delay * 2).min(MAX_DELAY);
             }
         }
+    }
+}
+#[cfg(windows)]
+fn is_transient_result_io_error(error: &std::io::Error, path: &Path) -> bool {
+    if path.is_dir() {
+        return false;
+    }
+    match error.raw_os_error() {
+        Some(2 | 3) => path.parent().is_some_and(|parent| parent.is_dir()),
+        Some(5 | 32 | 33 | 1175 | 1176 | 1177) => true,
+        _ => false,
     }
 }
 fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
@@ -2833,6 +2839,67 @@ pub fn process_json_timed(input: &[u8]) -> TimingSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn result_io_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "prov-result-io-{name}-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn result_io_retries_transient_codes_for_existing_file() {
+        let dir = result_io_test_dir("existing-file");
+        let path = dir.join("result.json");
+        fs::write(&path, b"result").unwrap();
+
+        for code in [2, 3, 5, 32, 33, 1175, 1176, 1177] {
+            assert!(
+                is_transient_result_io_error(&std::io::Error::from_raw_os_error(code), &path),
+                "expected error {code} to be transient for an existing file"
+            );
+        }
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn result_io_does_not_retry_missing_parent_or_directory_destination() {
+        let dir = result_io_test_dir("missing-parent");
+        let missing_path = dir.join("missing").join("result.json");
+        assert!(!is_transient_result_io_error(
+            &std::io::Error::from_raw_os_error(3),
+            &missing_path
+        ));
+
+        let directory_path = dir.join("result-directory");
+        fs::create_dir(&directory_path).unwrap();
+        assert!(!is_transient_result_io_error(
+            &std::io::Error::from_raw_os_error(5),
+            &directory_path
+        ));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn result_io_does_not_retry_unrecognized_codes() {
+        let dir = result_io_test_dir("unknown-code");
+        let path = dir.join("result.json");
+        fs::write(&path, b"result").unwrap();
+        assert!(!is_transient_result_io_error(
+            &std::io::Error::from_raw_os_error(87),
+            &path
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn apply_patch_payload_without_parsed_paths_falls_back_to_unscoped_capture() {
