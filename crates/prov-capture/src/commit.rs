@@ -726,7 +726,8 @@ fn derive_resolved_commit(
         .map_err(|error| error.to_string())?;
         crate::ensure_private_dir(lines_path.parent().ok_or("invalid lines path")?)
             .map_err(|error| error.to_string())?;
-        crate::atomic_bytes(&lines_path, &lines_bytes, false).map_err(|error| error.to_string())?;
+        crate::atomic_derive_result(&lines_path, &lines_bytes, false)
+            .map_err(|error| format!("{}: {error}", lines_path.display()))?;
         let bytes = serde_json::to_vec(&MergeOutput {
             schema: "prov.commit/0.1",
             commit,
@@ -741,7 +742,8 @@ fn derive_resolved_commit(
         .map_err(|error| error.to_string())?;
         crate::ensure_private_dir(output_path.parent().ok_or("invalid commit path")?)
             .map_err(|error| error.to_string())?;
-        crate::atomic_bytes(&output_path, &bytes, false).map_err(|error| error.to_string())?;
+        crate::atomic_derive_result(&output_path, &bytes, false)
+            .map_err(|error| format!("{}: {error}", output_path.display()))?;
         return Ok(output_path);
     }
 
@@ -1390,7 +1392,8 @@ fn derive_resolved_commit(
     let lines_path = store.join("commits").join(format!("{commit}.lines.json"));
     crate::ensure_private_dir(lines_path.parent().ok_or("invalid lines path")?)
         .map_err(|error| error.to_string())?;
-    crate::atomic_bytes(&lines_path, &lines_bytes, false).map_err(|error| error.to_string())?;
+    crate::atomic_derive_result(&lines_path, &lines_bytes, false)
+        .map_err(|error| format!("{}: {error}", lines_path.display()))?;
     let bytes = serde_json::to_vec(&CommitOutput {
         schema: "prov.commit/0.1",
         repo_id: repo_id.to_owned(),
@@ -1410,7 +1413,8 @@ fn derive_resolved_commit(
     .map_err(|error| error.to_string())?;
     crate::ensure_private_dir(output_path.parent().ok_or("invalid commit path")?)
         .map_err(|error| error.to_string())?;
-    crate::atomic_bytes(&output_path, &bytes, false).map_err(|error| error.to_string())?;
+    crate::atomic_derive_result(&output_path, &bytes, false)
+        .map_err(|error| format!("{}: {error}", output_path.display()))?;
     let _ = crate::rewrite::apply(&repo.root, store, &commit);
     Ok(output_path)
 }
@@ -1459,8 +1463,10 @@ fn write_empty_commit(
     })
     .map_err(|error| error.to_string())?;
     crate::ensure_private_dir(&commits_dir).map_err(|error| error.to_string())?;
-    crate::atomic_bytes(&lines_path, &lines_bytes, false).map_err(|error| error.to_string())?;
-    crate::atomic_bytes(&output_path, &bytes, false).map_err(|error| error.to_string())?;
+    crate::atomic_derive_result(&lines_path, &lines_bytes, false)
+        .map_err(|error| format!("{}: {error}", lines_path.display()))?;
+    crate::atomic_derive_result(&output_path, &bytes, false)
+        .map_err(|error| format!("{}: {error}", output_path.display()))?;
     Ok(output_path)
 }
 

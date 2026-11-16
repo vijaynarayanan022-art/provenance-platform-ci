@@ -2406,6 +2406,57 @@ fn read_blob(path: &Path, expected_sha: &str) -> Option<Vec<u8>> {
     let bytes = fs::read(path).ok()?;
     (hash(&bytes) == expected_sha).then_some(bytes)
 }
+pub(crate) fn read_derive_result(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        retry_derive_result_io(path, || fs::read(path))
+    }
+    #[cfg(not(windows))]
+    {
+        fs::read(path)
+    }
+}
+pub(crate) fn atomic_derive_result(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        retry_derive_result_io(path, || atomic_bytes(path, bytes, sync))
+    }
+    #[cfg(not(windows))]
+    {
+        atomic_bytes(path, bytes, sync)
+    }
+}
+#[cfg(windows)]
+fn retry_derive_result_io<T>(
+    path: &Path,
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    const RETRY_BUDGET: Duration = Duration::from_secs(3);
+    const MAX_DELAY: Duration = Duration::from_millis(200);
+    let started = Instant::now();
+    let mut delay = Duration::from_millis(10);
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let retryable = match error.raw_os_error() {
+                    Some(32 | 33) => true,
+                    Some(5) => fs::metadata(path).is_ok_and(|metadata| metadata.is_file()),
+                    _ => false,
+                };
+                if !retryable {
+                    return Err(error);
+                }
+                let remaining = RETRY_BUDGET.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(delay.min(remaining));
+                delay = (delay * 2).min(MAX_DELAY);
+            }
+        }
+    }
+}
 fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     let parent = path
         .parent()

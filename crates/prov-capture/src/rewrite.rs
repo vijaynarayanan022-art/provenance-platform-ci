@@ -158,12 +158,16 @@ pub(crate) fn apply(root: &Path, store: &Path, commit: &str) -> Result<(), Strin
     let commits_dir = store.join("commits");
     let report_path = commits_dir.join(format!("{commit}.json"));
     let sidecar_path = commits_dir.join(format!("{commit}.lines.json"));
-    let mut report: CommitReport =
-        serde_json::from_slice(&fs::read(&report_path).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
-    let mut sidecar: LinesSidecar =
-        serde_json::from_slice(&fs::read(&sidecar_path).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
+    let mut report: CommitReport = serde_json::from_slice(
+        &crate::read_derive_result(&report_path)
+            .map_err(|error| format!("{}: {error}", report_path.display()))?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut sidecar: LinesSidecar = serde_json::from_slice(
+        &crate::read_derive_result(&sidecar_path)
+            .map_err(|error| format!("{}: {error}", sidecar_path.display()))?,
+    )
+    .map_err(|error| error.to_string())?;
 
     let carry = match collect_and_carry(root, &commits_dir, &mut report, &mut sidecar, started) {
         Ok(carry) => carry,
@@ -197,8 +201,10 @@ pub(crate) fn apply(root: &Path, store: &Path, commit: &str) -> Result<(), Strin
     if started.elapsed() >= REWRITE_BUDGET {
         return Ok(());
     }
-    crate::atomic_bytes(&sidecar_path, &sidecar_bytes, false).map_err(|error| error.to_string())?;
-    crate::atomic_bytes(&report_path, &report_bytes, false).map_err(|error| error.to_string())?;
+    crate::atomic_derive_result(&sidecar_path, &sidecar_bytes, false)
+        .map_err(|error| format!("{}: {error}", sidecar_path.display()))?;
+    crate::atomic_derive_result(&report_path, &report_bytes, false)
+        .map_err(|error| format!("{}: {error}", report_path.display()))?;
     Ok(())
 }
 

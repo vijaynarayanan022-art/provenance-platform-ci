@@ -4033,6 +4033,78 @@ fn derive_fails_when_sidecar_destination_is_a_directory() {
     fixture.drop_root();
 }
 
+#[cfg(windows)]
+#[test]
+fn derive_retries_when_result_files_are_locked_for_read() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::mpsc;
+
+    let fixture = Fixture::new("locked-result-files");
+    fixture.hook("Stop", "locked-result-files");
+    git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "empty result commit"],
+    );
+    let commit = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    assert!(derive(&fixture, &commit).status.success());
+
+    for destination in [fixture.derived_path(&commit), fixture.lines_path(&commit)] {
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let handle = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(destination)
+                .unwrap();
+            opened_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            drop(handle);
+        });
+        opened_rx.recv().unwrap();
+
+        let result = derive(&fixture, &commit);
+        holder.join().unwrap();
+        assert!(
+            result.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&result.stderr),
+            String::from_utf8_lossy(&result.stdout)
+        );
+    }
+    fixture.drop_root();
+}
+
+#[cfg(windows)]
+#[test]
+fn derive_fails_promptly_when_result_destination_is_a_directory() {
+    let fixture = Fixture::new("result-directory-prompt");
+    fixture.hook("Stop", "result-directory-prompt");
+    git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "empty result commit"],
+    );
+    let commit = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    let sidecar_path = fixture.lines_path(&commit);
+    fs::create_dir_all(&sidecar_path).unwrap();
+
+    let started = Instant::now();
+    let result = derive(&fixture, &commit);
+    let elapsed = started.elapsed();
+    assert!(!result.status.success());
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "directory destination took {elapsed:?} to fail"
+    );
+    let sidecar_path_display = sidecar_path.display().to_string();
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains(&sidecar_path_display),
+        "stderr did not identify {}: {}",
+        sidecar_path_display,
+        String::from_utf8_lossy(&result.stderr)
+    );
+    fixture.drop_root();
+}
+
 #[test]
 fn pending_skips_dead_commit_and_continues_then_doctor_reports_zero() {
     let fixture = Fixture::new("pending-dead-commit");
