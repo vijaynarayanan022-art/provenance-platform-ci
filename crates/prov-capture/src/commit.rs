@@ -20,7 +20,7 @@ const MAX_PARENT_MATCH_CELLS: usize = 1_000_000;
 const MAX_DELAYED_EVENTS_PER_PATH: usize = 64;
 const MIXED_SCORE_MILLI: u16 = 840;
 const PRIOR_AI_EDIT_LOOKUP_BUDGET: Duration = Duration::from_secs(2);
-pub const LINE_SURVIVAL_VERSION: &str = "unobserved-mixed-cross-commit-v2";
+pub const LINE_SURVIVAL_VERSION: &str = "unobserved-position-mapped-v3";
 const UNOBSERVED_COVERAGE_MEDIUM_PERCENT: usize = 5;
 const UNOBSERVED_COVERAGE_LOW_PERCENT: usize = 20;
 const UNOBSERVED_COVERAGE_BASIS: [&str; 2] = ["X_UNOBSERVED_EDIT", "X_UNOBSERVED_EDIT_IN_FILE"];
@@ -319,6 +319,8 @@ struct EventDecisionTrace {
     tool_use_id: Option<String>,
     operation: Option<String>,
     checks: Vec<ExplainCheck>,
+    step_index: Option<usize>,
+    position_mapping_line_numbers: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -948,7 +950,7 @@ fn derive_resolved_commit(
                     .is_some_and(|bytes| normalize_eol(&bytes) == normalized_committed)
             })
         });
-        let (mut steps, mut evidence) = steps_for_events(
+        let (mut steps, mut evidence, mut event_traces) = steps_for_events_with_trace(
             store,
             &selected_events,
             &parent_content,
@@ -975,6 +977,7 @@ fn derive_resolved_commit(
             ) {
                 steps = vec![fallback];
                 evidence = "time_cut";
+                event_traces.clear();
             } else {
                 unreadable_files += 1;
                 attributions.extend(unknown_attributions(
@@ -1018,14 +1021,28 @@ fn derive_resolved_commit(
             None
         };
         let use_unobserved_survival = survival_steps.is_some();
+        let mapping_candidates = position_mapping_candidates(&event_traces);
         let mut evidence_input = Evidence {
             parent: normalized_parent.clone(),
             steps: survival_steps.unwrap_or(steps),
         };
-        let mut attributed_lines = if use_unobserved_survival {
-            derive::derive_lines_with_unobserved_edits(&evidence_input, &normalized_committed)
+        let (mut attributed_lines, _, protected_position_lines) = if use_unobserved_survival {
+            let result = derive::derive_lines_with_position_mapping(
+                &evidence_input,
+                &normalized_committed,
+                &mapping_candidates,
+            );
+            (
+                result.lines,
+                result.position_mappings,
+                result.protected_committed_lines,
+            )
         } else {
-            derive::derive_lines_with_attribution(&evidence_input, &normalized_committed)
+            (
+                derive::derive_lines_with_attribution(&evidence_input, &normalized_committed),
+                Vec::new(),
+                HashSet::new(),
+            )
         };
         let has_ai_source_step: Vec<_> = attributed_lines
             .iter()
@@ -1057,6 +1074,7 @@ fn derive_resolved_commit(
             if !attributed.line.added
                 || attributed.line.blank
                 || attributed.line.label != derive::Label::Unknown
+                || protected_position_lines.contains(&line_index)
             {
                 continue;
             }
@@ -1115,6 +1133,7 @@ fn derive_resolved_commit(
                             line.line.added
                                 && !line.line.blank
                                 && line.line.label == derive::Label::Unknown
+                                && !protected_position_lines.contains(&index)
                         })
                     })
                     .collect::<Vec<_>>();
@@ -1167,6 +1186,7 @@ fn derive_resolved_commit(
                     && line.line.added
                     && !line.line.blank
                     && line.line.label == derive::Label::Unknown
+                    && !protected_position_lines.contains(index)
             })
             .map(|(index, _)| index)
             .collect();
@@ -1659,7 +1679,7 @@ pub fn explain_commit(
                 .is_some_and(|bytes| normalize_eol(&bytes) == normalized_committed)
         })
     });
-    let (mut steps, mut evidence, event_traces) = steps_for_events_with_trace(
+    let (mut steps, mut evidence, mut event_traces) = steps_for_events_with_trace(
         &store,
         &selected_events,
         &parent_content,
@@ -1686,6 +1706,7 @@ pub fn explain_commit(
         ) {
             steps = vec![fallback];
             evidence = "time_cut";
+            event_traces.clear();
         } else {
             return Err(
                 "snapshot evidence is missing; derivation would mark this file unknown".into(),
@@ -1697,15 +1718,31 @@ pub fn explain_commit(
     } else {
         None
     };
+    let use_unobserved_survival = survival_steps.is_some();
+    let mapping_candidates = position_mapping_candidates(&event_traces);
     let mut evidence_input = Evidence {
         parent: normalized_parent.clone(),
         steps: survival_steps.unwrap_or(steps),
     };
-    let mut attributed_lines = if evidence == "time_cut" {
-        derive::derive_lines_with_unobserved_edits(&evidence_input, &normalized_committed)
-    } else {
-        derive::derive_lines_with_attribution(&evidence_input, &normalized_committed)
-    };
+    let (mut attributed_lines, position_mapping_traces, protected_position_lines) =
+        if use_unobserved_survival {
+            let result = derive::derive_lines_with_position_mapping(
+                &evidence_input,
+                &normalized_committed,
+                &mapping_candidates,
+            );
+            (
+                result.lines,
+                result.position_mappings,
+                result.protected_committed_lines,
+            )
+        } else {
+            (
+                derive::derive_lines_with_attribution(&evidence_input, &normalized_committed),
+                Vec::new(),
+                HashSet::new(),
+            )
+        };
     let has_ai_source_step: Vec<_> = attributed_lines
         .iter()
         .map(|line| {
@@ -1722,6 +1759,7 @@ pub fn explain_commit(
                 && line.line.added
                 && !line.line.blank
                 && line.line.label == derive::Label::Unknown
+                && !protected_position_lines.contains(index)
         })
         .map(|(index, _)| index)
         .collect();
@@ -1906,6 +1944,43 @@ pub fn explain_commit(
                 "unobserved_edit_in_file",
                 attributed.unobserved_edit.is_none(),
                 format!("unobserved_edit={:?}", attributed.unobserved_edit),
+            ));
+            let line_mappings: Vec<_> = position_mapping_traces
+                .iter()
+                .filter(|mapping| mapping.committed_line == Some(attributed.line.line))
+                .collect();
+            checks.push(explain_check(
+                "position_mapping",
+                attributed.unobserved_edit == Some(derive::UnobservedEditKind::PositionMapped),
+                if line_mappings.is_empty() {
+                    format!(
+                        "snapshot_line=unavailable; committed_line={}; equal_region_bounds=unavailable; decision=no_position_mapping",
+                        attributed.line.line
+                    )
+                } else {
+                    line_mappings
+                        .iter()
+                        .map(|mapping| {
+                            let bounds = mapping.equal_region_bounds.map_or_else(
+                                || "unavailable".to_owned(),
+                                |[snapshot_start, snapshot_end, committed_start, committed_end]| {
+                                    format!(
+                                        "snapshot={snapshot_start}-{snapshot_end},committed={committed_start}-{committed_end}"
+                                    )
+                                },
+                            );
+                            format!(
+                                "snapshot_line={}; committed_line={}; equal_region_bounds={bounds}; decision={}",
+                                mapping.snapshot_line,
+                                mapping
+                                    .committed_line
+                                    .map_or_else(|| "unavailable".to_owned(), |line| line.to_string()),
+                                mapping.decision
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                },
             ));
             checks.push(explain_check(
                 "exclusion_rules",
@@ -2835,6 +2910,7 @@ fn event_predates_parent(
             .is_some_and(|head| !parent.is_empty() && head != parent && ancestors.contains(head))
 }
 
+#[cfg(test)]
 fn steps_for_events(
     store: &Path,
     events: &[&EventRecord],
@@ -2987,7 +3063,7 @@ fn steps_for_events_with_trace(
             .or_else(|| {
                 (event.before_sha.is_none() && previous_snapshot.is_empty()).then(Vec::new)
             });
-        let (direct_lines, direct_line_numbers, checks) = if is_ai {
+        let (direct_lines, direct_line_numbers, position_mapping_line_numbers, checks) = if is_ai {
             verified_structured_lines(
                 event,
                 before_snapshot.as_deref(),
@@ -2998,13 +3074,16 @@ fn steps_for_events_with_trace(
                 &evidence_comparison,
             )
         } else {
-            (Vec::new(), Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
+        let step_index = steps.len();
         decision_traces.push(EventDecisionTrace {
             event: event.event.clone(),
             tool_use_id: event.tool_use_id.clone(),
             operation: event.operation.clone(),
             checks,
+            step_index: Some(step_index),
+            position_mapping_line_numbers,
         });
         let attribution = Some(derive::StepAttribution {
             adapter_id: event.tool.clone(),
@@ -3055,6 +3134,23 @@ fn steps_for_events_with_trace(
     (steps, evidence, decision_traces)
 }
 
+fn position_mapping_candidates(
+    traces: &[EventDecisionTrace],
+) -> Vec<derive::PositionMappingCandidate> {
+    traces
+        .iter()
+        .filter_map(|trace| {
+            let step_index = trace.step_index?;
+            (!trace.position_mapping_line_numbers.is_empty()).then(|| {
+                derive::PositionMappingCandidate {
+                    step_index,
+                    snapshot_line_numbers: trace.position_mapping_line_numbers.clone(),
+                }
+            })
+        })
+        .collect()
+}
+
 fn verified_structured_lines(
     event: &EventRecord,
     raw_before: Option<&[u8]>,
@@ -3063,7 +3159,7 @@ fn verified_structured_lines(
     normalized_after: &[u8],
     evidence_exact: bool,
     evidence_comparison: &str,
-) -> (Vec<Vec<u8>>, Vec<usize>, Vec<ExplainCheck>) {
+) -> (Vec<Vec<u8>>, Vec<usize>, Vec<usize>, Vec<ExplainCheck>) {
     let before_actual = raw_before.map(crate::hash);
     let before_sha_matches = match (event.before_sha.as_deref(), before_actual.as_deref()) {
         (None, Some(actual)) => normalized_before.is_empty() && actual == crate::hash(&[]),
@@ -3139,16 +3235,22 @@ fn verified_structured_lines(
             evidence_comparison.to_owned(),
         ),
     ];
-    if checks.iter().any(|check| !check.passed) {
-        return (Vec::new(), Vec::new(), checks);
+    if checks.iter().take(7).any(|check| !check.passed) {
+        return (Vec::new(), Vec::new(), Vec::new(), checks);
     }
     let old = commit_split_lines(normalized_before);
     let new = commit_split_lines(normalized_after);
-    let added = capture_diff_slices(Algorithm::Myers, &old, &new)
+    let mut added = Vec::new();
+    let mut added_line_numbers = Vec::new();
+    for operation in capture_diff_slices(Algorithm::Myers, &old, &new)
         .iter()
         .filter(|op| op.tag() != DiffTag::Equal)
-        .flat_map(|op| op.new_range().map(|index| new[index].clone()))
-        .collect::<Vec<_>>();
+    {
+        for index in operation.new_range() {
+            added.push(new[index].clone());
+            added_line_numbers.push(index + 1);
+        }
+    }
     let nonempty = !added.is_empty();
     let mut checks = checks;
     checks.push(explain_check(
@@ -3156,14 +3258,17 @@ fn verified_structured_lines(
         nonempty,
         format!("verified_added_line_count={}", added.len()),
     ));
-    if nonempty {
+    if !nonempty {
+        return (Vec::new(), Vec::new(), Vec::new(), checks);
+    }
+    if evidence_exact {
         let line_numbers = actual_ranges
             .iter()
             .flat_map(|[start, end]| *start..=*end)
             .collect();
-        (added, line_numbers, checks)
+        (added, line_numbers, Vec::new(), checks)
     } else {
-        (Vec::new(), Vec::new(), checks)
+        (Vec::new(), Vec::new(), added_line_numbers, checks)
     }
 }
 
@@ -3343,6 +3448,8 @@ fn missing_snapshot_trace(
         tool_use_id: event.tool_use_id.clone(),
         operation: event.operation.clone(),
         checks,
+        step_index: None,
+        position_mapping_line_numbers: Vec::new(),
     }
 }
 
@@ -3447,6 +3554,9 @@ fn attribution_ranges_with_prior_origin(
             Some(derive::UnobservedEditKind::ExactSurvivorInChangedFile) => {
                 push_basis(&mut limiting_basis, "X_UNOBSERVED_EDIT_IN_FILE");
             }
+            Some(derive::UnobservedEditKind::PositionMapped) => {
+                push_basis(&mut limiting_basis, "X_UNOBSERVED_EDIT_IN_FILE");
+            }
             Some(derive::UnobservedEditKind::MixedByTokenOverlap)
             | Some(derive::UnobservedEditKind::UnmatchedUnknown) => {
                 push_basis(&mut limiting_basis, "X_UNOBSERVED_EDIT");
@@ -3460,7 +3570,12 @@ fn attribution_ranges_with_prior_origin(
             None => {}
         }
         let score_step = step.cloned();
-        let score = score_for_label(label, score_step.as_ref(), &limiting_basis);
+        let score =
+            if attributed.unobserved_edit == Some(derive::UnobservedEditKind::PositionMapped) {
+                Some(0.92)
+            } else {
+                score_for_label(label, score_step.as_ref(), &limiting_basis)
+            };
         let confidence_band = match label {
             derive::Label::Unknown => "none",
             derive::Label::AiDirect
@@ -3478,6 +3593,9 @@ fn attribution_ranges_with_prior_origin(
             confidence_band: confidence_band.into(),
             primary_basis: if label == derive::Label::Unknown {
                 None
+            } else if attributed.unobserved_edit == Some(derive::UnobservedEditKind::PositionMapped)
+            {
+                Some("EXACT_FRAGMENT_MATCH".into())
             } else if attributed.unobserved_edit
                 == Some(derive::UnobservedEditKind::MixedByTokenOverlap)
                 || attributed.unobserved_edit == Some(derive::UnobservedEditKind::MixedBySimilarity)
@@ -3492,6 +3610,9 @@ fn attribution_ranges_with_prior_origin(
             },
             supporting_basis: if label == derive::Label::Unknown {
                 Vec::new()
+            } else if attributed.unobserved_edit == Some(derive::UnobservedEditKind::PositionMapped)
+            {
+                vec!["POSITION_MAPPED".into()]
             } else if attributed.unobserved_edit
                 == Some(derive::UnobservedEditKind::MixedByTokenOverlap)
             {
