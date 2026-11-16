@@ -247,6 +247,7 @@ When an eligible unknown added line replaces a nonblank parent line, derivation 
 
 This is a **proposed spec change pending sign-off** on three decisions: use `mixed` for the human edit of prior AI text; follow the line to its origin without a fixed ancestry depth; and count carried lines toward unobserved-edit coverage. Known limit: the origin commit must already have a current stored derivation in the local provenance store.
 
+
 ## Round 36: position-mapped survival for hand-edited files
 
 For a structured-edit AI event with available after-snapshot bytes and passing `before_sha`, `after_sha`, and `line_ranges` gates, derivation diffs the normalized snapshot against committed content. AI-added snapshot lines in equal diff regions map by position to committed lines; a unique claim is `ai_strong` at 0.92 with `EXACT_FRAGMENT_MATCH`, supporting `POSITION_MAPPED`, and limiting `X_UNOBSERVED_EDIT_IN_FILE`. Competing event claims leave the committed line unknown with `CONFLICTING_EVIDENCE`. Changed, moved, deleted, and unmatched lines stay on existing mixed/unknown rules. The bounded mapping falls back to existing behavior when its work cap is reached.
@@ -254,3 +255,21 @@ For a structured-edit AI event with available after-snapshot bytes and passing `
 This position-mapping rule is a **PROPOSED spec change pending sign-off**. The line-survival version is now `unobserved-position-mapped-v3`. This also versions the r34 prior-AI carry rule: stored results using the previous version are stale for that rule until re-derived. Re-derive the range oldest commit first so each later commit can use the refreshed origin report.
 
 Known limit: on hand-edited files, only verified structured-edit events with stored snapshots can position-map unchanged AI lines. Large files that exceed the mapping cap, events with failed gates, and lines outside equal regions retain the prior fallback behavior; repeated text alone does not establish a position.
+## Round 35: discard-boundary characterization
+
+No behavior change is proposed in this round. The characterization uses synthetic snapshot-diff edits with real Git operations and the existing Codex helpers; structured-edit (`ai_direct`) discard cases are not covered here and will be covered by the live pass.
+
+| Scenario | Main label/result today | Characterization |
+| --- | --- | --- |
+| S1 restore F, then write similar human text | `mixed` (0.84) | Known limit: indistinguishable from an in-place human edit of an AI line |
+| S2 restore F, then make a new AI edit | `ai_strong` from the second edit | The later event's content is credited |
+| S3 edit F and G, checkout G, commit F | F `ai_strong`; G absent | Discarded G evidence does not leak into F |
+| S4 stash AI F, commit an unrelated human change, leave stash | No AI credit in the commit; F absent | Stashed text is not part of the committed change |
+| S5 stash/pop unchanged, then commit F | `ai_strong`, not `ai_direct` | Restored snapshot bytes remain eligible for strong credit |
+| S6 force-checkout another branch, then write similar human text | `mixed` (0.84) | Known limit: indistinguishable from an in-place human edit of an AI line |
+| S7 restore staged content only | `ai_strong` | Worktree evidence is retained |
+| S8 restore F from an older commit, then write similar human text | `mixed` (0.84) | Known limit: indistinguishable from an in-place human edit of an AI line |
+| S9 hard-reset regression | Fresh post-reset edit `ai_strong` | Existing r27 behavior remains correct |
+| S10 restore, then human retypes identical text | `ai_strong` | Known limit: identical retyping is indistinguishable from unchanged AI bytes |
+
+Git restore and stash operations leave no hook-visible trace. The system observes snapshots and subsequent hook events, not the Git operation that changed the worktree. Consequently, S1/S6/S8 cannot be reliably distinguished from ordinary same-window human edits that the existing policy labels `mixed`; S10 cannot distinguish a human retype from unchanged identical bytes. S4 and S5 show the current outcomes for an unrestored stash and an unchanged stash/pop respectively. These are known limits, not behavior changes for this round.

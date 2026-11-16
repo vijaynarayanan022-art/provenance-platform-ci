@@ -897,6 +897,189 @@ fn ai_commit(fixture: &Fixture, contents: &str, message: &str) -> String {
     commit
 }
 
+fn synthetic_ai_edit(fixture: &Fixture, path: &str, tool: &str, contents: &[u8]) {
+    fixture.hook("PreToolUse", tool);
+    fs::write(fixture.repo.join(path), contents).unwrap();
+    fixture.hook("PostToolUse", tool);
+}
+
+fn derive_report(fixture: &Fixture, commit: &str) -> Value {
+    let result = derive(fixture, commit);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    fixture.derived_value(commit)
+}
+
+#[test]
+fn r35_discard_scenarios_characterisation() {
+    let s1 = Fixture::new("r35-char-s1");
+    synthetic_ai_edit(&s1, "tracked.txt", "s1-ai", b"one\nreturn total + tax\n");
+    git(&s1.repo, &["restore", "tracked.txt"]);
+    fs::write(s1.repo.join("tracked.txt"), b"one\nreturn total + fee\n").unwrap();
+    let commit = s1.commit("S1 restored then human rewrite");
+    let report = derive_report(&s1, &commit);
+    assert_eq!(file(&report, "tracked.txt")["mixed"], 1);
+    let sidecar = s1.sidecar_value(&commit);
+    let attribution = attribution_for(&sidecar, "tracked.txt", "mixed");
+    assert!(!attribution["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_DISCARDED_EVIDENCE")));
+    let explanation = explain_json(&s1, &commit, "tracked.txt", Some(2));
+    assert!(!explanation["lines"][0]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["condition"] == "discard_boundary"));
+    s1.drop_root();
+
+    let s2 = Fixture::new("r35-char-s2");
+    synthetic_ai_edit(&s2, "tracked.txt", "s2-ai-first", b"one\nfirst AI text\n");
+    git(&s2.repo, &["restore", "tracked.txt"]);
+    synthetic_ai_edit(&s2, "tracked.txt", "s2-ai-second", b"one\nsecond AI text\n");
+    let commit = s2.commit("S2 restored then new AI edit");
+    let report = derive_report(&s2, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    let sidecar = s2.sidecar_value(&commit);
+    let attribution = attribution_for(&sidecar, "tracked.txt", "ai_strong");
+    assert_eq!(attribution["source"]["sessionRef"], "s2-ai-second");
+    s2.drop_root();
+
+    let s3 = Fixture::new("r35-char-s3");
+    fs::write(s3.repo.join("G.txt"), b"base G\n").unwrap();
+    git(&s3.repo, &["add", "."]);
+    git(&s3.repo, &["commit", "-m", "add G"]);
+    synthetic_ai_edit(&s3, "tracked.txt", "s3-ai", b"one\nAI F\n");
+    synthetic_ai_edit(&s3, "G.txt", "s3-ai", b"base G\nAI G\n");
+    git(&s3.repo, &["checkout", "--", "G.txt"]);
+    git(&s3.repo, &["add", "tracked.txt"]);
+    git(&s3.repo, &["commit", "-m", "S3 commit F only"]);
+    let commit = git_text(&s3.repo, &["rev-parse", "HEAD"]);
+    let report = derive_report(&s3, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    assert!(!report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["path"] == "G.txt"));
+    s3.drop_root();
+
+    let s4 = Fixture::new("r35-char-s4");
+    synthetic_ai_edit(&s4, "tracked.txt", "s4-ai", b"one\nstashed AI\n");
+    git(&s4.repo, &["stash", "push", "-m", "discarded AI"]);
+    fs::write(s4.repo.join("other.txt"), b"human change\n").unwrap();
+    let commit = s4.commit("S4 unrelated human change");
+    let report = derive_report(&s4, &commit);
+    assert!(report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["path"] != "tracked.txt" && entry["ai_strong"] == 0));
+    assert!(!git_text(&s4.repo, &["stash", "list"]).is_empty());
+    s4.drop_root();
+
+    let s5 = Fixture::new("r35-char-s5");
+    synthetic_ai_edit(&s5, "tracked.txt", "s5-ai", b"one\nstashed AI\n");
+    git(&s5.repo, &["stash", "push", "-m", "unchanged AI"]);
+    git(&s5.repo, &["stash", "pop"]);
+    let commit = s5.commit("S5 unchanged stash pop");
+    let report = derive_report(&s5, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    assert_eq!(file(&report, "tracked.txt")["ai_direct"], 0);
+    s5.drop_root();
+
+    let s6 = Fixture::new("r35-char-s6");
+    git(&s6.repo, &["branch", "other-branch"]);
+    synthetic_ai_edit(&s6, "tracked.txt", "s6-ai", b"one\nreturn total + tax\n");
+    git(&s6.repo, &["checkout", "-f", "other-branch"]);
+    fs::write(s6.repo.join("tracked.txt"), b"one\nreturn total + fee\n").unwrap();
+    let commit = s6.commit("S6 other branch human text");
+    let report = derive_report(&s6, &commit);
+    assert_eq!(file(&report, "tracked.txt")["mixed"], 1);
+    let sidecar = s6.sidecar_value(&commit);
+    assert!(
+        !attribution_for(&sidecar, "tracked.txt", "mixed")["limitingBasis"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("X_DISCARDED_EVIDENCE"))
+    );
+    assert!(
+        !explain_json(&s6, &commit, "tracked.txt", Some(2))["lines"][0]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["condition"] == "discard_boundary")
+    );
+    s6.drop_root();
+
+    let s7 = Fixture::new("r35-char-s7");
+    synthetic_ai_edit(&s7, "tracked.txt", "s7-ai", b"one\nAI retained\n");
+    git(&s7.repo, &["add", "tracked.txt"]);
+    git(&s7.repo, &["restore", "--staged", "tracked.txt"]);
+    let commit = s7.commit("S7 unstaged AI evidence");
+    let report = derive_report(&s7, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    assert_eq!(file(&report, "tracked.txt")["evidence"], "exact");
+    s7.drop_root();
+
+    let s8 = Fixture::new("r35-char-s8");
+    synthetic_ai_edit(&s8, "tracked.txt", "s8-ai", b"one\nreturn total + tax\n");
+    let older = git_text(&s8.repo, &["rev-parse", "HEAD"]);
+    git(&s8.repo, &["restore", "--source", &older, "tracked.txt"]);
+    fs::write(s8.repo.join("tracked.txt"), b"one\nreturn total + fee\n").unwrap();
+    let commit = s8.commit("S8 restored from older commit");
+    let report = derive_report(&s8, &commit);
+    assert_eq!(file(&report, "tracked.txt")["mixed"], 1);
+    let sidecar = s8.sidecar_value(&commit);
+    assert!(
+        !attribution_for(&sidecar, "tracked.txt", "mixed")["limitingBasis"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("X_DISCARDED_EVIDENCE"))
+    );
+    assert!(
+        !explain_json(&s8, &commit, "tracked.txt", Some(2))["lines"][0]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["condition"] == "discard_boundary")
+    );
+    s8.drop_root();
+
+    let s9 = Fixture::new("r35-char-s9");
+    let parent = git_text(&s9.repo, &["rev-parse", "HEAD"]);
+    synthetic_ai_edit(
+        &s9,
+        "tracked.txt",
+        "s9-discarded-ai",
+        b"one\nreset AI text\n",
+    );
+    let discarded = s9.commit("discarded text");
+    assert_eq!(
+        file(&derive_report(&s9, &discarded), "tracked.txt")["ai_strong"],
+        1
+    );
+    git(&s9.repo, &["reset", "--hard", &parent]);
+    synthetic_ai_edit(&s9, "tracked.txt", "s9-fresh-ai", b"one\nfresh AI text\n");
+    let commit = s9.commit("fresh AI after hard reset");
+    let report = derive_report(&s9, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    s9.drop_root();
+
+    let s10 = Fixture::new("r35-char-s10");
+    synthetic_ai_edit(&s10, "tracked.txt", "s10-ai", b"one\nidentical text\n");
+    git(&s10.repo, &["restore", "tracked.txt"]);
+    fs::write(s10.repo.join("tracked.txt"), b"one\nidentical text\n").unwrap();
+    let commit = s10.commit("S10 human retypes identical text");
+    let report = derive_report(&s10, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    assert_eq!(file(&report, "tracked.txt")["ai_direct"], 0);
+    s10.drop_root();
+}
+
 const S_PY_AI_PARENT: &str =
     "def add(a,b):\n    return a + b\ndef sub(a,b):\n    return a - b\ndef neg(a):\n    return -a\n";
 
