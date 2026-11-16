@@ -2464,27 +2464,99 @@ fn is_transient_result_io_error(error: &std::io::Error, path: &Path) -> bool {
     }
 }
 #[cfg(windows)]
-fn extended_length_path(path: &Path) -> PathBuf {
+fn extended_length_path(path: &Path, use_extended_length: bool) -> PathBuf {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-    if !path.is_absolute() {
+    if !use_extended_length {
         return path.to_path_buf();
     }
 
-    let wide: Vec<_> = path.as_os_str().encode_wide().collect();
+    let original: Vec<_> = path.as_os_str().encode_wide().collect();
     const EXTENDED_PREFIX: [u16; 4] = [92, 92, 63, 92];
-    const DEVICE_PREFIX: [u16; 4] = [92, 92, 46, 92];
-    if wide.starts_with(&EXTENDED_PREFIX) || wide.starts_with(&DEVICE_PREFIX) {
+    const EXTENDED_UNC_PREFIX: [u16; 8] = [92, 92, 63, 92, 85, 78, 67, 92];
+    if !original.starts_with(&EXTENDED_PREFIX) && !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if !original.starts_with(&EXTENDED_PREFIX) && original.starts_with(&[92, 92, 46, 92]) {
         return path.to_path_buf();
     }
 
-    let mut extended = Vec::with_capacity(wide.len() + 8);
-    if wide.starts_with(&[92, 92]) {
-        extended.extend_from_slice(&[92, 92, 63, 92, 85, 78, 67, 92]);
-        extended.extend_from_slice(&wide[2..]);
+    let normalized: Vec<_> = original
+        .iter()
+        .map(|&unit| if unit == 47 { 92 } else { unit })
+        .collect();
+    let (root, rest): (Vec<u16>, Vec<&[u16]>) = if normalized.starts_with(&EXTENDED_UNC_PREFIX) {
+        let components = normalized[EXTENDED_UNC_PREFIX.len()..]
+            .split(|unit| *unit == 92)
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        let [server, share, remaining @ ..] = components.as_slice() else {
+            return path.to_path_buf();
+        };
+        let mut root = EXTENDED_UNC_PREFIX.to_vec();
+        root.extend_from_slice(server);
+        root.push(92);
+        root.extend_from_slice(share);
+        root.push(92);
+        (root, remaining.to_vec())
+    } else if normalized.starts_with(&EXTENDED_PREFIX) {
+        if normalized.len() < 7 || normalized[5] != 58 || normalized[6] != 92 {
+            return path.to_path_buf();
+        }
+        (
+            normalized[..7].to_vec(),
+            normalized[7..]
+                .split(|unit| *unit == 92)
+                .collect::<Vec<_>>(),
+        )
+    } else if normalized.starts_with(&[92, 92]) {
+        let components = normalized[2..]
+            .split(|unit| *unit == 92)
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        let [server, share, remaining @ ..] = components.as_slice() else {
+            return path.to_path_buf();
+        };
+        let mut root = EXTENDED_UNC_PREFIX.to_vec();
+        root.extend_from_slice(server);
+        root.push(92);
+        root.extend_from_slice(share);
+        root.push(92);
+        (root, remaining.to_vec())
+    } else if normalized.len() >= 3 && normalized[1] == 58 && normalized[2] == 92 {
+        let mut root = EXTENDED_PREFIX.to_vec();
+        root.extend_from_slice(&normalized[..3]);
+        (
+            root,
+            normalized[3..]
+                .split(|unit| *unit == 92)
+                .collect::<Vec<_>>(),
+        )
     } else {
-        extended.extend_from_slice(&EXTENDED_PREFIX);
-        extended.extend_from_slice(&wide);
+        return path.to_path_buf();
+    };
+
+    let mut components: Vec<&[u16]> = Vec::new();
+    for component in rest {
+        if component.is_empty() || *component == [46] {
+            continue;
+        }
+        if *component == [46, 46] {
+            components.pop();
+        } else {
+            components.push(component);
+        }
+    }
+
+    let mut extended = root;
+    for component in components {
+        if extended.last() != Some(&92) {
+            extended.push(92);
+        }
+        extended.extend_from_slice(component);
+    }
+    if normalized.last() == Some(&92) && extended.last() != Some(&92) {
+        extended.push(92);
     }
     PathBuf::from(std::ffi::OsString::from_wide(&extended))
 }
@@ -2514,8 +2586,14 @@ fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     #[cfg(windows)]
     if path.exists() {
         use std::os::windows::ffi::OsStrExt;
-        let source_path = extended_length_path(&temp);
-        let destination_path = extended_length_path(path);
+        let use_extended_length = temp
+            .as_os_str()
+            .encode_wide()
+            .count()
+            .max(path.as_os_str().encode_wide().count())
+            >= 200;
+        let source_path = extended_length_path(&temp, use_extended_length);
+        let destination_path = extended_length_path(path, use_extended_length);
         let source: Vec<u16> = source_path
             .as_os_str()
             .encode_wide()
@@ -2874,6 +2952,8 @@ pub fn process_json_timed(input: &[u8]) -> TimingSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt;
 
     #[cfg(windows)]
     fn result_io_test_dir(name: &str) -> PathBuf {
@@ -2938,6 +3018,70 @@ mod tests {
             &path
         ));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extended_length_path_handles_windows_path_forms() {
+        let short = PathBuf::from(r"C:\temp\short.txt");
+        assert_eq!(extended_length_path(&short, false), short);
+
+        let long_drive = PathBuf::from(format!(r"C:\{}", "segment\\".repeat(30)));
+        let extended_drive = extended_length_path(&long_drive, true);
+        assert!(extended_drive.to_string_lossy().starts_with(r"\\?\C:\"));
+
+        let forward_slashes = PathBuf::from(format!("C:/{}", "segment/".repeat(30)));
+        let normalized = extended_length_path(&forward_slashes, true);
+        assert!(normalized.to_string_lossy().starts_with(r"\\?\C:\"));
+        assert!(!normalized.to_string_lossy().contains('/'));
+
+        let unc = PathBuf::from(format!(r"\\server\share\{}", "segment\\".repeat(30)));
+        let extended_unc = extended_length_path(&unc, true);
+        assert!(extended_unc
+            .to_string_lossy()
+            .starts_with(r"\\?\UNC\server\share\"));
+
+        let verbatim = PathBuf::from(r"\\?\C:\already\verbatim.txt");
+        assert_eq!(extended_length_path(&verbatim, true), verbatim);
+
+        let relative = PathBuf::from(format!("relative\\{}", "segment\\".repeat(30)));
+        assert_eq!(extended_length_path(&relative, true), relative);
+
+        let parent_segment =
+            PathBuf::from(format!(r"C:\root\folder\..\base\{}", "segment".repeat(30)));
+        let normalized_parent = extended_length_path(&parent_segment, true);
+        assert!(normalized_parent
+            .to_string_lossy()
+            .starts_with(r"\\?\C:\root\base\"));
+        assert!(!normalized_parent.to_string_lossy().contains(r"\..\"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_bytes_overwrites_hook_state_path_with_forward_slash() {
+        let root = std::env::temp_dir().join(format!(
+            "prov-hook-verbatim-state-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination_prefix = format!(
+            "{}\\capture store\\hook-state-directory-long-enough-to-exercise-extended-paths\\repos\\{}\\state",
+            root.display(),
+            "a".repeat(64)
+        );
+        let destination = PathBuf::from(format!("{destination_prefix}/repo.json"));
+        let path_length = destination.as_os_str().encode_wide().count();
+        assert!(
+            (200..300).contains(&path_length),
+            "test destination length was {path_length}"
+        );
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"old state").unwrap();
+        atomic_bytes(&destination, b"new state", false).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new state");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3223,7 +3367,6 @@ mod tests {
             ) -> *mut std::ffi::c_void;
             fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
         }
-        let file = extended_length_path(&file);
         let wide: Vec<u16> = file.as_os_str().encode_wide().chain(Some(0)).collect();
         let handle = unsafe {
             CreateFileW(
