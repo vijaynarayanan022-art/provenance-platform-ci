@@ -404,7 +404,7 @@ fn prs_file_produces_dashboard_in_input_order() {
         json!({
             "engine": env!("CARGO_PKG_VERSION"),
             "algorithm": "derive-v1",
-            "line_survival": "unobserved-mixed-cross-commit-v2",
+            "line_survival": "unobserved-position-mapped-v3",
             "min_mixed_overlap": 0.5,
             "formula": "strict-v1",
             "eligibility": "non-blank-added-v1",

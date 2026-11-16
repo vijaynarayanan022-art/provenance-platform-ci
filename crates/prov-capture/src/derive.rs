@@ -562,19 +562,19 @@ fn position_map_lines(
     added: &[bool],
 ) -> PositionMapLines {
     let mut pending = Vec::new();
-    let mut seen = HashSet::new();
     for candidate in candidates {
         if candidate.step_index > last_ai_step
             || !matches!(ev.steps[candidate.step_index].kind, StepKind::Ai { .. })
         {
             continue;
         }
+        let mut candidate_lines = HashSet::new();
         for &line_number in &candidate.snapshot_line_numbers {
             let Some(snapshot_index) = line_number.checked_sub(1) else {
                 continue;
             };
             if snapshot_index >= split_lines(&ev.steps[candidate.step_index].after).len()
-                || !seen.insert((candidate.step_index, snapshot_index))
+                || !candidate_lines.insert(snapshot_index)
             {
                 continue;
             }
