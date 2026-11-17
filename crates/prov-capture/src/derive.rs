@@ -204,7 +204,7 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
     }
 
     let committed_lines = split_lines(committed);
-    let committed_owners = replay(
+    let mut committed_owners = replay(
         &previous,
         &owners,
         &committed_lines,
@@ -212,6 +212,13 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
         ev.steps.len(),
         &[],
         &[],
+    );
+    let identity_mapping_steps = identity_mapping_steps(ev, committed);
+    apply_identity_mapped_direct_ownership(
+        ev,
+        &identity_mapping_steps,
+        committed,
+        &mut committed_owners,
     );
     let added = added_lines(&parent, &committed_lines);
     let duplicate_owners = duplicate_owners(&committed_owners);
@@ -223,7 +230,17 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
             let owned = committed_owners[index];
             let duplicates = duplicate_owners[index];
             let candidates = owned.candidates | duplicates.candidates;
-            let ambiguous = owned.ambiguous || duplicates.ambiguous;
+            let ambiguous = if owned.owner == Owner::Direct
+                && is_identity_mapped_direct_line(
+                    ev,
+                    &identity_mapping_steps,
+                    owned.source_step,
+                    index + 1,
+                ) {
+                has_other_ai_candidate(line, owned.source_step, index + 1, ev)
+            } else {
+                owned.ambiguous || duplicates.ambiguous
+            };
             let label = if !added[index] || !all_candidates_have_ai_ancestry(candidates) {
                 Label::Unknown
             } else {
@@ -254,6 +271,93 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
             }
         })
         .collect()
+}
+
+fn apply_identity_mapped_direct_ownership(
+    evidence: &Evidence,
+    identity_mapping_steps: &[bool],
+    committed: &[u8],
+    owners: &mut [OwnedLine],
+) {
+    let committed_lines = split_lines(committed);
+    for (line_index, owner) in owners.iter_mut().enumerate() {
+        if owner.owner != Owner::Direct
+            || !is_identity_mapped_direct_line(
+                evidence,
+                identity_mapping_steps,
+                owner.source_step,
+                line_index + 1,
+            )
+        {
+            continue;
+        }
+        let Some(source_step) = owner.source_step else {
+            continue;
+        };
+        let line = committed_lines
+            .get(line_index)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if has_other_ai_candidate(line, Some(source_step), line_index + 1, evidence) {
+            continue;
+        }
+        *owner = OwnedLine {
+            owner: Owner::Direct,
+            candidates: owner_candidate(Owner::Direct),
+            source_step: Some(source_step),
+            ambiguous: false,
+        };
+    }
+}
+
+pub(crate) fn identity_mapping_steps(evidence: &Evidence, committed: &[u8]) -> Vec<bool> {
+    let normalized_committed = crate::commit::normalize_eol(committed);
+    let mut unchanged_through_end = vec![true; evidence.steps.len()];
+    let mut identity_mapping = vec![false; evidence.steps.len()];
+    let mut later_snapshot = None;
+    for index in (0..evidence.steps.len()).rev() {
+        let step = &evidence.steps[index];
+        let normalized_after = crate::commit::normalize_eol(&step.after);
+        if let Some(later) = later_snapshot.as_ref() {
+            unchanged_through_end[index] =
+                normalized_after == *later && unchanged_through_end[index + 1];
+        }
+        identity_mapping[index] = matches!(step.kind, StepKind::Ai { degraded: false })
+            && normalized_after == normalized_committed
+            && unchanged_through_end[index];
+        later_snapshot = Some(normalized_after);
+    }
+    identity_mapping
+}
+
+pub(crate) fn is_identity_mapped_direct_line(
+    evidence: &Evidence,
+    identity_mapping_steps: &[bool],
+    source_step: Option<usize>,
+    line_number: usize,
+) -> bool {
+    let Some(source_step) = source_step else {
+        return false;
+    };
+    identity_mapping_steps.get(source_step) == Some(&true)
+        && evidence
+            .steps
+            .get(source_step)
+            .and_then(|step| step.attribution.as_ref())
+            .is_some_and(|attribution| attribution.direct_line_numbers.contains(&line_number))
+}
+
+pub(crate) fn is_same_source_event(
+    candidate_step: usize,
+    candidate: &StepAttribution,
+    source_step: Option<usize>,
+    source: Option<&StepAttribution>,
+) -> bool {
+    source_step == Some(candidate_step)
+        || source.is_some_and(|source| {
+            candidate.event_index.is_some() && candidate.event_index == source.event_index
+                || candidate.run_id.is_some() && candidate.run_id == source.run_id
+        })
 }
 
 fn duplicate_candidates_share_ai_source(line: &[u8], evidence: &Evidence) -> bool {
@@ -290,6 +394,35 @@ fn duplicate_candidates_share_ai_source(line: &[u8], evidence: &Evidence) -> boo
         found = true;
     }
     found
+}
+
+fn has_other_ai_candidate(
+    line: &[u8],
+    source_step: Option<usize>,
+    line_number: usize,
+    evidence: &Evidence,
+) -> bool {
+    let source_attribution = source_step
+        .and_then(|index| evidence.steps.get(index))
+        .and_then(|step| step.attribution.as_ref());
+    evidence.steps.iter().enumerate().any(|(step_index, step)| {
+        if !matches!(step.kind, StepKind::Ai { .. }) {
+            return false;
+        }
+        let Some(attribution) = step.attribution.as_ref() else {
+            return false;
+        };
+        if is_same_source_event(step_index, attribution, source_step, source_attribution) {
+            return false;
+        }
+        let candidate_lines = split_lines(&step.after);
+        let Some(candidate) = candidate_lines.get(line_number.saturating_sub(1)) else {
+            return false;
+        };
+        candidate.as_slice() == line
+            && (attribution.direct_line_numbers.is_empty()
+                || attribution.direct_line_numbers.contains(&line_number))
+    })
 }
 
 /// Reconcile an unobserved final edit against the last captured AI snapshot.

@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 static HOOK_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 static FIXTURE_TEST_GATE: Mutex<()> = Mutex::new(());
@@ -1380,6 +1380,442 @@ fn copilot_edit_added_brace_does_not_compete_with_same_event_preexisting_brace()
         "{closing_brace}"
     );
     assert_no_unrecognized_payload_for_session(&fixture, "copilot-duplicate-session");
+    fixture.drop_root();
+}
+
+#[test]
+fn repeated_text_in_exact_source_snapshot_stays_direct_for_current_file_tools() {
+    let fixture = Fixture::new("repeated-source-write");
+    let path = fixture.repo.join("repeated.js");
+    let content = (0..30)
+        .map(|index| {
+            if index % 3 == 0 {
+                "}".to_owned()
+            } else {
+                format!("const value_{index} = {index};")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    run_copilot_file_tool(
+        &fixture,
+        "repeated-source-session",
+        "write-repeated",
+        "Write",
+        json!({"path":path,"file_text":content}),
+        content.as_bytes(),
+    );
+    let commit = derive_fixture_commit(&fixture, "Write repeated source lines");
+    let file = file_report(&fixture, &commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "repeated.js")
+        .unwrap()
+        .clone();
+    assert_eq!(file["ai_direct"], 30, "{file}");
+    assert_eq!(file["ai_strong"], 0, "{file}");
+    assert_eq!(file["unknown"], 0, "{file}");
+    let explanation = explain_fixture_file(&fixture, &commit, "repeated.js");
+    for line in explanation["lines"].as_array().unwrap() {
+        assert_eq!(line["category"], "ai_direct", "{line}");
+        assert!(
+            line["checks"].as_array().unwrap().iter().any(|check| {
+                check["condition"] == "duplicate_ambiguity" && check["passed"] == true
+            }),
+            "{line}"
+        );
+    }
+    fixture.drop_root();
+}
+
+#[test]
+fn repeated_text_in_exact_apply_patch_source_snapshot_stays_direct() {
+    let fixture = Fixture::new("repeated-source-patch");
+    let path = fixture.repo.join("repeated.js");
+    let content = (0..30)
+        .map(|index| {
+            if index % 2 == 0 {
+                "}".to_owned()
+            } else {
+                format!("const patch_value_{index} = {index};")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: {}\n{}\n*** End Patch",
+        path.display(),
+        content
+            .lines()
+            .map(|line| format!("+{line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let tool_use_id = "custom_call_CULUt_r38_repeated_patch";
+    let pre = copilot_file_tool_payload(
+        &fixture,
+        "PreToolUse",
+        "repeated-patch-session",
+        tool_use_id,
+        "Edit",
+        json!(patch),
+    );
+    assert_hook_response(&fixture.hook(&pre, "vscode"));
+    fs::write(&path, &content).unwrap();
+    let post = copilot_file_tool_payload(
+        &fixture,
+        "PostToolUse",
+        "repeated-patch-session",
+        tool_use_id,
+        "Edit",
+        pre["tool_input"].clone(),
+    );
+    assert_hook_response(&fixture.hook(&post, "vscode"));
+    let event = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["tool_use_id"] == tool_use_id)
+        .unwrap();
+    assert_eq!(event["operation"], "apply_patch");
+    assert_eq!(event["structured_edit"], true);
+
+    let commit = derive_fixture_commit(&fixture, "Patch repeated source lines");
+    let file = file_report(&fixture, &commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "repeated.js")
+        .unwrap()
+        .clone();
+    assert_eq!(file["ai_direct"], 30, "{file}");
+    assert_eq!(file["ai_strong"], 0, "{file}");
+    assert_eq!(file["unknown"], 0, "{file}");
+    let explanation = explain_fixture_file(&fixture, &commit, "repeated.js");
+    for line in explanation["lines"].as_array().unwrap() {
+        assert_eq!(line["category"], "ai_direct", "{line}");
+        assert!(
+            line["checks"].as_array().unwrap().iter().any(|check| {
+                check["condition"] == "duplicate_ambiguity" && check["passed"] == true
+            }),
+            "{line}"
+        );
+    }
+    fixture.drop_root();
+}
+
+#[test]
+fn copilot_edit_repeated_added_lines_stay_direct_in_exact_snapshot() {
+    let fixture = Fixture::new("repeated-source-edit");
+    let path = fixture.repo.join("tracked.txt");
+    let added = (0..30)
+        .map(|index| {
+            if index % 2 == 0 {
+                "}".to_owned()
+            } else {
+                format!("const edit_value_{index} = {index};")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let after = format!("base\n{added}");
+    run_copilot_file_tool(
+        &fixture,
+        "repeated-edit-session",
+        "edit-repeated",
+        "Edit",
+        json!({"path":path,"old_str":"base\n","new_str":after}),
+        after.as_bytes(),
+    );
+    let commit = derive_fixture_commit(&fixture, "Edit repeated source lines");
+    let file = file_report(&fixture, &commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(file["ai_direct"], 30, "{file}");
+    assert_eq!(file["ai_strong"], 0, "{file}");
+    assert_eq!(file["unknown"], 0, "{file}");
+    let explanation = explain_fixture_file(&fixture, &commit, "tracked.txt");
+    for line in explanation["lines"].as_array().unwrap() {
+        assert_eq!(line["category"], "ai_direct", "{line}");
+        assert!(
+            line["checks"].as_array().unwrap().iter().any(|check| {
+                check["condition"] == "duplicate_ambiguity" && check["passed"] == true
+            }),
+            "{line}"
+        );
+    }
+    fixture.drop_root();
+}
+
+#[test]
+fn large_repeated_ai_file_derives_all_lines_direct() {
+    let fixture = Fixture::new("large-repeated-ai-file");
+    let path = fixture.repo.join("tracked.txt");
+    let content = "}\n".repeat(5_000);
+    run_copilot_file_tool(
+        &fixture,
+        "large-repeated-session",
+        "large-write",
+        "Write",
+        json!({"path":path,"file_text":content}),
+        content.as_bytes(),
+    );
+
+    let commit = fixture.commit("Large repeated AI file");
+    let started = Instant::now();
+    let derived = fixture.cli(&[
+        "derive",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+    ]);
+    let elapsed = started.elapsed();
+    assert!(
+        derived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&derived.stderr)
+    );
+    eprintln!("5,000-line repeated-brace derive wall time: {elapsed:?}");
+
+    let file = file_report(&fixture, &commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(file["ai_direct"], 5_000, "{file}");
+    assert_eq!(file["ai_strong"], 0, "{file}");
+    assert_eq!(file["unknown"], 0, "{file}");
+    fixture.drop_root();
+}
+
+#[test]
+fn same_text_from_distinct_events_at_distinct_positions_remains_direct() {
+    let fixture = Fixture::new("repeated-different-events");
+    let path = fixture.repo.join("tracked.txt");
+    let first = "}\nconst first_value = true;\n";
+    run_copilot_file_tool(
+        &fixture,
+        "different-event-session",
+        "first-write",
+        "Write",
+        json!({"path":path,"file_text":first}),
+        first.as_bytes(),
+    );
+    let second = "}\n}\nconst second_value = true;\n";
+    run_copilot_file_tool(
+        &fixture,
+        "different-event-session",
+        "second-write",
+        "Write",
+        json!({"path":path,"file_text":second}),
+        second.as_bytes(),
+    );
+    let ai_events: Vec<_> = events(&fixture.store)
+        .into_iter()
+        .filter(|event| event["event"] == "ai_change" && event["path"] == "tracked.txt")
+        .collect();
+    assert!(ai_events
+        .iter()
+        .any(|event| event["tool_use_id"] == "first-write"));
+    assert!(ai_events
+        .iter()
+        .any(|event| event["tool_use_id"] == "second-write"));
+
+    let commit = derive_fixture_commit(&fixture, "Two events claim repeated text");
+    let file = file_report(&fixture, &commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(file["ai_direct"], 2, "{file}");
+    assert_eq!(file["ai_strong"], 1, "{file}");
+    let explanation = explain_fixture_file(&fixture, &commit, "tracked.txt");
+    assert!(
+        explanation["lines"].as_array().unwrap().iter().any(|line| {
+            line["category"] == "ai_strong"
+                && line["checks"].as_array().unwrap().iter().any(|check| {
+                    check["condition"] == "duplicate_ambiguity"
+                        && check["passed"] == false
+                        && check["compared"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("second-write")
+                })
+        }),
+        "{explanation}"
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn human_added_copy_of_ai_text_stays_unknown() {
+    let fixture = Fixture::new("human-copy-ai-text");
+    let path = fixture.repo.join("tracked.txt");
+    let content = "}\nconst keep = true;\n}\n";
+    run_copilot_file_tool(
+        &fixture,
+        "human-copy-session",
+        "ai-write",
+        "Write",
+        json!({"path":path,"file_text":content}),
+        content.as_bytes(),
+    );
+    fs::write(&path, format!("{content}}}\n")).unwrap();
+    let human_pre = json!({
+        "hook_event_name":"PreToolUse",
+        "session_id":"human-copy-session",
+        "cwd":fixture.repo,
+        "tool_name":"replace_string_in_file",
+        "tool_use_id":"next-tool",
+        "tool_input":{
+            "filePath":path,
+            "oldString":"unused",
+            "newString":"unused"
+        }
+    });
+    assert_hook_response(&fixture.hook(&human_pre, "vscode"));
+    let mut human_post = human_pre.clone();
+    human_post["hook_event_name"] = json!("PostToolUse");
+    assert_hook_response(&fixture.hook(&human_post, "vscode"));
+    assert!(events(&fixture.store)
+        .iter()
+        .any(|event| event["event"] == "external_change" && event["path"] == "tracked.txt"));
+
+    let commit = derive_fixture_commit(&fixture, "Human adds same-text line");
+    let file = file_report(&fixture, &commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(file["ai_direct"], 3, "{file}");
+    assert_eq!(file["unknown"], 1, "{file}");
+    fixture.drop_root();
+}
+
+#[test]
+fn human_delete_and_reinsert_of_ai_line_is_not_direct() {
+    let fixture = Fixture::new("human-move-ai-line");
+    let path = fixture.repo.join("tracked.txt");
+    let original = "const first = 0;\nconst moved = 1;\nconst middle = 2;\nconst last = 3;\n";
+    run_copilot_file_tool(
+        &fixture,
+        "human-move-session",
+        "ai-write",
+        "Write",
+        json!({"path":path,"file_text":original}),
+        original.as_bytes(),
+    );
+
+    let moved = "const first = 0;\nconst middle = 2;\nconst last = 3;\nconst moved = 1;\n";
+    fs::write(&path, moved).unwrap();
+    let human_pre = json!({
+        "hook_event_name":"PreToolUse",
+        "session_id":"human-move-session",
+        "cwd":fixture.repo,
+        "tool_name":"replace_string_in_file",
+        "tool_use_id":"next-tool",
+        "tool_input":{
+            "filePath":path,
+            "oldString":"unused",
+            "newString":"unused"
+        }
+    });
+    assert_hook_response(&fixture.hook(&human_pre, "vscode"));
+    let mut human_post = human_pre.clone();
+    human_post["hook_event_name"] = json!("PostToolUse");
+    assert_hook_response(&fixture.hook(&human_post, "vscode"));
+
+    let commit = derive_fixture_commit(&fixture, "Human moves and retypes AI line");
+    let file = file_report(&fixture, &commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    let explanation = explain_fixture_file(&fixture, &commit, "tracked.txt");
+    let labels: Vec<_> = explanation["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line["category"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        ["ai_direct", "ai_direct", "ai_direct", "unknown"],
+        "{explanation}"
+    );
+    let moved_line = explanation["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["line"] == 4)
+        .unwrap();
+    assert_ne!(moved_line["category"], "ai_direct", "{moved_line}");
+    assert!(file["ai_direct"].as_u64().unwrap_or_default() < 4, "{file}");
+    fixture.drop_root();
+}
+
+#[test]
+fn human_deletes_and_retypes_ai_brace_without_direct_credit() {
+    let fixture = Fixture::new("human-retypes-ai-brace");
+    let path = fixture.repo.join("tracked.txt");
+    let original = "const first = 0;\n}\nconst second = 1;\nconst third = 2;\n";
+    run_copilot_file_tool(
+        &fixture,
+        "human-brace-session",
+        "ai-write",
+        "Write",
+        json!({"path":path,"file_text":original}),
+        original.as_bytes(),
+    );
+
+    let edited = "const first = 0;\nconst second = 1;\nconst third = 2;\n}\n";
+    fs::write(&path, edited).unwrap();
+    let human_pre = json!({
+        "hook_event_name":"PreToolUse",
+        "session_id":"human-brace-session",
+        "cwd":fixture.repo,
+        "tool_name":"replace_string_in_file",
+        "tool_use_id":"next-tool",
+        "tool_input":{
+            "filePath":path,
+            "oldString":"unused",
+            "newString":"unused"
+        }
+    });
+    assert_hook_response(&fixture.hook(&human_pre, "vscode"));
+    let mut human_post = human_pre.clone();
+    human_post["hook_event_name"] = json!("PostToolUse");
+    assert_hook_response(&fixture.hook(&human_post, "vscode"));
+
+    let commit = derive_fixture_commit(&fixture, "Human retypes an AI brace");
+    let explanation = explain_fixture_file(&fixture, &commit, "tracked.txt");
+    let labels: Vec<_> = explanation["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line["category"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        ["ai_direct", "ai_direct", "ai_direct", "unknown"],
+        "{explanation}"
+    );
+    assert_ne!(labels[3], "ai_direct", "{explanation}");
     fixture.drop_root();
 }
 

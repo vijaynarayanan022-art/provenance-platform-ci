@@ -20,7 +20,7 @@ const MAX_PARENT_MATCH_CELLS: usize = 1_000_000;
 const MAX_DELAYED_EVENTS_PER_PATH: usize = 64;
 const MIXED_SCORE_MILLI: u16 = 840;
 const PRIOR_AI_EDIT_LOOKUP_BUDGET: Duration = Duration::from_secs(2);
-pub const LINE_SURVIVAL_VERSION: &str = "unobserved-position-mapped-v4";
+pub const LINE_SURVIVAL_VERSION: &str = "unobserved-position-mapped-v5";
 const UNOBSERVED_COVERAGE_MEDIUM_PERCENT: usize = 5;
 const UNOBSERVED_COVERAGE_LOW_PERCENT: usize = 20;
 const UNOBSERVED_COVERAGE_BASIS: [&str; 2] = ["X_UNOBSERVED_EDIT", "X_UNOBSERVED_EDIT_IN_FILE"];
@@ -1730,6 +1730,8 @@ pub fn explain_commit(
         parent: normalized_parent.clone(),
         steps: survival_steps.unwrap_or(steps),
     };
+    let identity_mapping_steps =
+        derive::identity_mapping_steps(&evidence_input, &normalized_committed);
     let (mut attributed_lines, position_mapping_traces, protected_position_lines) =
         if use_unobserved_survival {
             let result = derive::derive_lines_with_position_mapping(
@@ -1939,6 +1941,9 @@ pub fn explain_commit(
                                 .get(attributed.line.line.saturating_sub(1))
                                 .copied()
                                 .unwrap_or_default(),
+                            attributed.source_step,
+                            attributed.line.line,
+                            &identity_mapping_steps,
                             &evidence_input,
                         )
                     } else {
@@ -3340,18 +3345,47 @@ fn ranges_match_at_duplicate_boundary(
     differing_range.is_some()
 }
 
-fn duplicate_competing_candidates(line: &[u8], evidence: &Evidence) -> String {
+fn duplicate_competing_candidates(
+    line: &[u8],
+    source_step: Option<usize>,
+    line_number: usize,
+    identity_mapping_steps: &[bool],
+    evidence: &Evidence,
+) -> String {
+    let identity_source_step = source_step.filter(|source_step| {
+        derive::is_identity_mapped_direct_line(
+            evidence,
+            identity_mapping_steps,
+            Some(*source_step),
+            line_number,
+        )
+    });
+    let source_attribution = identity_source_step
+        .and_then(|index| evidence.steps.get(index))
+        .and_then(|step| step.attribution.as_ref());
     let candidates = evidence
         .steps
         .iter()
-        .filter(|step| matches!(step.kind, StepKind::Ai { .. }))
-        .filter_map(|step| {
+        .enumerate()
+        .filter(|(_, step)| matches!(step.kind, StepKind::Ai { .. }))
+        .filter_map(|(step_index, step)| {
             let attribution = step.attribution.as_ref()?;
+            if identity_source_step.is_some_and(|source_step| {
+                derive::is_same_source_event(
+                    step_index,
+                    attribution,
+                    Some(source_step),
+                    source_attribution,
+                )
+            }) {
+                return None;
+            }
             let matching_lines = split_normalized_lines(&step.after)
                 .iter()
                 .enumerate()
                 .filter_map(|(index, candidate)| {
                     (*candidate == line
+                        && (identity_source_step.is_none() || index + 1 == line_number)
                         && (attribution.direct_line_numbers.is_empty()
                             || attribution.direct_line_numbers.contains(&(index + 1))))
                     .then_some(index + 1)
@@ -3473,7 +3507,7 @@ fn commit_split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
     lines
 }
 
-fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
