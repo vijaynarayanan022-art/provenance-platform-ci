@@ -20,7 +20,7 @@ const MAX_PARENT_MATCH_CELLS: usize = 1_000_000;
 const MAX_DELAYED_EVENTS_PER_PATH: usize = 64;
 const MIXED_SCORE_MILLI: u16 = 840;
 const PRIOR_AI_EDIT_LOOKUP_BUDGET: Duration = Duration::from_secs(2);
-pub const LINE_SURVIVAL_VERSION: &str = "unobserved-position-mapped-v3";
+pub const LINE_SURVIVAL_VERSION: &str = "unobserved-position-mapped-v4";
 const UNOBSERVED_COVERAGE_MEDIUM_PERCENT: usize = 5;
 const UNOBSERVED_COVERAGE_LOW_PERCENT: usize = 20;
 const UNOBSERVED_COVERAGE_BASIS: [&str; 2] = ["X_UNOBSERVED_EDIT", "X_UNOBSERVED_EDIT_IN_FILE"];
@@ -3350,7 +3350,12 @@ fn duplicate_competing_candidates(line: &[u8], evidence: &Evidence) -> String {
             let matching_lines = split_normalized_lines(&step.after)
                 .iter()
                 .enumerate()
-                .filter_map(|(index, candidate)| (*candidate == line).then_some(index + 1))
+                .filter_map(|(index, candidate)| {
+                    (*candidate == line
+                        && (attribution.direct_line_numbers.is_empty()
+                            || attribution.direct_line_numbers.contains(&(index + 1))))
+                    .then_some(index + 1)
+                })
                 .collect::<Vec<_>>();
             (!matching_lines.is_empty()).then(|| {
                 serde_json::json!({

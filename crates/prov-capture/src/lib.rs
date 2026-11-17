@@ -328,6 +328,7 @@ struct FileChange {
     degraded: Option<String>,
     line_ranges: Option<Vec<[usize; 2]>>,
     deleted_at: Vec<usize>,
+    structured_edit_verified: Option<bool>,
 }
 
 /// Contain all hook work. The executable wraps this in catch_unwind and has a process watchdog.
@@ -402,7 +403,23 @@ pub fn process_vscode_json(input: &[u8]) {
         .map(str::to_owned);
     let mut tool_name = raw_tool_name.clone();
     if let Some(name) = raw_tool_name.as_deref() {
-        if name.eq_ignore_ascii_case("edit") {
+        if name.eq_ignore_ascii_case("write") {
+            tool_name = Some("copilot_write".into());
+        } else if name == "Edit"
+            && payload.get("tool_input").is_some_and(|input| {
+                input.is_object()
+                    && input
+                        .get("old_str")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+                    && input
+                        .get("new_str")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+            })
+        {
+            tool_name = Some("copilot_edit".into());
+        } else if name.eq_ignore_ascii_case("edit") {
             tool_name = Some("apply_patch".into());
             if let Some(patch) = payload.get("tool_input").and_then(|input| input.as_str()) {
                 payload["tool_input"] = serde_json::json!({"input": patch});
@@ -432,6 +449,19 @@ pub fn process_vscode_json(input: &[u8]) {
             if let Some(path) = payload
                 .get("tool_input")
                 .and_then(|v| v.get("filePath"))
+                .and_then(|v| v.as_str())
+                .filter(|path| !path.trim().is_empty())
+            {
+                target_paths = Some(vec![path.to_owned()]);
+            } else if let Some(input) = payload.get_mut("tool_input") {
+                *input = serde_json::Value::Null;
+            }
+            true
+        }
+        ("PreToolUse" | "PostToolUse", Some("copilot_write" | "copilot_edit")) => {
+            if let Some(path) = payload
+                .get("tool_input")
+                .and_then(|v| v.get("path"))
                 .and_then(|v| v.as_str())
                 .filter(|path| !path.trim().is_empty())
             {
@@ -722,7 +752,9 @@ fn structured_edit_allowed(adapter: &str, operation: Option<&str>) -> bool {
                         | "apply_patch"
                         | "insert_edit_into_file"
                         | "replace_string_in_file"
-                        | "multi_replace_string_in_file",
+                        | "multi_replace_string_in_file"
+                        | "copilot_write"
+                        | "copilot_edit",
                 ),
             )
     )
@@ -736,6 +768,8 @@ fn structured_added_lines(
     let operation = operation?;
     let content = match (adapter, operation) {
         ("vscode-copilot", "create_file") => input.get("content")?.as_str()?,
+        ("vscode-copilot", "copilot_write") => input.get("file_text")?.as_str()?,
+        ("vscode-copilot", "copilot_edit") => input.get("new_str")?.as_str()?,
         (_, "apply_patch") => input
             .get("input")
             .or_else(|| input.get("patch"))
@@ -784,6 +818,16 @@ fn structured_input(
     let operation = operation?;
     let field = match (adapter, operation) {
         ("vscode-copilot", "create_file") => "content",
+        ("vscode-copilot", "copilot_write") => "file_text",
+        ("vscode-copilot", "copilot_edit") => {
+            let old_str = input.get("old_str")?.as_str()?;
+            let new_str = input.get("new_str")?.as_str()?;
+            return serde_json::to_string(&serde_json::json!({
+                "old_str": old_str.replace("\r\n", "\n"),
+                "new_str": new_str.replace("\r\n", "\n"),
+            }))
+            .ok();
+        }
         (_, "apply_patch") => {
             return input
                 .get("input")
@@ -801,6 +845,183 @@ fn structured_input(
         _ => return None,
     };
     input.get(field)?.as_str().map(str::to_owned)
+}
+
+fn structured_edit_matches_snapshots(
+    root: &Path,
+    scanned_path: &str,
+    operation: &str,
+    input: &serde_json::Value,
+    before: &BeforeContent,
+    after: &[u8],
+) -> Option<bool> {
+    let input_path = input.get("path")?.as_str()?;
+    if repo_relative_path(root, input_path).as_deref() != Some(scanned_path) {
+        return None;
+    }
+    Some(structured_edit_matches_snapshot_bytes(
+        operation, input, before, after,
+    ))
+}
+
+fn structured_edit_matches_snapshot_bytes(
+    operation: &str,
+    input: &serde_json::Value,
+    before: &BeforeContent,
+    after: &[u8],
+) -> bool {
+    if !structured_input_within_limit(input) {
+        return false;
+    }
+    let before = match before {
+        BeforeContent::Known(bytes) => bytes.as_slice(),
+        BeforeContent::KnownEmpty => b"",
+        BeforeContent::Unavailable => return false,
+    };
+    if before.len() > MAX_FILE as usize || after.len() > MAX_FILE as usize {
+        return false;
+    }
+
+    match operation {
+        "copilot_write" => {
+            let Some(file_text) = input.get("file_text").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let Some(input_size) = input
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(str::len)
+                .unwrap_or(0)
+                .checked_add(file_text.len())
+            else {
+                return false;
+            };
+            input_size <= MAX_FILE as usize
+                && normalize_structured_eol(file_text.as_bytes()) == normalize_structured_eol(after)
+        }
+        "copilot_edit" => {
+            let Some(path) = input.get("path").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let Some(old_str) = input.get("old_str").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let Some(new_str) = input.get("new_str").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let Some(input_size) = path
+                .len()
+                .checked_add(old_str.len())
+                .and_then(|size| size.checked_add(new_str.len()))
+            else {
+                return false;
+            };
+            if input_size > MAX_FILE as usize {
+                return false;
+            }
+            let normalized_before = normalize_structured_eol(before);
+            let normalized_old = normalize_structured_eol(old_str.as_bytes());
+            let normalized_new = normalize_structured_eol(new_str.as_bytes());
+            let Some(replacement_at) =
+                unique_subslice_position(&normalized_before, &normalized_old)
+            else {
+                return false;
+            };
+            let expected_len = normalized_before
+                .len()
+                .saturating_sub(normalized_old.len())
+                .checked_add(normalized_new.len());
+            let Some(expected_len) = expected_len.filter(|&len| len <= MAX_FILE as usize) else {
+                return false;
+            };
+            let normalized_after = normalize_structured_eol(after);
+            if expected_len != normalized_after.len() {
+                return false;
+            }
+            let mut expected = Vec::with_capacity(expected_len);
+            expected.extend_from_slice(&normalized_before[..replacement_at]);
+            expected.extend_from_slice(&normalized_new);
+            expected.extend_from_slice(&normalized_before[replacement_at + normalized_old.len()..]);
+            expected == normalized_after
+        }
+        _ => false,
+    }
+}
+
+fn structured_input_within_limit(input: &serde_json::Value) -> bool {
+    struct LimitedWriter {
+        written: usize,
+    }
+
+    impl Write for LimitedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(total) = self.written.checked_add(bytes.len()) else {
+                return Err(std::io::Error::other("structured input size overflow"));
+            };
+            if total > MAX_FILE as usize {
+                return Err(std::io::Error::other("structured input exceeds size limit"));
+            }
+            self.written = total;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    serde_json::to_writer(&mut LimitedWriter { written: 0 }, input).is_ok()
+}
+
+fn unique_subslice_position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let mut prefix = vec![0; needle.len()];
+    let mut prefix_len = 0;
+    for index in 1..needle.len() {
+        while prefix_len > 0 && needle[index] != needle[prefix_len] {
+            prefix_len = prefix[prefix_len - 1];
+        }
+        if needle[index] == needle[prefix_len] {
+            prefix_len += 1;
+            prefix[index] = prefix_len;
+        }
+    }
+
+    let mut found = None;
+    let mut matched = 0;
+    for (index, &byte) in haystack.iter().enumerate() {
+        while matched > 0 && byte != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if byte == needle[matched] {
+            matched += 1;
+        }
+        if matched == needle.len() {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(index + 1 - needle.len());
+            matched = prefix[matched - 1];
+        }
+    }
+    found
+}
+
+fn normalize_structured_eol(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            normalized.push(b'\n');
+            index += 2;
+        } else {
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+    }
+    normalized
 }
 
 fn structured_input_is_direct_eligible(
@@ -1002,7 +1223,13 @@ fn process_hook(
     let mut derive_after_hook = false;
     match event_name {
         "PreToolUse" => {
-            let scan = timed_scan(&repo.root, &store.join("blobs"), &mut shadow, SCAN_BUDGET);
+            let scan = timed_scan(
+                &repo.root,
+                &store.join("blobs"),
+                &mut shadow,
+                SCAN_BUDGET,
+                None,
+            );
             let (changes, incomplete, bulk_count, bulk_remaining) = match scan {
                 Ok(v) => (v.changes, v.incomplete, v.bulk_count, v.bulk_remaining),
                 Err(_) => (Vec::new(), true, None, None),
@@ -1089,7 +1316,18 @@ fn process_hook(
             state.windows.push(window);
         }
         "PostToolUse" => {
-            let scan = timed_scan(&repo.root, &store.join("blobs"), &mut shadow, SCAN_BUDGET);
+            let snapshot_verification_input = hook
+                .tool_name
+                .as_deref()
+                .filter(|operation| matches!(*operation, "copilot_write" | "copilot_edit"))
+                .zip(hook.tool_input.as_ref());
+            let scan = timed_scan(
+                &repo.root,
+                &store.join("blobs"),
+                &mut shadow,
+                SCAN_BUDGET,
+                snapshot_verification_input,
+            );
             let (changes, incomplete, bulk_count, bulk_remaining) = match scan {
                 Ok(v) => (v.changes, v.incomplete, v.bulk_count, v.bulk_remaining),
                 Err(_) => (Vec::new(), true, None, None),
@@ -1180,6 +1418,7 @@ fn process_hook(
                     } else {
                         "ai_change"
                     };
+                let structured_edit_verified = change.structured_edit_verified;
                 let mut e = change_event(
                     kind,
                     change,
@@ -1193,28 +1432,40 @@ fn process_hook(
                 e.model = hook.model.clone();
                 e.tool = Some(tool_label.into());
                 e.operation = hook.tool_name.clone();
-                e.structured_edit = Some(
-                    structured_edit_allowed(tool_label, hook.tool_name.as_deref())
-                        && structured_input_is_direct_eligible(
-                            tool_label,
-                            hook.tool_name.as_deref(),
-                            hook.tool_input.as_ref(),
-                        ),
+                e.structured_edit = Some(match hook.tool_name.as_deref() {
+                    Some("copilot_write" | "copilot_edit") => {
+                        structured_edit_allowed(tool_label, hook.tool_name.as_deref())
+                            && structured_edit_verified == Some(true)
+                    }
+                    _ => {
+                        structured_edit_allowed(tool_label, hook.tool_name.as_deref())
+                            && structured_input_is_direct_eligible(
+                                tool_label,
+                                hook.tool_name.as_deref(),
+                                hook.tool_input.as_ref(),
+                            )
+                    }
+                });
+                let current_file_tool = matches!(
+                    hook.tool_name.as_deref(),
+                    Some("copilot_write" | "copilot_edit")
                 );
-                e.structured_added_lines = hook
-                    .tool_input
-                    .as_ref()
-                    .and_then(|input| {
-                        structured_added_lines(tool_label, hook.tool_name.as_deref(), input)
-                    })
-                    .unwrap_or_default();
-                e.structured_input_sha256 = hook
-                    .tool_input
-                    .as_ref()
-                    .and_then(|input| {
-                        structured_input(tool_label, hook.tool_name.as_deref(), input)
-                    })
-                    .map(|payload| hash(payload.replace("\r\n", "\n").as_bytes()));
+                if !current_file_tool || structured_edit_verified == Some(true) {
+                    e.structured_added_lines = hook
+                        .tool_input
+                        .as_ref()
+                        .and_then(|input| {
+                            structured_added_lines(tool_label, hook.tool_name.as_deref(), input)
+                        })
+                        .unwrap_or_default();
+                    e.structured_input_sha256 = hook
+                        .tool_input
+                        .as_ref()
+                        .and_then(|input| {
+                            structured_input(tool_label, hook.tool_name.as_deref(), input)
+                        })
+                        .map(|payload| hash(payload.replace("\r\n", "\n").as_bytes()));
+                }
                 e.command_sha256 = command_sha.clone();
                 e.command_length = command_length;
                 e.window_open = opened;
@@ -1642,6 +1893,7 @@ fn scan(
     blobs: &Path,
     shadow: &mut Shadow,
     budget: Duration,
+    structured_input: Option<(&str, &serde_json::Value)>,
 ) -> std::io::Result<ScanResult> {
     let start = Instant::now();
     let status_start = Instant::now();
@@ -1821,6 +2073,7 @@ fn scan(
                 degraded: Some("unmerged".into()),
                 line_ranges: None,
                 deleted_at: Vec::new(),
+                structured_edit_verified: None,
             });
             continue;
         }
@@ -1889,6 +2142,7 @@ fn scan(
                         degraded: Some("before_unavailable".into()),
                         line_ranges: None,
                         deleted_at: Vec::new(),
+                        structured_edit_verified: None,
                     });
                 }
                 BeforeContent::Known(ref old_bytes) => {
@@ -1901,6 +2155,7 @@ fn scan(
                         degraded: None,
                         line_ranges: Some(Vec::new()),
                         deleted_at,
+                        structured_edit_verified: None,
                     });
                 }
                 _ => {
@@ -1912,6 +2167,7 @@ fn scan(
                         degraded: None,
                         line_ranges: if excluded { None } else { Some(Vec::new()) },
                         deleted_at: Vec::new(),
+                        structured_edit_verified: None,
                     });
                 }
             }
@@ -1960,6 +2216,16 @@ fn scan(
             continue;
         }
         let after_sha = hash(&after_bytes);
+        let structured_edit_verified = structured_input.and_then(|(operation, input)| {
+            structured_edit_matches_snapshots(
+                root,
+                &path,
+                operation,
+                input,
+                &before_content,
+                &after_bytes,
+            )
+        });
         if before_sha.as_deref() != Some(&after_sha) {
             if !excluded {
                 if let Err(e) = write_once(&blobs.join(&after_sha), &after_bytes) {
@@ -1977,6 +2243,7 @@ fn scan(
                         degraded: Some("before_unavailable".into()),
                         line_ranges: None,
                         deleted_at: Vec::new(),
+                        structured_edit_verified,
                     });
                 }
                 BeforeContent::Known(ref old_bytes) => {
@@ -1989,6 +2256,7 @@ fn scan(
                         degraded: None,
                         line_ranges: Some(ranges),
                         deleted_at,
+                        structured_edit_verified,
                     });
                 }
                 BeforeContent::KnownEmpty => {
@@ -2001,6 +2269,7 @@ fn scan(
                         degraded: None,
                         line_ranges: Some(ranges),
                         deleted_at,
+                        structured_edit_verified,
                     });
                 }
                 _ => {
@@ -2012,6 +2281,7 @@ fn scan(
                         degraded: None,
                         line_ranges: None,
                         deleted_at: Vec::new(),
+                        structured_edit_verified,
                     });
                 }
             }
@@ -2040,11 +2310,12 @@ fn timed_scan(
     blobs: &Path,
     shadow: &mut Shadow,
     budget: Duration,
+    structured_input: Option<(&str, &serde_json::Value)>,
 ) -> std::io::Result<ScanResult> {
     let start = Instant::now();
     let before_status = TIMINGS.git_status_ns.load(Ordering::Relaxed);
     let before_writes = TIMINGS.writes_ns.load(Ordering::Relaxed);
-    let result = scan(root, blobs, shadow, budget);
+    let result = scan(root, blobs, shadow, budget, structured_input);
     let status = TIMINGS
         .git_status_ns
         .load(Ordering::Relaxed)
@@ -2260,6 +2531,7 @@ fn file_error(
         degraded: Some(format!("{reason}:{}", e.kind())),
         line_ranges: None,
         deleted_at: Vec::new(),
+        structured_edit_verified: None,
     }
 }
 fn change_event(
@@ -2954,6 +3226,73 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     use std::os::windows::ffi::OsStrExt;
+
+    #[test]
+    fn structured_edit_verification_is_scoped_to_the_input_path() {
+        let root = std::env::temp_dir().join(format!(
+            "prov-structured-path-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path_a = root.join("a.txt");
+        fs::write(&path_a, b"before\n").unwrap();
+        fs::write(root.join("b.txt"), b"before\n").unwrap();
+        let before = BeforeContent::Known(b"before\n".to_vec());
+        let write_input = serde_json::json!({
+            "path":path_a,
+            "file_text":"after\n"
+        });
+        assert_eq!(
+            structured_edit_matches_snapshots(
+                &root,
+                "b.txt",
+                "copilot_write",
+                &write_input,
+                &before,
+                b"after\n",
+            ),
+            None
+        );
+
+        let mut normalized_path = path_a.to_string_lossy().replace('\\', "/");
+        if normalized_path.as_bytes().get(1) == Some(&b':') {
+            normalized_path.replace_range(0..1, &normalized_path[0..1].to_ascii_lowercase());
+        }
+        let matching_input = serde_json::json!({
+            "path":normalized_path,
+            "file_text":"after\n"
+        });
+        assert_eq!(
+            structured_edit_matches_snapshots(
+                &root,
+                "a.txt",
+                "copilot_write",
+                &matching_input,
+                &before,
+                b"after\n",
+            ),
+            Some(true)
+        );
+
+        let edit_input = serde_json::json!({
+            "path":path_a,
+            "old_str":"before\n",
+            "new_str":"after\n"
+        });
+        assert_eq!(
+            structured_edit_matches_snapshots(
+                &root,
+                "b.txt",
+                "copilot_edit",
+                &edit_input,
+                &before,
+                b"after\n",
+            ),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[cfg(windows)]
     fn result_io_test_dir(name: &str) -> PathBuf {

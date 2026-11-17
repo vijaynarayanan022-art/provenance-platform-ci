@@ -434,6 +434,109 @@ fn file_report(fixture: &Fixture, commit: &str) -> Value {
     .unwrap()
 }
 
+fn copilot_file_tool_payload(
+    fixture: &Fixture,
+    event: &str,
+    session: &str,
+    tool_use_id: &str,
+    tool_name: &str,
+    tool_input: Value,
+) -> Value {
+    json!({
+        "hook_event_name":event,
+        "session_id":session,
+        "cwd":fixture.repo,
+        "tool_use_id":tool_use_id,
+        "tool_name":tool_name,
+        "tool_input":tool_input
+    })
+}
+
+fn run_copilot_file_tool(
+    fixture: &Fixture,
+    session: &str,
+    tool_use_id: &str,
+    tool_name: &str,
+    tool_input: Value,
+    after: &[u8],
+) {
+    let pre = copilot_file_tool_payload(
+        fixture,
+        "PreToolUse",
+        session,
+        tool_use_id,
+        tool_name,
+        tool_input.clone(),
+    );
+    assert_hook_response(&fixture.hook(&pre, "vscode"));
+    let path = PathBuf::from(tool_input["path"].as_str().unwrap());
+    fs::write(path, after).unwrap();
+    let post = copilot_file_tool_payload(
+        fixture,
+        "PostToolUse",
+        session,
+        tool_use_id,
+        tool_name,
+        tool_input,
+    );
+    assert_hook_response(&fixture.hook(&post, "vscode"));
+}
+
+fn derive_fixture_commit(fixture: &Fixture, message: &str) -> String {
+    let commit = fixture.commit(message);
+    let derived = fixture.cli(&[
+        "derive",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+    ]);
+    assert!(
+        derived.status.success(),
+        "{}",
+        String::from_utf8_lossy(&derived.stderr)
+    );
+    commit
+}
+
+fn explain_fixture_file(fixture: &Fixture, commit: &str, path: &str) -> Value {
+    let output = fixture.cli(&[
+        "explain",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        commit,
+        "--file",
+        path,
+        "--format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn assert_structured_edit_pass(explanation: &Value) {
+    assert!(explanation["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| line["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["condition"] == "structured_edit" && check["passed"] == true)));
+}
+
+fn assert_no_unrecognized_payload_for_session(fixture: &Fixture, session: &str) {
+    assert!(!events(&fixture.store).iter().any(|event| {
+        event["event"] == "unrecognized_payload" && event["session_id"] == session
+    }));
+}
+
 #[test]
 fn vscode_always_returns_exact_empty_object_for_empty_garbage_and_fixtures() {
     let fixture = Fixture::new("stdout");
@@ -794,6 +897,489 @@ fn recognized_existing_file_edit_tools_are_direct_and_unknown_tools_are_strong()
         .clone();
     assert_eq!(file["ai_direct"], 0);
     assert!(file["ai_strong"].as_u64().unwrap() > 0);
+    fixture.drop_root();
+}
+
+#[test]
+fn copilot_write_create_and_overwrite_are_verified_direct_edits() {
+    let fixture = Fixture::new("copilot-write");
+    let session = "copilot-write-session";
+    let path = fixture.repo.join("tap-demo.js");
+    let file_text = "function add(a, b) {\n  return a + b;\n}\n\nmodule.exports = { add };\n";
+    run_copilot_file_tool(
+        &fixture,
+        session,
+        "write-create",
+        "Write",
+        json!({"path":path,"file_text":file_text}),
+        file_text.as_bytes(),
+    );
+    let create_event = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["path"] == "tap-demo.js")
+        .unwrap();
+    assert_eq!(create_event["operation"], "copilot_write");
+    assert_eq!(create_event["structured_edit"], true);
+    assert!(create_event["structured_input_sha256"].is_string());
+    assert_eq!(
+        create_event["structured_added_lines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert!(create_event["line_ranges"].is_array());
+
+    let create_commit = derive_fixture_commit(&fixture, "Copilot creates tap-demo");
+    let create_file = file_report(&fixture, &create_commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tap-demo.js")
+        .unwrap()
+        .clone();
+    assert_eq!(create_file["ai_direct"], 4);
+    assert_eq!(create_file["ai_strong"], 0);
+    assert_eq!(create_file["unknown"], 0);
+    let create_explain = explain_fixture_file(&fixture, &create_commit, "tap-demo.js");
+    assert_structured_edit_pass(&create_explain);
+    assert!(create_explain["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|line| { line["category"] != "ai_direct" || line["firstFailedCondition"].is_null() }));
+
+    let overwrite = "replacement content\n";
+    run_copilot_file_tool(
+        &fixture,
+        session,
+        "write-overwrite",
+        "Write",
+        json!({"path":fixture.repo.join("tracked.txt"),"file_text":overwrite}),
+        overwrite.as_bytes(),
+    );
+    let overwrite_event = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["path"] == "tracked.txt")
+        .unwrap();
+    assert_eq!(overwrite_event["operation"], "copilot_write");
+    assert_eq!(overwrite_event["structured_edit"], true);
+    let overwrite_commit = derive_fixture_commit(&fixture, "Copilot overwrites tracked file");
+    let overwrite_file = file_report(&fixture, &overwrite_commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(overwrite_file["ai_direct"], 1);
+    assert_eq!(overwrite_file["unknown"], 0);
+    assert_structured_edit_pass(&explain_fixture_file(
+        &fixture,
+        &overwrite_commit,
+        "tracked.txt",
+    ));
+    assert_no_unrecognized_payload_for_session(&fixture, session);
+    fixture.drop_root();
+}
+
+#[test]
+fn copilot_edit_replacement_is_verified_with_lf_and_crlf_snapshots() {
+    let fixture = Fixture::new("copilot-edit-eol");
+    let before = "function add(a, b) {\n  return a + b;\n}\n\nmodule.exports = { add };\n";
+    let after =
+        "function add(a, b) {\n  return a + b;\n}\n\nfunction sub(a, b) {\n  return a - b;\n}\n\nmodule.exports = { add, sub };\n";
+    let lf_path = fixture.repo.join("edit-lf.js");
+    let crlf_path = fixture.repo.join("edit-crlf.js");
+    fs::write(&lf_path, before).unwrap();
+    fs::write(&crlf_path, before.replace('\n', "\r\n")).unwrap();
+    let _baseline = fixture.commit("edit files baseline");
+
+    for (name, path, after_bytes) in [
+        ("edit-lf", lf_path, after.as_bytes().to_vec()),
+        (
+            "edit-crlf",
+            crlf_path,
+            after.replace('\n', "\r\n").into_bytes(),
+        ),
+    ] {
+        run_copilot_file_tool(
+            &fixture,
+            "copilot-edit-session",
+            name,
+            "Edit",
+            json!({"path":path,"old_str":before,"new_str":after}),
+            &after_bytes,
+        );
+    }
+
+    let recorded: Vec<_> = events(&fixture.store)
+        .into_iter()
+        .filter(|event| event["event"] == "ai_change" && event["operation"] == "copilot_edit")
+        .collect();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded
+        .iter()
+        .all(|event| event["structured_edit"] == true));
+    assert!(recorded
+        .iter()
+        .all(|event| event["structured_input_sha256"].is_string()));
+    assert!(recorded
+        .iter()
+        .all(|event| event["structured_added_lines"].as_array().is_some()));
+
+    let commit = derive_fixture_commit(&fixture, "Copilot edits LF and CRLF files");
+    for path in ["edit-lf.js", "edit-crlf.js"] {
+        let file = file_report(&fixture, &commit)["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"] == path)
+            .unwrap()
+            .clone();
+        assert_eq!(file["ai_direct"], 4, "{path}: {file}");
+        assert_eq!(file["ai_strong"], 0, "{path}: {file}");
+        assert_eq!(file["unknown"], 0, "{path}: {file}");
+        let explanation = explain_fixture_file(&fixture, &commit, path);
+        assert_structured_edit_pass(&explanation);
+        let added_closing_brace = after
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| *line == "}")
+            .nth(1)
+            .map(|(index, _)| index + 1)
+            .unwrap();
+        let brace = explanation["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|line| line["line"] == added_closing_brace)
+            .unwrap();
+        assert_eq!(brace["category"], "ai_direct", "{path}: {brace}");
+        assert!(brace["firstFailedCondition"].is_null(), "{path}: {brace}");
+    }
+    assert_no_unrecognized_payload_for_session(&fixture, "copilot-edit-session");
+    fixture.drop_root();
+}
+
+#[test]
+fn copilot_edit_requires_exact_reproduction_before_direct_credit() {
+    let fixture = Fixture::new("copilot-edit-verification");
+    let missing_old = json!({
+        "path":fixture.repo.join("tracked.txt"),
+        "old_str":"not present",
+        "new_str":"added by Copilot\n"
+    });
+    run_copilot_file_tool(
+        &fixture,
+        "copilot-edit-verification",
+        "missing-old",
+        "Edit",
+        missing_old,
+        b"base\nadded by Copilot\n",
+    );
+    let missing_event = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["tool_use_id"] == "missing-old")
+        .unwrap();
+    assert_eq!(missing_event["structured_edit"], false);
+    let missing_commit = derive_fixture_commit(&fixture, "Unverified missing old text");
+    let missing_file = file_report(&fixture, &missing_commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(missing_file["ai_direct"], 0);
+    assert_eq!(missing_file["ai_strong"], 1);
+
+    let mismatched = json!({
+        "path":fixture.repo.join("tracked.txt"),
+        "old_str":"added by Copilot\n",
+        "new_str":"generated replacement\n"
+    });
+    run_copilot_file_tool(
+        &fixture,
+        "copilot-edit-verification",
+        "human-typed-window",
+        "Edit",
+        mismatched,
+        b"base\nhuman replacement\n",
+    );
+    let mismatch_event = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["tool_use_id"] == "human-typed-window")
+        .unwrap();
+    assert_eq!(mismatch_event["structured_edit"], false);
+    let mismatch_commit = derive_fixture_commit(&fixture, "Unverified in-window human change");
+    let mismatch_file = file_report(&fixture, &mismatch_commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(mismatch_file["ai_direct"], 0);
+    assert_no_unrecognized_payload_for_session(&fixture, "copilot-edit-verification");
+    fixture.drop_root();
+}
+
+#[test]
+fn copilot_edit_requires_unique_old_text_and_caps_input_size() {
+    let fixture = Fixture::new("copilot-edit-bounds");
+    fs::write(fixture.repo.join("tracked.txt"), "aba\n").unwrap();
+    let _baseline = fixture.commit("duplicate old text baseline");
+    run_copilot_file_tool(
+        &fixture,
+        "copilot-edit-bounds",
+        "duplicate-old",
+        "Edit",
+        json!({
+            "path":fixture.repo.join("tracked.txt"),
+            "old_str":"a",
+            "new_str":"x"
+        }),
+        b"xba\n",
+    );
+    let duplicate_event = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["tool_use_id"] == "duplicate-old")
+        .unwrap();
+    assert_eq!(duplicate_event["structured_edit"], false);
+    let duplicate_commit = derive_fixture_commit(&fixture, "Ambiguous old text");
+    let duplicate_file = file_report(&fixture, &duplicate_commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(duplicate_file["ai_direct"], 0);
+
+    let mut oversized_input = json!({
+        "path":fixture.repo.join("tracked.txt"),
+        "file_text":"small replacement\n"
+    });
+    oversized_input["padding"] = json!("x".repeat(1024 * 1024));
+    run_copilot_file_tool(
+        &fixture,
+        "copilot-edit-bounds",
+        "oversized-input",
+        "Write",
+        oversized_input,
+        b"small replacement\n",
+    );
+    let oversized_event = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["tool_use_id"] == "oversized-input")
+        .unwrap();
+    assert_eq!(oversized_event["structured_edit"], false);
+    let oversized_commit = derive_fixture_commit(&fixture, "Oversized tool input");
+    let oversized_file = file_report(&fixture, &oversized_commit)["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap()
+        .clone();
+    assert_eq!(oversized_file["ai_direct"], 0);
+    assert_no_unrecognized_payload_for_session(&fixture, "copilot-edit-bounds");
+    fixture.drop_root();
+}
+
+#[test]
+fn copilot_current_file_tools_do_not_verify_another_changed_path() {
+    let fixture = Fixture::new("copilot-edit-path-scope");
+    let path_a = fixture.repo.join("file-a.txt");
+    let path_b = fixture.repo.join("file-b.txt");
+    fs::write(&path_a, "base\n").unwrap();
+    fs::write(&path_b, "base\n").unwrap();
+    let _baseline = fixture.commit("two file baseline");
+    let payload = copilot_file_tool_payload(
+        &fixture,
+        "PreToolUse",
+        "copilot-path-scope",
+        "write-a",
+        "Write",
+        json!({"path":path_a,"file_text":"changed\n"}),
+    );
+    assert_hook_response(&fixture.hook(&payload, "vscode"));
+    fs::write(&path_a, "changed\n").unwrap();
+    fs::write(&path_b, "changed\n").unwrap();
+    let post = copilot_file_tool_payload(
+        &fixture,
+        "PostToolUse",
+        "copilot-path-scope",
+        "write-a",
+        "Write",
+        payload["tool_input"].clone(),
+    );
+    assert_hook_response(&fixture.hook(&post, "vscode"));
+
+    let recorded = events(&fixture.store);
+    let event_a = recorded
+        .iter()
+        .find(|event| event["event"] == "ai_change" && event["path"] == "file-a.txt")
+        .unwrap();
+    assert_eq!(event_a["structured_edit"], true);
+    assert!(!recorded
+        .iter()
+        .any(|event| event["event"] == "ai_change" && event["path"] == "file-b.txt"));
+    assert_no_unrecognized_payload_for_session(&fixture, "copilot-path-scope");
+    fixture.drop_root();
+}
+
+#[test]
+fn edit_object_with_input_field_keeps_legacy_apply_patch_operation() {
+    let fixture = Fixture::new("edit-object-legacy");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n base\n+legacy added line\n*** End Patch",
+        fixture.repo.join("tracked.txt").display()
+    );
+    let tool_input = json!({"input":patch});
+    let pre = copilot_file_tool_payload(
+        &fixture,
+        "PreToolUse",
+        "legacy-edit-session",
+        "legacy-edit",
+        "Edit",
+        tool_input.clone(),
+    );
+    assert_hook_response(&fixture.hook(&pre, "vscode"));
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        "base\nlegacy added line\n",
+    )
+    .unwrap();
+    let post = copilot_file_tool_payload(
+        &fixture,
+        "PostToolUse",
+        "legacy-edit-session",
+        "legacy-edit",
+        "Edit",
+        tool_input,
+    );
+    assert_hook_response(&fixture.hook(&post, "vscode"));
+    let event = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["path"] == "tracked.txt")
+        .unwrap();
+    assert_eq!(event["operation"], "apply_patch");
+    assert_eq!(event["structured_edit"], false);
+    assert_no_unrecognized_payload_for_session(&fixture, "legacy-edit-session");
+    fixture.drop_root();
+}
+
+#[test]
+fn copilot_edit_human_followup_remains_mixed() {
+    let fixture = Fixture::new("copilot-edit-human-followup");
+    let input = json!({
+        "path":fixture.repo.join("tracked.txt"),
+        "old_str":"base\n",
+        "new_str":"calculate_total = left + right\n"
+    });
+    run_copilot_file_tool(
+        &fixture,
+        "copilot-edit-human-session",
+        "verified-edit",
+        "Edit",
+        input,
+        b"calculate_total = left + right\n",
+    );
+
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        "calculate_total = left + right + offset\n",
+    )
+    .unwrap();
+    let followup = copilot_file_tool_payload(
+        &fixture,
+        "PreToolUse",
+        "copilot-edit-human-session",
+        "next-write",
+        "Write",
+        json!({
+            "path":fixture.repo.join("tracked.txt"),
+            "file_text":"calculate_total = left + right + offset\n"
+        }),
+    );
+    assert_hook_response(&fixture.hook(&followup, "vscode"));
+    let followup_post = copilot_file_tool_payload(
+        &fixture,
+        "PostToolUse",
+        "copilot-edit-human-session",
+        "next-write",
+        "Write",
+        followup["tool_input"].clone(),
+    );
+    assert_hook_response(&fixture.hook(&followup_post, "vscode"));
+
+    let commit = derive_fixture_commit(&fixture, "Human follows up on Copilot edit");
+    let report = file_report(&fixture, &commit);
+    let file = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "tracked.txt")
+        .unwrap();
+    assert_eq!(file["mixed"], 1, "{file}");
+    assert_eq!(file["ai_direct"], 0, "{file}");
+    assert_no_unrecognized_payload_for_session(&fixture, "copilot-edit-human-session");
+    fixture.drop_root();
+}
+
+#[test]
+fn copilot_edit_added_brace_does_not_compete_with_same_event_preexisting_brace() {
+    let fixture = Fixture::new("copilot-edit-duplicate-brace");
+    let path = fixture.repo.join("task-utils.js");
+    let before =
+        "function getStaleTasks() {\n  return [];\n}\n\nmodule.exports = { getStaleTasks };\n";
+    let after = "function getStaleTasks() {\n  return [];\n}\n\nfunction getFreshTasks() {\n  return [];\n}\n\nmodule.exports = { getStaleTasks, getFreshTasks };\n";
+    fs::write(&path, before).unwrap();
+    let _baseline = fixture.commit("task utility baseline");
+    run_copilot_file_tool(
+        &fixture,
+        "copilot-duplicate-session",
+        "same-event-brace",
+        "Edit",
+        json!({"path":path,"old_str":"module.exports = { getStaleTasks };","new_str":"function getFreshTasks() {\n  return [];\n}\n\nmodule.exports = { getStaleTasks, getFreshTasks };"}),
+        after.as_bytes(),
+    );
+    let event = events(&fixture.store)
+        .into_iter()
+        .find(|event| event["event"] == "ai_change" && event["tool_use_id"] == "same-event-brace")
+        .unwrap();
+    assert_eq!(event["structured_edit"], true);
+
+    let commit = derive_fixture_commit(&fixture, "Add fresh task utility");
+    let report = file_report(&fixture, &commit);
+    let file = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "task-utils.js")
+        .unwrap();
+    assert_eq!(file["ai_direct"], 4, "{file}");
+    assert_eq!(file["unknown"], 0, "{file}");
+    let explanation = explain_fixture_file(&fixture, &commit, "task-utils.js");
+    let new_function_start = after
+        .lines()
+        .position(|line| line.starts_with("function getFreshTasks()"))
+        .unwrap();
+    let new_closing_brace = new_function_start + 3;
+    let closing_brace = explanation["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["line"] == new_closing_brace)
+        .unwrap_or_else(|| panic!("line {new_closing_brace} missing: {explanation}"));
+    assert_eq!(closing_brace["category"], "ai_direct", "{closing_brace}");
+    assert!(
+        closing_brace["firstFailedCondition"].is_null(),
+        "{closing_brace}"
+    );
+    assert_no_unrecognized_payload_for_session(&fixture, "copilot-duplicate-session");
     fixture.drop_root();
 }
 
