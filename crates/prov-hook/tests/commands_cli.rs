@@ -421,7 +421,7 @@ fn summary_range_matches_pr_report_and_expands_full_category_names() {
     assert!(summary["versions"].is_object());
     assert_eq!(
         summary["versions"]["line_survival"],
-        "unobserved-mixed-cross-commit-v2"
+        "unobserved-position-mapped-v3"
     );
     assert_eq!(summary["versions"]["min_mixed_overlap"], 0.5);
     assert_eq!(summary["commits"].as_array().unwrap().len(), 3);

@@ -2,6 +2,29 @@ use similar::{capture_diff_slices, Algorithm, DiffTag};
 use std::collections::{HashMap, HashSet};
 
 pub const MIN_MIXED_OVERLAP: f64 = 0.5;
+const MAX_POSITION_MAPPING_BYTES: usize = 4 * 1024 * 1024;
+const MAX_POSITION_MAPPING_WORK: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub(crate) struct PositionMappingCandidate {
+    pub step_index: usize,
+    pub snapshot_line_numbers: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PositionMappingTrace {
+    pub step_index: usize,
+    pub snapshot_line: usize,
+    pub committed_line: Option<usize>,
+    pub equal_region_bounds: Option<[usize; 4]>,
+    pub decision: &'static str,
+}
+
+pub(crate) struct UnobservedDerivation {
+    pub lines: Vec<AttributedLine>,
+    pub position_mappings: Vec<PositionMappingTrace>,
+    pub protected_committed_lines: HashSet<usize>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepKind {
@@ -118,6 +141,7 @@ pub struct AttributedLine {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnobservedEditKind {
     ExactSurvivorInChangedFile,
+    PositionMapped,
     MixedByTokenOverlap,
     MixedBySimilarity,
     MixedByPriorAiEdit,
@@ -267,12 +291,24 @@ fn duplicate_candidates_share_ai_source(line: &[u8], evidence: &Evidence) -> boo
 /// Reconcile an unobserved final edit against the last captured AI snapshot.
 /// The caller uses this only when no later observed non-AI step supersedes that snapshot.
 pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Vec<AttributedLine> {
+    derive_lines_with_position_mapping(ev, committed, &[]).lines
+}
+
+pub(crate) fn derive_lines_with_position_mapping(
+    ev: &Evidence,
+    committed: &[u8],
+    candidates: &[PositionMappingCandidate],
+) -> UnobservedDerivation {
     let Some(last_ai_step) = ev
         .steps
         .iter()
         .rposition(|step| matches!(step.kind, StepKind::Ai { .. }))
     else {
-        return derive_lines_with_attribution(ev, committed);
+        return UnobservedDerivation {
+            lines: derive_lines_with_attribution(ev, committed),
+            position_mappings: Vec::new(),
+            protected_committed_lines: HashSet::new(),
+        };
     };
 
     let parent = split_lines(&ev.parent);
@@ -313,6 +349,8 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
     let ops = capture_diff_slices(Algorithm::Myers, &snapshot, &committed_lines);
     let has_unmatched_changes = ops.iter().any(|op| op.tag() != DiffTag::Equal);
     let added = added_lines(&parent, &committed_lines);
+    let position_mapping = position_map_lines(ev, committed, candidates, last_ai_step, &added);
+    let mapped_committed_lines: HashSet<_> = position_mapping.claims.keys().copied().collect();
     let mut snapshot_counts = HashMap::<Vec<u8>, usize>::new();
     for line in &snapshot {
         *snapshot_counts.entry(line.clone()).or_default() += 1;
@@ -327,10 +365,33 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
         committed_lines.len()
     ];
     let mut unobserved_edits = vec![None; committed_lines.len()];
+    for (&committed_index, claim_indices) in &position_mapping.claims {
+        if claim_indices.len() != 1 {
+            committed_owners[committed_index] = OwnedLine {
+                owner: Owner::Gap,
+                candidates: owner_candidate(Owner::Gap),
+                source_step: None,
+                ambiguous: true,
+            };
+            continue;
+        }
+        let claim = &position_mapping.traces[claim_indices[0]];
+        committed_owners[committed_index] = OwnedLine {
+            owner: Owner::Ai,
+            candidates: owner_candidate(Owner::Ai),
+            source_step: Some(claim.step_index),
+            ambiguous: false,
+        };
+        unobserved_edits[committed_index] = Some(UnobservedEditKind::PositionMapped);
+    }
+
     let mut cursor = 0;
     while cursor < ops.len() {
         if ops[cursor].tag() == DiffTag::Equal {
             for (old_index, new_index) in ops[cursor].old_range().zip(ops[cursor].new_range()) {
+                if mapped_committed_lines.contains(&new_index) {
+                    continue;
+                }
                 let owner = owners[old_index];
                 if is_ai_ancestry(owner.owner) && has_unmatched_changes {
                     unobserved_edits[new_index] =
@@ -349,11 +410,15 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
         let old_indices: Vec<_> = ops[start..cursor]
             .iter()
             .flat_map(|op| op.old_range())
-            .filter(|index| is_ai_ancestry(owners[*index].owner))
+            .filter(|index| {
+                is_ai_ancestry(owners[*index].owner)
+                    && !position_mapping.protected_snapshot_lines.contains(index)
+            })
             .collect();
         let new_indices: Vec<_> = ops[start..cursor]
             .iter()
             .flat_map(|op| op.new_range())
+            .filter(|index| !mapped_committed_lines.contains(index))
             .collect();
         let mut matched_new = HashSet::new();
         let mut remaining_old = Vec::new();
@@ -405,6 +470,9 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
     }
     let mut committed_occurrences = HashMap::<Vec<u8>, usize>::new();
     for (index, line) in committed_lines.iter().enumerate() {
+        if mapped_committed_lines.contains(&index) {
+            continue;
+        }
         let occurrence = committed_occurrences.entry(line.clone()).or_default();
         *occurrence += 1;
         let captured = snapshot_counts.get(line).copied().unwrap_or_default();
@@ -425,7 +493,7 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
 
     let duplicate_owners = duplicate_owners(&committed_owners);
 
-    committed_lines
+    let lines = committed_lines
         .iter()
         .enumerate()
         .map(|(index, line)| {
@@ -457,7 +525,261 @@ pub fn derive_lines_with_unobserved_edits(ev: &Evidence, committed: &[u8]) -> Ve
                 unobserved_edit: unobserved_edits[index],
             }
         })
-        .collect()
+        .collect();
+    UnobservedDerivation {
+        lines,
+        position_mappings: position_mapping.traces,
+        protected_committed_lines: mapped_committed_lines,
+    }
+}
+
+struct PositionMapLines {
+    claims: HashMap<usize, Vec<usize>>,
+    protected_snapshot_lines: HashSet<usize>,
+    traces: Vec<PositionMappingTrace>,
+}
+
+struct PositionMapCandidate {
+    step_index: usize,
+    snapshot_index: usize,
+    committed_index: Option<usize>,
+    equal_region_bounds: Option<[usize; 4]>,
+    decision: &'static str,
+    final_snapshot_index: Option<usize>,
+}
+
+struct BoundedLineDiff {
+    equal_targets: Vec<Option<usize>>,
+    equal_region_bounds: Vec<Option<[usize; 4]>>,
+    changed_targets: Vec<Option<usize>>,
+}
+
+fn position_map_lines(
+    ev: &Evidence,
+    committed: &[u8],
+    candidates: &[PositionMappingCandidate],
+    last_ai_step: usize,
+    added: &[bool],
+) -> PositionMapLines {
+    let mut pending = Vec::new();
+    for candidate in candidates {
+        if candidate.step_index > last_ai_step
+            || !matches!(ev.steps[candidate.step_index].kind, StepKind::Ai { .. })
+        {
+            continue;
+        }
+        let mut candidate_lines = HashSet::new();
+        for &line_number in &candidate.snapshot_line_numbers {
+            let Some(snapshot_index) = line_number.checked_sub(1) else {
+                continue;
+            };
+            if snapshot_index >= split_lines(&ev.steps[candidate.step_index].after).len()
+                || !candidate_lines.insert(snapshot_index)
+            {
+                continue;
+            }
+            pending.push(PositionMapCandidate {
+                step_index: candidate.step_index,
+                snapshot_index,
+                committed_index: None,
+                equal_region_bounds: None,
+                decision: "unmatched",
+                final_snapshot_index: None,
+            });
+        }
+    }
+    if pending.is_empty() {
+        return PositionMapLines {
+            claims: HashMap::new(),
+            protected_snapshot_lines: HashSet::new(),
+            traces: Vec::new(),
+        };
+    }
+
+    let mut work = 0;
+    let committed_lines = split_lines(committed);
+    let mut mapping_steps: Vec<_> = pending
+        .iter()
+        .map(|candidate| candidate.step_index)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    mapping_steps.sort_unstable();
+    for step_index in mapping_steps {
+        let snapshot_lines = split_lines(&ev.steps[step_index].after);
+        let Some(diff) = bounded_line_diff(&snapshot_lines, &committed_lines, &mut work) else {
+            return capped_position_map(pending);
+        };
+        for candidate in pending
+            .iter_mut()
+            .filter(|candidate| candidate.step_index == step_index)
+        {
+            if let Some(committed_index) = diff.equal_targets[candidate.snapshot_index] {
+                candidate.committed_index = Some(committed_index);
+                candidate.equal_region_bounds = diff.equal_region_bounds[candidate.snapshot_index];
+                candidate.decision = if added.get(committed_index).copied().unwrap_or(false) {
+                    "mapped"
+                } else {
+                    "not_added"
+                };
+            } else if let Some(committed_index) = diff.changed_targets[candidate.snapshot_index] {
+                candidate.committed_index = Some(committed_index);
+                candidate.decision = "changed";
+            } else {
+                candidate.decision = "deleted";
+            }
+        }
+    }
+
+    let mut active_positions = vec![None; pending.len()];
+    let mut previous = Vec::new();
+    for (step_index, step) in ev.steps.iter().enumerate().take(last_ai_step + 1) {
+        let current = split_lines(&step.after);
+        if step_index > 0 && active_positions.iter().any(Option::is_some) {
+            let Some(diff) = bounded_line_diff(&previous, &current, &mut work) else {
+                return capped_position_map(pending);
+            };
+            for position in &mut active_positions {
+                *position = position.and_then(|old_index| diff.equal_targets[old_index]);
+            }
+        }
+        for (index, candidate) in pending.iter().enumerate() {
+            if candidate.step_index == step_index {
+                active_positions[index] = Some(candidate.snapshot_index);
+            }
+        }
+        previous = current;
+    }
+    for (candidate, final_index) in pending.iter_mut().zip(active_positions) {
+        candidate.final_snapshot_index = candidate
+            .final_snapshot_index
+            .or(final_index.filter(|_| candidate.decision == "mapped"));
+    }
+
+    let mut claims = HashMap::<usize, Vec<usize>>::new();
+    let mut protected_snapshot_lines = HashSet::new();
+    let mut traces = Vec::with_capacity(pending.len());
+    for (index, candidate) in pending.iter().enumerate() {
+        if candidate.decision == "mapped" {
+            if let Some(committed_index) = candidate.committed_index {
+                claims.entry(committed_index).or_default().push(index);
+            }
+            if let Some(snapshot_index) = candidate.final_snapshot_index {
+                protected_snapshot_lines.insert(snapshot_index);
+            }
+        }
+        traces.push(PositionMappingTrace {
+            step_index: candidate.step_index,
+            snapshot_line: candidate.snapshot_index + 1,
+            committed_line: candidate.committed_index.map(|line| line + 1),
+            equal_region_bounds: candidate.equal_region_bounds,
+            decision: candidate.decision,
+        });
+    }
+    for claim_indices in claims.values() {
+        if claim_indices.len() > 1 {
+            for &index in claim_indices {
+                traces[index].decision = "conflicting_claim";
+            }
+        }
+    }
+    PositionMapLines {
+        claims,
+        protected_snapshot_lines,
+        traces,
+    }
+}
+
+fn capped_position_map(candidates: Vec<PositionMapCandidate>) -> PositionMapLines {
+    let traces = candidates
+        .iter()
+        .map(|candidate| PositionMappingTrace {
+            step_index: candidate.step_index,
+            snapshot_line: candidate.snapshot_index + 1,
+            committed_line: None,
+            equal_region_bounds: None,
+            decision: "fallback_cap",
+        })
+        .collect();
+    PositionMapLines {
+        claims: HashMap::new(),
+        protected_snapshot_lines: HashSet::new(),
+        traces,
+    }
+}
+
+fn bounded_line_diff(
+    old: &[Vec<u8>],
+    new: &[Vec<u8>],
+    work: &mut usize,
+) -> Option<BoundedLineDiff> {
+    let byte_count = old
+        .iter()
+        .chain(new)
+        .try_fold(0usize, |total, line| total.checked_add(line.len()))?;
+    let combined_lines = old.len().checked_add(new.len())?;
+    let estimated_work = combined_lines.checked_mul(combined_lines)?;
+    if byte_count > MAX_POSITION_MAPPING_BYTES
+        || work.checked_add(estimated_work)? > MAX_POSITION_MAPPING_WORK
+    {
+        return None;
+    }
+    *work += estimated_work;
+
+    let operations = capture_diff_slices(Algorithm::Myers, old, new);
+    let mut old_to_new = vec![None; old.len()];
+    let mut regions = vec![None; old.len()];
+    let mut changed_to_new = vec![None; old.len()];
+    let mut cursor = 0;
+    while cursor < operations.len() {
+        if operations[cursor].tag() == DiffTag::Equal {
+            let old_range = operations[cursor].old_range();
+            let new_range = operations[cursor].new_range();
+            let Some(old_start) = old_range.clone().next() else {
+                cursor += 1;
+                continue;
+            };
+            let Some(old_end) = old_range.clone().last() else {
+                cursor += 1;
+                continue;
+            };
+            let Some(new_start) = new_range.clone().next() else {
+                cursor += 1;
+                continue;
+            };
+            let Some(new_end) = new_range.clone().last() else {
+                cursor += 1;
+                continue;
+            };
+            let bounds = [old_start + 1, old_end + 1, new_start + 1, new_end + 1];
+            for (old_index, new_index) in old_range.zip(new_range) {
+                old_to_new[old_index] = Some(new_index);
+                regions[old_index] = Some(bounds);
+            }
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor < operations.len() && operations[cursor].tag() != DiffTag::Equal {
+            cursor += 1;
+        }
+        let old_indices: Vec<_> = operations[start..cursor]
+            .iter()
+            .flat_map(|op| op.old_range())
+            .collect();
+        let new_indices: Vec<_> = operations[start..cursor]
+            .iter()
+            .flat_map(|op| op.new_range())
+            .collect();
+        for (relative, old_index) in old_indices.into_iter().enumerate() {
+            changed_to_new[old_index] = new_indices.get(relative).copied();
+        }
+    }
+    Some(BoundedLineDiff {
+        equal_targets: old_to_new,
+        equal_region_bounds: regions,
+        changed_targets: changed_to_new,
+    })
 }
 
 /// Return AI-owned snapshot lines removed in each changed hunk, with nonblank additions

@@ -247,6 +247,14 @@ When an eligible unknown added line replaces a nonblank parent line, derivation 
 
 This is a **proposed spec change pending sign-off** on three decisions: use `mixed` for the human edit of prior AI text; follow the line to its origin without a fixed ancestry depth; and count carried lines toward unobserved-edit coverage. Known limit: the origin commit must already have a current stored derivation in the local provenance store.
 
+
+## Round 36: position-mapped survival for hand-edited files
+
+For a structured-edit AI event with available after-snapshot bytes and passing `before_sha`, `after_sha`, and `line_ranges` gates, derivation diffs the normalized snapshot against committed content. AI-added snapshot lines in equal diff regions map by position to committed lines; a unique claim is `ai_strong` at 0.92 with `EXACT_FRAGMENT_MATCH`, supporting `POSITION_MAPPED`, and limiting `X_UNOBSERVED_EDIT_IN_FILE`. Competing event claims leave the committed line unknown with `CONFLICTING_EVIDENCE`. Changed, moved, deleted, and unmatched lines stay on existing mixed/unknown rules. The bounded mapping falls back to existing behavior when its work cap is reached.
+
+This position-mapping rule is a **PROPOSED spec change pending sign-off**. The line-survival version is now `unobserved-position-mapped-v3`. This also versions the r34 prior-AI carry rule: stored results using the previous version are stale for that rule until re-derived. Re-derive the range oldest commit first so each later commit can use the refreshed origin report.
+
+Known limit: on hand-edited files, only verified structured-edit events with stored snapshots can position-map unchanged AI lines. Large files that exceed the mapping cap, events with failed gates, and lines outside equal regions retain the prior fallback behavior; repeated text alone does not establish a position.
 ## Round 35: discard-boundary characterization
 
 No behavior change is proposed in this round. The characterization uses synthetic snapshot-diff edits with real Git operations and the existing Codex helpers; structured-edit (`ai_direct`) discard cases are not covered here and will be covered by the live pass.
