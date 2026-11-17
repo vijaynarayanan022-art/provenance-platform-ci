@@ -2406,6 +2406,160 @@ fn read_blob(path: &Path, expected_sha: &str) -> Option<Vec<u8>> {
     let bytes = fs::read(path).ok()?;
     (hash(&bytes) == expected_sha).then_some(bytes)
 }
+pub(crate) fn read_derive_result(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        retry_derive_result_io(path, || fs::read(path))
+    }
+    #[cfg(not(windows))]
+    {
+        fs::read(path)
+    }
+}
+pub(crate) fn atomic_derive_result(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        retry_derive_result_io(path, || atomic_bytes(path, bytes, sync))
+    }
+    #[cfg(not(windows))]
+    {
+        atomic_bytes(path, bytes, sync)
+    }
+}
+#[cfg(windows)]
+fn retry_derive_result_io<T>(
+    path: &Path,
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    const RETRY_BUDGET: Duration = Duration::from_secs(3);
+    const MAX_DELAY: Duration = Duration::from_millis(200);
+    let started = Instant::now();
+    let mut delay = Duration::from_millis(10);
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if !is_transient_result_io_error(&error, path) {
+                    return Err(error);
+                }
+                let remaining = RETRY_BUDGET.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(delay.min(remaining));
+                delay = (delay * 2).min(MAX_DELAY);
+            }
+        }
+    }
+}
+#[cfg(windows)]
+fn is_transient_result_io_error(error: &std::io::Error, path: &Path) -> bool {
+    if path.is_dir() {
+        return false;
+    }
+    match error.raw_os_error() {
+        Some(5) => path.is_file(),
+        Some(32 | 33 | 1175 | 1176 | 1177) => true,
+        _ => false,
+    }
+}
+#[cfg(windows)]
+fn extended_length_path(path: &Path, use_extended_length: bool) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    if !use_extended_length {
+        return path.to_path_buf();
+    }
+
+    let original: Vec<_> = path.as_os_str().encode_wide().collect();
+    const EXTENDED_PREFIX: [u16; 4] = [92, 92, 63, 92];
+    const EXTENDED_UNC_PREFIX: [u16; 8] = [92, 92, 63, 92, 85, 78, 67, 92];
+    if !original.starts_with(&EXTENDED_PREFIX) && !path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if !original.starts_with(&EXTENDED_PREFIX) && original.starts_with(&[92, 92, 46, 92]) {
+        return path.to_path_buf();
+    }
+
+    let normalized: Vec<_> = original
+        .iter()
+        .map(|&unit| if unit == 47 { 92 } else { unit })
+        .collect();
+    let (root, rest): (Vec<u16>, Vec<&[u16]>) = if normalized.starts_with(&EXTENDED_UNC_PREFIX) {
+        let components = normalized[EXTENDED_UNC_PREFIX.len()..]
+            .split(|unit| *unit == 92)
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        let [server, share, remaining @ ..] = components.as_slice() else {
+            return path.to_path_buf();
+        };
+        let mut root = EXTENDED_UNC_PREFIX.to_vec();
+        root.extend_from_slice(server);
+        root.push(92);
+        root.extend_from_slice(share);
+        root.push(92);
+        (root, remaining.to_vec())
+    } else if normalized.starts_with(&EXTENDED_PREFIX) {
+        if normalized.len() < 7 || normalized[5] != 58 || normalized[6] != 92 {
+            return path.to_path_buf();
+        }
+        (
+            normalized[..7].to_vec(),
+            normalized[7..]
+                .split(|unit| *unit == 92)
+                .collect::<Vec<_>>(),
+        )
+    } else if normalized.starts_with(&[92, 92]) {
+        let components = normalized[2..]
+            .split(|unit| *unit == 92)
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        let [server, share, remaining @ ..] = components.as_slice() else {
+            return path.to_path_buf();
+        };
+        let mut root = EXTENDED_UNC_PREFIX.to_vec();
+        root.extend_from_slice(server);
+        root.push(92);
+        root.extend_from_slice(share);
+        root.push(92);
+        (root, remaining.to_vec())
+    } else if normalized.len() >= 3 && normalized[1] == 58 && normalized[2] == 92 {
+        let mut root = EXTENDED_PREFIX.to_vec();
+        root.extend_from_slice(&normalized[..3]);
+        (
+            root,
+            normalized[3..]
+                .split(|unit| *unit == 92)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        return path.to_path_buf();
+    };
+
+    let mut components: Vec<&[u16]> = Vec::new();
+    for component in rest {
+        if component.is_empty() || *component == [46] {
+            continue;
+        }
+        if *component == [46, 46] {
+            components.pop();
+        } else {
+            components.push(component);
+        }
+    }
+
+    let mut extended = root;
+    for component in components {
+        if extended.last() != Some(&92) {
+            extended.push(92);
+        }
+        extended.extend_from_slice(component);
+    }
+    if normalized.last() == Some(&92) && extended.last() != Some(&92) {
+        extended.push(92);
+    }
+    PathBuf::from(std::ffi::OsString::from_wide(&extended))
+}
 fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -2432,8 +2586,24 @@ fn atomic_bytes(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     #[cfg(windows)]
     if path.exists() {
         use std::os::windows::ffi::OsStrExt;
-        let source: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let use_extended_length = temp
+            .as_os_str()
+            .encode_wide()
+            .count()
+            .max(path.as_os_str().encode_wide().count())
+            >= 200;
+        let source_path = extended_length_path(&temp, use_extended_length);
+        let destination_path = extended_length_path(path, use_extended_length);
+        let source: Vec<u16> = source_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let destination: Vec<u16> = destination_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
         // ReplaceFile preserves an atomic replacement for existing state/cache files.
         #[link(name = "Kernel32")]
         unsafe extern "system" {
@@ -2782,6 +2952,137 @@ pub fn process_json_timed(input: &[u8]) -> TimingSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::os::windows::ffi::OsStrExt;
+
+    #[cfg(windows)]
+    fn result_io_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "prov-result-io-{name}-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn result_io_retries_transient_codes_for_existing_file() {
+        let dir = result_io_test_dir("existing-file");
+        let path = dir.join("result.json");
+        fs::write(&path, b"result").unwrap();
+
+        for code in [5, 32, 33, 1175, 1176, 1177] {
+            assert!(
+                is_transient_result_io_error(&std::io::Error::from_raw_os_error(code), &path),
+                "expected error {code} to be transient for an existing file"
+            );
+        }
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn result_io_does_not_retry_missing_parent_or_directory_destination() {
+        let dir = result_io_test_dir("missing-parent");
+        let missing_path = dir.join("missing").join("result.json");
+        assert!(!is_transient_result_io_error(
+            &std::io::Error::from_raw_os_error(3),
+            &missing_path
+        ));
+
+        let directory_path = dir.join("result-directory");
+        fs::create_dir(&directory_path).unwrap();
+        assert!(!is_transient_result_io_error(
+            &std::io::Error::from_raw_os_error(5),
+            &directory_path
+        ));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn result_io_does_not_retry_unrecognized_codes() {
+        let dir = result_io_test_dir("unknown-code");
+        let path = dir.join("result.json");
+        fs::write(&path, b"result").unwrap();
+        assert!(!is_transient_result_io_error(
+            &std::io::Error::from_raw_os_error(3),
+            &path
+        ));
+        assert!(!is_transient_result_io_error(
+            &std::io::Error::from_raw_os_error(87),
+            &path
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extended_length_path_handles_windows_path_forms() {
+        let short = PathBuf::from(r"C:\temp\short.txt");
+        assert_eq!(extended_length_path(&short, false), short);
+
+        let long_drive = PathBuf::from(format!(r"C:\{}", "segment\\".repeat(30)));
+        let extended_drive = extended_length_path(&long_drive, true);
+        assert!(extended_drive.to_string_lossy().starts_with(r"\\?\C:\"));
+
+        let forward_slashes = PathBuf::from(format!("C:/{}", "segment/".repeat(30)));
+        let normalized = extended_length_path(&forward_slashes, true);
+        assert!(normalized.to_string_lossy().starts_with(r"\\?\C:\"));
+        assert!(!normalized.to_string_lossy().contains('/'));
+
+        let unc = PathBuf::from(format!(r"\\server\share\{}", "segment\\".repeat(30)));
+        let extended_unc = extended_length_path(&unc, true);
+        assert!(extended_unc
+            .to_string_lossy()
+            .starts_with(r"\\?\UNC\server\share\"));
+
+        let verbatim = PathBuf::from(r"\\?\C:\already\verbatim.txt");
+        assert_eq!(extended_length_path(&verbatim, true), verbatim);
+
+        let relative = PathBuf::from(format!("relative\\{}", "segment\\".repeat(30)));
+        assert_eq!(extended_length_path(&relative, true), relative);
+
+        let parent_segment =
+            PathBuf::from(format!(r"C:\root\folder\..\base\{}", "segment".repeat(30)));
+        let normalized_parent = extended_length_path(&parent_segment, true);
+        assert!(normalized_parent
+            .to_string_lossy()
+            .starts_with(r"\\?\C:\root\base\"));
+        assert!(!normalized_parent.to_string_lossy().contains(r"\..\"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_bytes_overwrites_hook_state_path_with_forward_slash() {
+        let root = std::env::temp_dir().join(format!(
+            "prov-hook-verbatim-state-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination_prefix = format!(
+            "{}\\capture store\\hook-state-directory-long-enough-to-exercise-extended-paths\\repos\\{}\\state",
+            root.display(),
+            "a".repeat(64)
+        );
+        let destination = PathBuf::from(format!("{destination_prefix}/repo.json"));
+        let path_length = destination.as_os_str().encode_wide().count();
+        assert!(
+            (200..300).contains(&path_length),
+            "test destination length was {path_length}"
+        );
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"old state").unwrap();
+        atomic_bytes(&destination, b"new state", false).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new state");
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn apply_patch_payload_without_parsed_paths_falls_back_to_unscoped_capture() {
@@ -3009,6 +3310,36 @@ mod tests {
         assert_eq!(fs::read(&file).unwrap(), b"new");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_bytes_overwrites_long_windows_path() {
+        let root = std::env::temp_dir().join(format!(
+            "prov-long-path-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        let mut destination = root.clone();
+        for _ in 0..4 {
+            destination.push("a".repeat(70));
+        }
+        destination.push("result.json");
+        let parent = destination.parent().unwrap();
+        assert!(destination.to_string_lossy().len() >= 300);
+        let parent_text = parent.to_string_lossy();
+        let verbatim_parent = if let Some(unc_path) = parent_text.strip_prefix(r"\\") {
+            PathBuf::from(format!(r"\\?\UNC\{unc_path}"))
+        } else {
+            PathBuf::from(format!(r"\\?\{parent_text}"))
+        };
+        fs::create_dir_all(verbatim_parent).unwrap();
+
+        atomic_bytes(&destination, b"old bytes", false).unwrap();
+        atomic_bytes(&destination, b"new bytes", false).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new bytes");
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]

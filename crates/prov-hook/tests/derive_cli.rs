@@ -897,6 +897,189 @@ fn ai_commit(fixture: &Fixture, contents: &str, message: &str) -> String {
     commit
 }
 
+fn synthetic_ai_edit(fixture: &Fixture, path: &str, tool: &str, contents: &[u8]) {
+    fixture.hook("PreToolUse", tool);
+    fs::write(fixture.repo.join(path), contents).unwrap();
+    fixture.hook("PostToolUse", tool);
+}
+
+fn derive_report(fixture: &Fixture, commit: &str) -> Value {
+    let result = derive(fixture, commit);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    fixture.derived_value(commit)
+}
+
+#[test]
+fn r35_discard_scenarios_characterisation() {
+    let s1 = Fixture::new("r35-char-s1");
+    synthetic_ai_edit(&s1, "tracked.txt", "s1-ai", b"one\nreturn total + tax\n");
+    git(&s1.repo, &["restore", "tracked.txt"]);
+    fs::write(s1.repo.join("tracked.txt"), b"one\nreturn total + fee\n").unwrap();
+    let commit = s1.commit("S1 restored then human rewrite");
+    let report = derive_report(&s1, &commit);
+    assert_eq!(file(&report, "tracked.txt")["mixed"], 1);
+    let sidecar = s1.sidecar_value(&commit);
+    let attribution = attribution_for(&sidecar, "tracked.txt", "mixed");
+    assert!(!attribution["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("X_DISCARDED_EVIDENCE")));
+    let explanation = explain_json(&s1, &commit, "tracked.txt", Some(2));
+    assert!(!explanation["lines"][0]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| check["condition"] == "discard_boundary"));
+    s1.drop_root();
+
+    let s2 = Fixture::new("r35-char-s2");
+    synthetic_ai_edit(&s2, "tracked.txt", "s2-ai-first", b"one\nfirst AI text\n");
+    git(&s2.repo, &["restore", "tracked.txt"]);
+    synthetic_ai_edit(&s2, "tracked.txt", "s2-ai-second", b"one\nsecond AI text\n");
+    let commit = s2.commit("S2 restored then new AI edit");
+    let report = derive_report(&s2, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    let sidecar = s2.sidecar_value(&commit);
+    let attribution = attribution_for(&sidecar, "tracked.txt", "ai_strong");
+    assert_eq!(attribution["source"]["sessionRef"], "s2-ai-second");
+    s2.drop_root();
+
+    let s3 = Fixture::new("r35-char-s3");
+    fs::write(s3.repo.join("G.txt"), b"base G\n").unwrap();
+    git(&s3.repo, &["add", "."]);
+    git(&s3.repo, &["commit", "-m", "add G"]);
+    synthetic_ai_edit(&s3, "tracked.txt", "s3-ai", b"one\nAI F\n");
+    synthetic_ai_edit(&s3, "G.txt", "s3-ai", b"base G\nAI G\n");
+    git(&s3.repo, &["checkout", "--", "G.txt"]);
+    git(&s3.repo, &["add", "tracked.txt"]);
+    git(&s3.repo, &["commit", "-m", "S3 commit F only"]);
+    let commit = git_text(&s3.repo, &["rev-parse", "HEAD"]);
+    let report = derive_report(&s3, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    assert!(!report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["path"] == "G.txt"));
+    s3.drop_root();
+
+    let s4 = Fixture::new("r35-char-s4");
+    synthetic_ai_edit(&s4, "tracked.txt", "s4-ai", b"one\nstashed AI\n");
+    git(&s4.repo, &["stash", "push", "-m", "discarded AI"]);
+    fs::write(s4.repo.join("other.txt"), b"human change\n").unwrap();
+    let commit = s4.commit("S4 unrelated human change");
+    let report = derive_report(&s4, &commit);
+    assert!(report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["path"] != "tracked.txt" && entry["ai_strong"] == 0));
+    assert!(!git_text(&s4.repo, &["stash", "list"]).is_empty());
+    s4.drop_root();
+
+    let s5 = Fixture::new("r35-char-s5");
+    synthetic_ai_edit(&s5, "tracked.txt", "s5-ai", b"one\nstashed AI\n");
+    git(&s5.repo, &["stash", "push", "-m", "unchanged AI"]);
+    git(&s5.repo, &["stash", "pop"]);
+    let commit = s5.commit("S5 unchanged stash pop");
+    let report = derive_report(&s5, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    assert_eq!(file(&report, "tracked.txt")["ai_direct"], 0);
+    s5.drop_root();
+
+    let s6 = Fixture::new("r35-char-s6");
+    git(&s6.repo, &["branch", "other-branch"]);
+    synthetic_ai_edit(&s6, "tracked.txt", "s6-ai", b"one\nreturn total + tax\n");
+    git(&s6.repo, &["checkout", "-f", "other-branch"]);
+    fs::write(s6.repo.join("tracked.txt"), b"one\nreturn total + fee\n").unwrap();
+    let commit = s6.commit("S6 other branch human text");
+    let report = derive_report(&s6, &commit);
+    assert_eq!(file(&report, "tracked.txt")["mixed"], 1);
+    let sidecar = s6.sidecar_value(&commit);
+    assert!(
+        !attribution_for(&sidecar, "tracked.txt", "mixed")["limitingBasis"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("X_DISCARDED_EVIDENCE"))
+    );
+    assert!(
+        !explain_json(&s6, &commit, "tracked.txt", Some(2))["lines"][0]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["condition"] == "discard_boundary")
+    );
+    s6.drop_root();
+
+    let s7 = Fixture::new("r35-char-s7");
+    synthetic_ai_edit(&s7, "tracked.txt", "s7-ai", b"one\nAI retained\n");
+    git(&s7.repo, &["add", "tracked.txt"]);
+    git(&s7.repo, &["restore", "--staged", "tracked.txt"]);
+    let commit = s7.commit("S7 unstaged AI evidence");
+    let report = derive_report(&s7, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    assert_eq!(file(&report, "tracked.txt")["evidence"], "exact");
+    s7.drop_root();
+
+    let s8 = Fixture::new("r35-char-s8");
+    synthetic_ai_edit(&s8, "tracked.txt", "s8-ai", b"one\nreturn total + tax\n");
+    let older = git_text(&s8.repo, &["rev-parse", "HEAD"]);
+    git(&s8.repo, &["restore", "--source", &older, "tracked.txt"]);
+    fs::write(s8.repo.join("tracked.txt"), b"one\nreturn total + fee\n").unwrap();
+    let commit = s8.commit("S8 restored from older commit");
+    let report = derive_report(&s8, &commit);
+    assert_eq!(file(&report, "tracked.txt")["mixed"], 1);
+    let sidecar = s8.sidecar_value(&commit);
+    assert!(
+        !attribution_for(&sidecar, "tracked.txt", "mixed")["limitingBasis"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("X_DISCARDED_EVIDENCE"))
+    );
+    assert!(
+        !explain_json(&s8, &commit, "tracked.txt", Some(2))["lines"][0]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["condition"] == "discard_boundary")
+    );
+    s8.drop_root();
+
+    let s9 = Fixture::new("r35-char-s9");
+    let parent = git_text(&s9.repo, &["rev-parse", "HEAD"]);
+    synthetic_ai_edit(
+        &s9,
+        "tracked.txt",
+        "s9-discarded-ai",
+        b"one\nreset AI text\n",
+    );
+    let discarded = s9.commit("discarded text");
+    assert_eq!(
+        file(&derive_report(&s9, &discarded), "tracked.txt")["ai_strong"],
+        1
+    );
+    git(&s9.repo, &["reset", "--hard", &parent]);
+    synthetic_ai_edit(&s9, "tracked.txt", "s9-fresh-ai", b"one\nfresh AI text\n");
+    let commit = s9.commit("fresh AI after hard reset");
+    let report = derive_report(&s9, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    s9.drop_root();
+
+    let s10 = Fixture::new("r35-char-s10");
+    synthetic_ai_edit(&s10, "tracked.txt", "s10-ai", b"one\nidentical text\n");
+    git(&s10.repo, &["restore", "tracked.txt"]);
+    fs::write(s10.repo.join("tracked.txt"), b"one\nidentical text\n").unwrap();
+    let commit = s10.commit("S10 human retypes identical text");
+    let report = derive_report(&s10, &commit);
+    assert_eq!(file(&report, "tracked.txt")["ai_strong"], 1);
+    assert_eq!(file(&report, "tracked.txt")["ai_direct"], 0);
+    s10.drop_root();
+}
+
 const S_PY_AI_PARENT: &str =
     "def add(a,b):\n    return a + b\ndef sub(a,b):\n    return a - b\ndef neg(a):\n    return -a\n";
 
@@ -915,6 +1098,35 @@ fn time_cut_new_file(fixture: &Fixture, final_contents: &str, message: &str) -> 
         String::from_utf8_lossy(&result.stderr)
     );
     commit
+}
+
+fn time_cut_structured_file_commit(
+    name: &str,
+    path: &str,
+    before: &[u8],
+    ai_snapshot: &[u8],
+    committed: &[u8],
+    line_ranges: Value,
+) -> (Fixture, String, Value) {
+    let fixture = Fixture::new(name);
+    let file_path = fixture.repo.join(path);
+    fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+    fs::write(&file_path, before).unwrap();
+    fixture.commit("structured file baseline");
+    fixture.hook("PreToolUse", "structured-ai-edit");
+    fs::write(&file_path, ai_snapshot).unwrap();
+    fixture.hook("PostToolUse", "structured-ai-edit");
+    configure_structured_apply_patch(&fixture, path, Some(true), false, line_ranges);
+    fs::write(&file_path, committed).unwrap();
+    let commit = fixture.commit("hand-edited structured file");
+    let result = derive(&fixture, &commit);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report = fixture.derived_value(&commit);
+    (fixture, commit, report)
 }
 
 fn attribution_at_line<'a>(sidecar: &'a Value, path: &str, line: usize) -> &'a Value {
@@ -1269,6 +1481,365 @@ fn time_cut_new_file_pure_addition_stays_unknown_and_snapshot_lines_stay_strong(
         attribution_at_line(&sidecar, "final.py", 15)["category"],
         "ai_strong"
     );
+    fixture.drop_root();
+}
+
+#[test]
+fn position_mapping_survives_duplicate_lines_and_shifts_from_human_edits() {
+    let before = b"parent before\nparent after\n";
+    let ai_snapshot = b"parent before\nfunction alpha() {\n}\nreturn result;\n}\nfunction beta() {\n}\nparent after\n";
+    let committed = b"human before\nuser inserted before block\nfunction alpha() {\n}\nreturn result;\n}\nfunction beta() {\n}\nhuman after\n";
+    let (fixture, commit, report) = time_cut_structured_file_commit(
+        "position-mapping-duplicates-and-shifts",
+        "tracked.txt",
+        before,
+        ai_snapshot,
+        committed,
+        json!([[2, 7]]),
+    );
+
+    let tracked = file(&report, "tracked.txt");
+    assert_eq!(tracked["ai_strong"], 6);
+    assert_eq!(tracked["unknown"], 3);
+    let sidecar = fixture.sidecar_value(&commit);
+    for line in [3, 4, 5, 6, 7, 8] {
+        assert_eq!(
+            attribution_at_line(&sidecar, "tracked.txt", line)["category"],
+            "ai_strong"
+        );
+    }
+    for line in [1, 2, 9] {
+        assert_eq!(
+            attribution_at_line(&sidecar, "tracked.txt", line)["category"],
+            "unknown"
+        );
+    }
+
+    let explain = explain_json(&fixture, &commit, "tracked.txt", Some(4));
+    let mapped = &explain["lines"][0];
+    assert_eq!(mapped["category"], "ai_strong");
+    let position_gate = mapped["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["condition"] == "position_mapping")
+        .unwrap();
+    assert_eq!(position_gate["passed"], true);
+    let compared = position_gate["compared"].as_str().unwrap();
+    assert!(compared.contains("snapshot_line=3"));
+    assert!(compared.contains("committed_line=4"));
+    assert!(compared.contains("equal_region_bounds=snapshot=2-7,committed=3-8"));
+    assert!(compared.contains("decision=mapped"));
+    fixture.drop_root();
+}
+
+#[test]
+fn position_mapping_keeps_a_modified_ai_line_mixed() {
+    let (fixture, commit, report) = time_cut_structured_file_commit(
+        "position-mapping-mixed-line",
+        "tracked.txt",
+        b"start\nfinish\n",
+        b"start\nlet product = left_value * right_value;\nlet keep_marker = 17;\nfinish\n",
+        b"start\nlet product = left_value * other_value;\nlet keep_marker = 17;\nfinish\n",
+        json!([[2, 3]]),
+    );
+    let tracked = file(&report, "tracked.txt");
+    assert_eq!(tracked["ai_strong"], 1);
+    assert_eq!(tracked["mixed"], 1);
+    assert_eq!(tracked["unknown"], 0);
+    let sidecar = fixture.sidecar_value(&commit);
+    assert_eq!(
+        attribution_at_line(&sidecar, "tracked.txt", 2)["category"],
+        "mixed"
+    );
+    assert_eq!(
+        attribution_at_line(&sidecar, "tracked.txt", 3)["category"],
+        "ai_strong"
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn position_mapping_does_not_rescue_deleted_ai_lines() {
+    let (fixture, commit, report) = time_cut_structured_file_commit(
+        "position-mapping-deleted-line",
+        "tracked.txt",
+        b"start\nfinish\n",
+        b"start\nfunction run() {\n}\nreturn result;\n}\nfinish\n",
+        b"start\nfunction run() {\n}\nuser replacement\n}\nfinish\n",
+        json!([[2, 5]]),
+    );
+    let tracked = file(&report, "tracked.txt");
+    assert_eq!(tracked["ai_strong"], 3);
+    assert_eq!(tracked["unknown"], 1);
+    let sidecar = fixture.sidecar_value(&commit);
+    assert_eq!(
+        attribution_at_line(&sidecar, "tracked.txt", 4)["category"],
+        "unknown"
+    );
+    assert_eq!(
+        attribution_at_line(&sidecar, "tracked.txt", 2)["category"],
+        "ai_strong"
+    );
+    assert_eq!(
+        attribution_at_line(&sidecar, "tracked.txt", 3)["category"],
+        "ai_strong"
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn position_mapping_is_not_used_when_the_snapshot_is_unchanged() {
+    let (fixture, commit, report) = structured_existing_file_commit(
+        "position-mapping-unchanged-snapshot",
+        "tracked.txt",
+        b"before\n",
+        b"before\nunchanged AI line\n",
+        json!([[2, 2]]),
+    );
+    assert_eq!(file(&report, "tracked.txt")["ai_direct"], 1);
+    let explain = explain_json(&fixture, &commit, "tracked.txt", Some(2));
+    assert_eq!(explain["lines"][0]["category"], "ai_direct");
+    assert_eq!(explain["lines"][0]["firstFailedCondition"], Value::Null);
+    fixture.drop_root();
+}
+
+#[test]
+fn position_mapping_conflicting_event_claims_stay_unknown() {
+    let fixture = Fixture::new("position-mapping-conflicting-claims");
+    let before = b"old heading\nold footer\n";
+    let first_snapshot = b"old heading\n}\nold footer\n";
+    let second_snapshot = b"old heading\n}\n}\nold footer\n";
+    fs::write(fixture.repo.join("tracked.txt"), before).unwrap();
+    fixture.commit("position mapping conflict baseline");
+    fixture.hook("Stop", "position-mapping-conflicting-claims");
+
+    write_fixture_apply_patch_event(
+        &fixture,
+        "tracked.txt",
+        before,
+        first_snapshot,
+        json!([[2, 2]]),
+    );
+    let event_path = fixture
+        .home
+        .join("repos")
+        .join(fixture.repo_id())
+        .join("events")
+        .join("real-apply-patch.jsonl");
+    let first_event_time = now();
+    let mut first_event: Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
+    first_event["timestamp"] = json!(first_event_time);
+    write_fixture_apply_patch_event(
+        &fixture,
+        "tracked.txt",
+        first_snapshot,
+        second_snapshot,
+        json!([[3, 3]]),
+    );
+    let mut second_event: Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
+    second_event["timestamp"] = json!(first_event_time + 1);
+    fs::write(&event_path, format!("{first_event}\n{second_event}\n")).unwrap();
+
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        b"human heading\n}\nold footer\n",
+    )
+    .unwrap();
+    let commit = fixture.commit("conflicting position mapping claims");
+    assert!(derive(&fixture, &commit).status.success());
+    let report = fixture.derived_value(&commit);
+    let tracked = file(&report, "tracked.txt");
+    assert_eq!(tracked["unknown"], 2);
+    let sidecar = fixture.sidecar_value(&commit);
+    let explain = explain_json(&fixture, &commit, "tracked.txt", Some(2));
+    assert_eq!(tracked["ai_strong"], 0, "{sidecar}\n{explain}");
+    let brace = attribution_at_line(&sidecar, "tracked.txt", 2);
+    assert_eq!(brace["category"], "unknown", "{sidecar}\n{explain}");
+    assert!(brace["limitingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("CONFLICTING_EVIDENCE")));
+    let position_gate = explain["lines"][0]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["condition"] == "position_mapping")
+        .unwrap();
+    assert_eq!(position_gate["passed"], false);
+    assert!(position_gate["compared"]
+        .as_str()
+        .unwrap()
+        .contains("decision=conflicting_claim"));
+    fixture.drop_root();
+}
+
+#[test]
+fn position_mapping_large_file_cap_falls_back_without_failure() {
+    let line_count = 2_050;
+    let ai_lines = (0..line_count)
+        .map(|index| format!("large symbol {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ai_snapshot = format!("{ai_lines}\n");
+    let committed = format!("{ai_snapshot}human appended line\n");
+    let (fixture, commit, report) = time_cut_structured_file_commit(
+        "position-mapping-large-file-cap",
+        "large.txt",
+        b"",
+        ai_snapshot.as_bytes(),
+        committed.as_bytes(),
+        json!([[1, 2050]]),
+    );
+    let large = file(&report, "large.txt");
+    assert_eq!(large["ai_strong"], line_count);
+    assert_eq!(large["unknown"], 1);
+    let sidecar = fixture.sidecar_value(&commit);
+    let strong = attribution_for(&sidecar, "large.txt", "ai_strong");
+    assert!(!strong["supportingBasis"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("POSITION_MAPPED")));
+    fixture.drop_root();
+}
+
+#[test]
+fn position_mapping_results_are_deterministic_and_match_summary_and_explain() {
+    let before = b"parent before\nparent after\n";
+    let ai_snapshot = b"parent before\nfunction alpha() {\n}\nreturn result;\n}\nfunction beta() {\n}\nparent after\n";
+    let committed = b"human before\nuser inserted before block\nfunction alpha() {\n}\nreturn result;\n}\nfunction beta() {\n}\nhuman after\n";
+    let (fixture, commit, report) = time_cut_structured_file_commit(
+        "position-mapping-deterministic",
+        "tracked.txt",
+        before,
+        ai_snapshot,
+        committed,
+        json!([[2, 7]]),
+    );
+    let first_report = fs::read(fixture.derived_path(&commit)).unwrap();
+    let first_sidecar = fs::read(fixture.lines_path(&commit)).unwrap();
+    let result = derive(&fixture, &commit);
+    assert!(
+        result.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&result.stderr),
+        String::from_utf8_lossy(&result.stdout)
+    );
+    assert_eq!(
+        first_report,
+        fs::read(fixture.derived_path(&commit)).unwrap()
+    );
+    assert_eq!(
+        first_sidecar,
+        fs::read(fixture.lines_path(&commit)).unwrap()
+    );
+
+    let summary = fixture.cli(&[
+        "summary",
+        "--repo",
+        fixture.repo.to_str().unwrap(),
+        "--commit",
+        &commit,
+        "--format",
+        "json",
+    ]);
+    assert!(summary.status.success());
+    let summary: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    assert_eq!(
+        summary["totals"]["ai_strong"],
+        report["totals"]["ai_strong"]
+    );
+    assert_eq!(summary["totals"]["unknown"], report["totals"]["unknown"]);
+    let explain = explain_json(&fixture, &commit, "tracked.txt", Some(4));
+    assert_eq!(
+        explain["lines"][0]["category"],
+        attribution_at_line(&fixture.sidecar_value(&commit), "tracked.txt", 4)["category"]
+    );
+    fixture.drop_root();
+}
+
+#[test]
+fn position_mapping_synthetic_real_case_shape_matches_counts_and_percentages() {
+    let fixture = Fixture::new("position-mapping-48-line-shape");
+    fixture.hook("PreToolUse", "shape-cross-origin");
+    fs::write(
+        fixture.repo.join("cross.txt"),
+        b"alpha beta gamma delta\nomega psi chi phi\n",
+    )
+    .unwrap();
+    fixture.hook("PostToolUse", "shape-cross-origin");
+    configure_structured_apply_patch(&fixture, "cross.txt", Some(true), false, json!([[1, 2]]));
+    let origin = fixture.commit("synthetic cross-file AI source");
+    assert!(derive(&fixture, &origin).status.success());
+    git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "un-derived bridge"],
+    );
+    fs::write(fixture.repo.join("strong.txt"), b"stable header\n").unwrap();
+    fixture.commit("un-derived header baseline");
+
+    fixture.hook("PreToolUse", "shape-direct-source");
+    let direct = (0..26)
+        .map(|index| format!("direct symbol {index} alpha"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(fixture.repo.join("direct.txt"), format!("{direct}\n")).unwrap();
+    fixture.hook("PostToolUse", "shape-direct-source");
+    configure_structured_apply_patch(&fixture, "direct.txt", Some(true), false, json!([[1, 26]]));
+
+    fixture.hook("PreToolUse", "shape-position-mapped-source");
+    let strong = (0..19)
+        .map(|index| format!("strong symbol {index} beta"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let strong_snapshot = format!("stable header\n{strong}\n");
+    fs::write(fixture.repo.join("strong.txt"), &strong_snapshot).unwrap();
+    fixture.hook("PostToolUse", "shape-position-mapped-source");
+    configure_structured_apply_patch(&fixture, "strong.txt", Some(true), false, json!([[2, 20]]));
+
+    fs::write(
+        fixture.repo.join("strong.txt"),
+        format!("human header\n{strong}\n"),
+    )
+    .unwrap();
+    fs::write(
+        fixture.repo.join("cross.txt"),
+        b"alpha beta gamma epsilon\nomega psi chi tau\n",
+    )
+    .unwrap();
+    let target = fixture.commit("synthetic mapped attribution shape");
+    assert!(derive(&fixture, &target).status.success());
+    let report = fixture.derived_value(&target);
+    assert_eq!(report["totals"]["e"], 48);
+    assert_eq!(report["totals"]["ai_direct"], 26);
+    assert_eq!(report["totals"]["ai_strong"], 19);
+    assert_eq!(report["totals"]["mixed"], 2);
+    assert_eq!(report["totals"]["unknown"], 1);
+    assert_eq!(report["totals"]["ai_deterministic_pct"], 93.8);
+    assert_eq!(report["totals"]["ai_linked_pct"], 97.9);
+
+    let mapped_explain = explain_json(&fixture, &target, "strong.txt", Some(2));
+    let mapped_line = &mapped_explain["lines"][0];
+    assert_eq!(mapped_line["category"], "ai_strong");
+    let mapping = mapped_line["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["condition"] == "position_mapping")
+        .unwrap();
+    assert_eq!(mapping["passed"], true);
+    let compared = mapping["compared"].as_str().unwrap();
+    assert!(compared.contains("snapshot_line=2"));
+    assert!(compared.contains("committed_line=2"));
+    assert!(compared.contains("equal_region_bounds=snapshot=2-20,committed=2-20"));
+
+    let direct_explain = explain_json(&fixture, &target, "direct.txt", Some(1));
+    assert_eq!(direct_explain["lines"][0]["category"], "ai_direct");
+    assert_eq!(
+        direct_explain["lines"][0]["firstFailedCondition"],
+        Value::Null
+    );
+    assert_ne!(origin, target);
     fixture.drop_root();
 }
 
@@ -3458,6 +4029,78 @@ fn derive_fails_when_sidecar_destination_is_a_directory() {
         !fixture.derived_path(&commit).exists(),
         "commit report written despite sidecar failure; commits: {}",
         commits_listing(commits_dir)
+    );
+    fixture.drop_root();
+}
+
+#[cfg(windows)]
+#[test]
+fn derive_retries_when_result_files_are_locked_for_read() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::mpsc;
+
+    let fixture = Fixture::new("locked-result-files");
+    fixture.hook("Stop", "locked-result-files");
+    git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "empty result commit"],
+    );
+    let commit = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    assert!(derive(&fixture, &commit).status.success());
+
+    for destination in [fixture.derived_path(&commit), fixture.lines_path(&commit)] {
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let handle = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(destination)
+                .unwrap();
+            opened_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            drop(handle);
+        });
+        opened_rx.recv().unwrap();
+
+        let result = derive(&fixture, &commit);
+        holder.join().unwrap();
+        assert!(
+            result.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&result.stderr),
+            String::from_utf8_lossy(&result.stdout)
+        );
+    }
+    fixture.drop_root();
+}
+
+#[cfg(windows)]
+#[test]
+fn derive_fails_promptly_when_result_destination_is_a_directory() {
+    let fixture = Fixture::new("result-directory-prompt");
+    fixture.hook("Stop", "result-directory-prompt");
+    git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "empty result commit"],
+    );
+    let commit = git_text(&fixture.repo, &["rev-parse", "HEAD"]);
+    let sidecar_path = fixture.lines_path(&commit);
+    fs::create_dir_all(&sidecar_path).unwrap();
+
+    let started = Instant::now();
+    let result = derive(&fixture, &commit);
+    let elapsed = started.elapsed();
+    assert!(!result.status.success());
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "directory destination took {elapsed:?} to fail"
+    );
+    let sidecar_path_display = sidecar_path.display().to_string();
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains(&sidecar_path_display),
+        "stderr did not identify {}: {}",
+        sidecar_path_display,
+        String::from_utf8_lossy(&result.stderr)
     );
     fixture.drop_root();
 }
