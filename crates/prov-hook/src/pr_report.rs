@@ -732,7 +732,7 @@ mod tests {
     fn versions_are_named_and_use_the_hook_package_version() {
         assert_eq!(ENGINE_VERSION, env!("CARGO_PKG_VERSION"));
         assert_eq!(ALGORITHM_VERSION, "derive-v1");
-        assert_eq!(LINE_SURVIVAL_VERSION, "unobserved-position-mapped-v3");
+        assert_eq!(LINE_SURVIVAL_VERSION, "unobserved-position-mapped-v4");
         assert_eq!(FORMULA_VERSION, "strict-v1");
         assert_eq!(ELIGIBILITY_VERSION, "non-blank-added-v1");
         assert_eq!(COVERAGE_VERSION, "coverage-v3");

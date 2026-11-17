@@ -260,16 +260,20 @@ fn duplicate_candidates_share_ai_source(line: &[u8], evidence: &Evidence) -> boo
     let mut source = None;
     let mut found = false;
     for step in &evidence.steps {
-        if !matches!(step.kind, StepKind::Ai { .. })
-            || !split_lines(&step.after)
-                .iter()
-                .any(|candidate| candidate == line)
-        {
+        if !matches!(step.kind, StepKind::Ai { .. }) {
             continue;
         }
         let Some(attribution) = step.attribution.as_ref() else {
             return false;
         };
+        let snapshot_lines = split_lines(&step.after);
+        if !snapshot_lines.iter().enumerate().any(|(index, candidate)| {
+            candidate == line
+                && (attribution.direct_line_numbers.is_empty()
+                    || attribution.direct_line_numbers.contains(&(index + 1)))
+        }) {
+            continue;
+        }
         let (Some(adapter), Some(tool), Some(session), Some(operation)) = (
             attribution.adapter_id.as_deref(),
             attribution.tool_id.as_deref(),

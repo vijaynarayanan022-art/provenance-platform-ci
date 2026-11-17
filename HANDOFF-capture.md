@@ -255,6 +255,14 @@ For a structured-edit AI event with available after-snapshot bytes and passing `
 This position-mapping rule is a **PROPOSED spec change pending sign-off**. The line-survival version is now `unobserved-position-mapped-v3`. This also versions the r34 prior-AI carry rule: stored results using the previous version are stale for that rule until re-derived. Re-derive the range oldest commit first so each later commit can use the refreshed origin report.
 
 Known limit: on hand-edited files, only verified structured-edit events with stored snapshots can position-map unchanged AI lines. Large files that exceed the mapping cap, events with failed gates, and lines outside equal regions retain the prior fallback behavior; repeated text alone does not establish a position.
+
+## Round 37: Copilot current-file tools as structured edits
+
+**PROPOSED spec change pending sign-off.** Direct evidence for the VS Code adapter's Copilot PascalCase `Write` payload `{path, file_text}` and object-form `Edit` payload `{path, old_str, new_str}` requires the input path to identify the changed repo-relative file and the already-captured before/after snapshots to reproduce the input after CRLF-to-LF normalization. `Edit.old_str` must occur exactly once. Missing before bytes, a mismatched path or content, or input/snapshots over 1 MiB leaves the event unstructured and on the existing fallback path. Their stored operation names are `copilot_write` and `copilot_edit`; legacy `Edit` unified-diff strings, `apply_patch`, `create_file`, and the existing VS Code file tools retain their prior handling. No extra file reads or processes are used.
+
+Same-event duplicate resolution is constrained to verified added-line coordinates: identical pre-existing text outside the event's added range is not a competing candidate for the newly edited line. The line-survival version changes to `unobserved-position-mapped-v4`; stored results using v3 are stale and must be re-derived, oldest commit first, so the r34 prior-AI carry rule can use refreshed origin reports.
+
+Known limits and open items: `transcript_path` is intentionally ignored; multi-edit tools and other models' current-file tool names are not covered. The new structured verification is exact-input matching, not a general merge or edit-intent inference. Failed verification remains fail-open and can receive only the existing non-direct attribution.
 ## Round 35: discard-boundary characterization
 
 No behavior change is proposed in this round. The characterization uses synthetic snapshot-diff edits with real Git operations and the existing Codex helpers; structured-edit (`ai_direct`) discard cases are not covered here and will be covered by the live pass.
