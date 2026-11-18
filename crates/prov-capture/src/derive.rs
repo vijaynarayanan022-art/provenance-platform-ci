@@ -42,6 +42,7 @@ pub struct Step {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StepAttribution {
+    pub path: Option<String>,
     pub adapter_id: Option<String>,
     pub tool_id: Option<String>,
     pub run_id: Option<String>,
@@ -55,6 +56,8 @@ pub struct StepAttribution {
     pub direct_lines: Vec<Vec<u8>>,
     /// One-based line numbers in this step's verified after snapshot.
     pub direct_line_numbers: Vec<usize>,
+    /// The structured before/after diff was verified and added no lines.
+    pub verified_no_add: bool,
     /// Event position in the session JSONL, for explain diagnostics.
     pub event_index: Option<usize>,
 }
@@ -230,13 +233,14 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
             let owned = committed_owners[index];
             let duplicates = duplicate_owners[index];
             let candidates = owned.candidates | duplicates.candidates;
-            let ambiguous = if owned.owner == Owner::Direct
+            let chain_mapped = owned.owner == Owner::Direct
                 && is_identity_mapped_direct_line(
                     ev,
                     &identity_mapping_steps,
                     owned.source_step,
                     index + 1,
-                ) {
+                );
+            let ambiguous = if chain_mapped {
                 has_other_ai_candidate(line, owned.source_step, index + 1, ev)
             } else {
                 owned.ambiguous || duplicates.ambiguous
@@ -246,11 +250,16 @@ pub fn derive_lines_with_attribution(ev: &Evidence, committed: &[u8]) -> Vec<Att
             } else {
                 match owned.owner {
                     Owner::Direct if !ambiguous => Label::AiDirect,
-                    Owner::Direct if duplicate_candidates_share_ai_source(line, ev) => {
+                    Owner::Direct
+                        if duplicate_candidates_share_ai_source(line, ev, chain_mapped) =>
+                    {
                         Label::AiStrong
                     }
                     Owner::Direct => Label::AiProbable,
-                    Owner::Ai if !ambiguous || duplicate_candidates_share_ai_source(line, ev) => {
+                    Owner::Ai
+                        if !ambiguous
+                            || duplicate_candidates_share_ai_source(line, ev, chain_mapped) =>
+                    {
                         Label::AiStrong
                     }
                     Owner::Ai | Owner::AiWeak => Label::AiProbable,
@@ -312,22 +321,23 @@ fn apply_identity_mapped_direct_ownership(
 
 pub(crate) fn identity_mapping_steps(evidence: &Evidence, committed: &[u8]) -> Vec<bool> {
     let normalized_committed = crate::commit::normalize_eol(committed);
-    let mut unchanged_through_end = vec![true; evidence.steps.len()];
-    let mut identity_mapping = vec![false; evidence.steps.len()];
-    let mut later_snapshot = None;
+    let last_snapshot_matches_committed = evidence
+        .steps
+        .last()
+        .is_some_and(|step| crate::commit::normalize_eol(&step.after) == normalized_committed);
+    let mut chain_valid = true;
+    let mut ai_chain = vec![false; evidence.steps.len()];
     for index in (0..evidence.steps.len()).rev() {
         let step = &evidence.steps[index];
-        let normalized_after = crate::commit::normalize_eol(&step.after);
-        if let Some(later) = later_snapshot.as_ref() {
-            unchanged_through_end[index] =
-                normalized_after == *later && unchanged_through_end[index + 1];
-        }
-        identity_mapping[index] = matches!(step.kind, StepKind::Ai { degraded: false })
-            && normalized_after == normalized_committed
-            && unchanged_through_end[index];
-        later_snapshot = Some(normalized_after);
+        ai_chain[index] = last_snapshot_matches_committed
+            && chain_valid
+            && matches!(step.kind, StepKind::Ai { degraded: false });
+        chain_valid &= matches!(step.kind, StepKind::Ai { degraded: false })
+            && step.attribution.as_ref().is_some_and(|attribution| {
+                !attribution.direct_line_numbers.is_empty() || attribution.verified_no_add
+            });
     }
-    identity_mapping
+    ai_chain
 }
 
 pub(crate) fn is_identity_mapped_direct_line(
@@ -356,11 +366,31 @@ pub(crate) fn is_same_source_event(
     source_step == Some(candidate_step)
         || source.is_some_and(|source| {
             candidate.event_index.is_some() && candidate.event_index == source.event_index
-                || candidate.run_id.is_some() && candidate.run_id == source.run_id
+                || candidate.path.is_some()
+                    && candidate.path == source.path
+                    && candidate.session_id.is_some()
+                    && candidate.session_id == source.session_id
+                    && candidate.run_id.is_some()
+                    && candidate.run_id == source.run_id
         })
 }
 
-fn duplicate_candidates_share_ai_source(line: &[u8], evidence: &Evidence) -> bool {
+pub(crate) fn claims_line_at_position(attribution: &StepAttribution, line_number: usize) -> bool {
+    if attribution.verified_no_add {
+        return false;
+    }
+    matches!(
+        attribution.operation.as_deref(),
+        Some("copilot_write" | "create_file")
+    ) || attribution.direct_line_numbers.is_empty()
+        || attribution.direct_line_numbers.contains(&line_number)
+}
+
+fn duplicate_candidates_share_ai_source(
+    line: &[u8],
+    evidence: &Evidence,
+    chain_mapped: bool,
+) -> bool {
     let mut source = None;
     let mut found = false;
     for step in &evidence.steps {
@@ -370,6 +400,9 @@ fn duplicate_candidates_share_ai_source(line: &[u8], evidence: &Evidence) -> boo
         let Some(attribution) = step.attribution.as_ref() else {
             return false;
         };
+        if chain_mapped && attribution.verified_no_add {
+            continue;
+        }
         let snapshot_lines = split_lines(&step.after);
         if !snapshot_lines.iter().enumerate().any(|(index, candidate)| {
             candidate == line
@@ -419,9 +452,7 @@ fn has_other_ai_candidate(
         let Some(candidate) = candidate_lines.get(line_number.saturating_sub(1)) else {
             return false;
         };
-        candidate.as_slice() == line
-            && (attribution.direct_line_numbers.is_empty()
-                || attribution.direct_line_numbers.contains(&line_number))
+        candidate.as_slice() == line && claims_line_at_position(attribution, line_number)
     })
 }
 
@@ -1384,6 +1415,7 @@ mod tests {
     fn sourced_ai_step(after: &[u8], adapter: &str, tool: &str, session: &str) -> Step {
         let mut result = step(StepKind::Ai { degraded: false }, after);
         result.attribution = Some(StepAttribution {
+            path: None,
             adapter_id: Some(adapter.into()),
             tool_id: Some(adapter.into()),
             run_id: Some(format!("invocation-{}", after.len())),
@@ -1396,6 +1428,7 @@ mod tests {
             limiting_basis: Vec::new(),
             direct_lines: Vec::new(),
             direct_line_numbers: Vec::new(),
+            verified_no_add: false,
             event_index: None,
         });
         result
@@ -1406,6 +1439,82 @@ mod tests {
             parent: parent.to_vec(),
             steps,
         }
+    }
+
+    fn test_attribution(
+        run_id: &str,
+        operation: &str,
+        direct_lines: &[&[u8]],
+        direct_line_numbers: &[usize],
+        verified_no_add: bool,
+    ) -> StepAttribution {
+        StepAttribution {
+            path: Some("file.js".into()),
+            adapter_id: Some("vscode-copilot".into()),
+            tool_id: Some("vscode-copilot".into()),
+            run_id: Some(run_id.into()),
+            session_id: Some("session".into()),
+            operation: Some(operation.into()),
+            primary_basis: Some("DIRECT_AGENT_PATCH".into()),
+            score_milli: 990,
+            penalties_milli: Vec::new(),
+            supporting_basis: Vec::new(),
+            limiting_basis: Vec::new(),
+            direct_lines: direct_lines.iter().map(|line| line.to_vec()).collect(),
+            direct_line_numbers: direct_line_numbers.to_vec(),
+            verified_no_add,
+            event_index: None,
+        }
+    }
+
+    #[test]
+    fn verified_no_add_ai_step_keeps_chain_and_claims_no_lines() {
+        let mut source = sourced_ai_step(b"keep\nrepeat\n", "vscode-copilot", "apply_patch", "s");
+        source.attribution = Some(test_attribution(
+            "source",
+            "apply_patch",
+            &[b"keep", b"repeat"],
+            &[1, 2],
+            false,
+        ));
+        let mut no_add = step(StepKind::Ai { degraded: false }, b"keep\nrepeat\n");
+        no_add.attribution = Some(test_attribution("delete", "apply_patch", &[], &[], true));
+        let ev = evidence(b"", vec![source, no_add]);
+
+        assert_eq!(
+            identity_mapping_steps(&ev, b"keep\nrepeat\n"),
+            vec![true, true]
+        );
+        assert!(!claims_line_at_position(
+            ev.steps[1].attribution.as_ref().unwrap(),
+            1
+        ));
+        assert!(!has_other_ai_candidate(b"keep", Some(0), 1, &ev));
+        for line in derive_lines_with_attribution(&ev, b"keep\nrepeat\n") {
+            assert_eq!(line.line.label, Label::AiDirect);
+            assert!(!line.ambiguous);
+        }
+    }
+
+    #[test]
+    fn unstructured_empty_claim_set_keeps_legacy_all_lines_meaning() {
+        let mut source = sourced_ai_step(b"same\n", "vscode-copilot", "apply_patch", "s");
+        source.attribution = Some(test_attribution(
+            "source",
+            "apply_patch",
+            &[b"same"],
+            &[1],
+            false,
+        ));
+        let mut unstructured = step(StepKind::Ai { degraded: false }, b"same\n");
+        unstructured.attribution = Some(test_attribution("other", "unknown_tool", &[], &[], false));
+        let ev = evidence(b"", vec![source, unstructured]);
+
+        assert!(claims_line_at_position(
+            ev.steps[1].attribution.as_ref().unwrap(),
+            1
+        ));
+        assert!(has_other_ai_candidate(b"same", Some(0), 1, &ev));
     }
 
     fn only_label(ev: &Evidence, committed: &[u8]) -> Label {
@@ -1496,6 +1605,7 @@ mod tests {
             b"base\nhuman edit\nnew ai edit\n",
         );
         new_attempt.attribution = Some(StepAttribution {
+            path: None,
             adapter_id: Some("vscode-copilot".into()),
             tool_id: Some("vscode-copilot".into()),
             run_id: Some("new-attempt".into()),
@@ -1508,6 +1618,7 @@ mod tests {
             limiting_basis: Vec::new(),
             direct_lines: vec![b"new ai edit".to_vec()],
             direct_line_numbers: Vec::new(),
+            verified_no_add: false,
             event_index: None,
         });
         // The discarded AI snapshot is omitted from replay; the retained sequence
@@ -2110,6 +2221,7 @@ mod tests {
         assert_eq!(external, committed);
         let mut ai_step = step(StepKind::Ai { degraded: false }, &ai);
         ai_step.attribution = Some(StepAttribution {
+            path: None,
             adapter_id: Some("vscode-copilot".into()),
             tool_id: Some("vscode-copilot".into()),
             run_id: None,
@@ -2122,6 +2234,7 @@ mod tests {
             limiting_basis: Vec::new(),
             direct_lines: split_lines(&ai),
             direct_line_numbers: Vec::new(),
+            verified_no_add: false,
             event_index: None,
         });
         let ev = evidence(b"", vec![ai_step, step(StepKind::External, &external)]);
