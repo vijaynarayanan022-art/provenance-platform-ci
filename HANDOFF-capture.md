@@ -263,6 +263,12 @@ Known limit: on hand-edited files, only verified structured-edit events with sto
 Same-event duplicate resolution is constrained to verified added-line coordinates: identical pre-existing text outside the event's added range is not a competing candidate for the newly edited line. The line-survival version changes to `unobserved-position-mapped-v4`; stored results using v3 are stale and must be re-derived, oldest commit first, so the r34 prior-AI carry rule can use refreshed origin reports.
 
 Known limits and open items: `transcript_path` is intentionally ignored; multi-edit tools and other models' current-file tool names are not covered. The new structured verification is exact-input matching, not a general merge or edit-intent inference. Failed verification remains fail-open and can receive only the existing non-direct attribution.
+
+## Round 38: same-event repeated text
+
+**PROPOSED spec change pending sign-off.** A line's own source event is not a competing duplicate candidate; duplicate ambiguity and explain candidates exclude that source step, event index, and matching `tool_use_id`. When the committed normalized bytes equal the source event's after-snapshot and no later step changed the file, verified direct lines map by line position, so repeated text within that event remains `ai_direct`. Competing claims from distinct events retain the existing ambiguity behavior. A human-added or moved identical-text line is not granted this identity mapping.
+
+The line-survival version changes to `unobserved-position-mapped-v5`; v4 results are stale and should be re-derived oldest commit first to refresh stored reports used by prior-AI carry.
 ## Round 35: discard-boundary characterization
 
 No behavior change is proposed in this round. The characterization uses synthetic snapshot-diff edits with real Git operations and the existing Codex helpers; structured-edit (`ai_direct`) discard cases are not covered here and will be covered by the live pass.

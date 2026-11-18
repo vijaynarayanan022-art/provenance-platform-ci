@@ -20,7 +20,7 @@ const MAX_PARENT_MATCH_CELLS: usize = 1_000_000;
 const MAX_DELAYED_EVENTS_PER_PATH: usize = 64;
 const MIXED_SCORE_MILLI: u16 = 840;
 const PRIOR_AI_EDIT_LOOKUP_BUDGET: Duration = Duration::from_secs(2);
-pub const LINE_SURVIVAL_VERSION: &str = "unobserved-position-mapped-v4";
+pub const LINE_SURVIVAL_VERSION: &str = "unobserved-position-mapped-v5";
 const UNOBSERVED_COVERAGE_MEDIUM_PERCENT: usize = 5;
 const UNOBSERVED_COVERAGE_LOW_PERCENT: usize = 20;
 const UNOBSERVED_COVERAGE_BASIS: [&str; 2] = ["X_UNOBSERVED_EDIT", "X_UNOBSERVED_EDIT_IN_FILE"];
@@ -1000,6 +1000,7 @@ fn derive_resolved_commit(
                 kind: StepKind::Ai { degraded: true },
                 after: normalized_committed.clone(),
                 attribution: Some(derive::StepAttribution {
+                    path: None,
                     adapter_id: None,
                     tool_id: None,
                     run_id: None,
@@ -1012,6 +1013,7 @@ fn derive_resolved_commit(
                     limiting_basis: vec!["X_RECONSTRUCTED_WINDOW".into()],
                     direct_lines: Vec::new(),
                     direct_line_numbers: Vec::new(),
+                    verified_no_add: false,
                     event_index: None,
                 }),
             });
@@ -1090,6 +1092,7 @@ fn derive_resolved_commit(
                 kind: StepKind::Unknown,
                 after: Vec::new(),
                 attribution: Some(derive::StepAttribution {
+                    path: None,
                     adapter_id: parent_line
                         .source
                         .as_ref()
@@ -1111,6 +1114,7 @@ fn derive_resolved_commit(
                     limiting_basis: vec!["X_UNOBSERVED_EDIT_IN_FILE".into()],
                     direct_lines: Vec::new(),
                     direct_line_numbers: Vec::new(),
+                    verified_no_add: false,
                     event_index: None,
                 }),
             });
@@ -1234,6 +1238,7 @@ fn derive_resolved_commit(
                 kind: StepKind::Unknown,
                 after: Vec::new(),
                 attribution: Some(derive::StepAttribution {
+                    path: None,
                     adapter_id: source
                         .source
                         .as_ref()
@@ -1255,6 +1260,7 @@ fn derive_resolved_commit(
                     limiting_basis: vec!["X_UNOBSERVED_EDIT".into()],
                     direct_lines: Vec::new(),
                     direct_line_numbers: Vec::new(),
+                    verified_no_add: false,
                     event_index: None,
                 }),
             });
@@ -1730,6 +1736,8 @@ pub fn explain_commit(
         parent: normalized_parent.clone(),
         steps: survival_steps.unwrap_or(steps),
     };
+    let identity_mapping_steps =
+        derive::identity_mapping_steps(&evidence_input, &normalized_committed);
     let (mut attributed_lines, position_mapping_traces, protected_position_lines) =
         if use_unobserved_survival {
             let result = derive::derive_lines_with_position_mapping(
@@ -1811,6 +1819,7 @@ pub fn explain_commit(
             kind: StepKind::Unknown,
             after: Vec::new(),
             attribution: Some(derive::StepAttribution {
+                path: None,
                 adapter_id: source
                     .source
                     .as_ref()
@@ -1832,6 +1841,7 @@ pub fn explain_commit(
                 limiting_basis: vec!["X_UNOBSERVED_EDIT".into()],
                 direct_lines: Vec::new(),
                 direct_line_numbers: Vec::new(),
+                verified_no_add: false,
                 event_index: None,
             }),
         });
@@ -1939,6 +1949,9 @@ pub fn explain_commit(
                                 .get(attributed.line.line.saturating_sub(1))
                                 .copied()
                                 .unwrap_or_default(),
+                            attributed.source_step,
+                            attributed.line.line,
+                            &identity_mapping_steps,
                             &evidence_input,
                         )
                     } else {
@@ -3064,7 +3077,13 @@ fn steps_for_events_with_trace(
             .or_else(|| {
                 (event.before_sha.is_none() && previous_snapshot.is_empty()).then(Vec::new)
             });
-        let (direct_lines, direct_line_numbers, position_mapping_line_numbers, checks) = if is_ai {
+        let (
+            direct_lines,
+            direct_line_numbers,
+            position_mapping_line_numbers,
+            checks,
+            verified_no_add,
+        ) = if is_ai {
             verified_structured_lines(
                 event,
                 before_snapshot.as_deref(),
@@ -3075,7 +3094,7 @@ fn steps_for_events_with_trace(
                 &evidence_comparison,
             )
         } else {
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), false)
         };
         let step_index = steps.len();
         decision_traces.push(EventDecisionTrace {
@@ -3087,6 +3106,7 @@ fn steps_for_events_with_trace(
             position_mapping_line_numbers,
         });
         let attribution = Some(derive::StepAttribution {
+            path: event.path.clone(),
             adapter_id: event.tool.clone(),
             tool_id: event.tool.clone(),
             run_id: event.tool_use_id.clone(),
@@ -3122,6 +3142,7 @@ fn steps_for_events_with_trace(
             limiting_basis,
             direct_lines,
             direct_line_numbers,
+            verified_no_add,
             event_index: Some(event.order),
         });
         steps.push(Step {
@@ -3152,6 +3173,14 @@ fn position_mapping_candidates(
         .collect()
 }
 
+type VerifiedStructuredLines = (
+    Vec<Vec<u8>>,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<ExplainCheck>,
+    bool,
+);
+
 fn verified_structured_lines(
     event: &EventRecord,
     raw_before: Option<&[u8]>,
@@ -3160,7 +3189,7 @@ fn verified_structured_lines(
     normalized_after: &[u8],
     evidence_exact: bool,
     evidence_comparison: &str,
-) -> (Vec<Vec<u8>>, Vec<usize>, Vec<usize>, Vec<ExplainCheck>) {
+) -> VerifiedStructuredLines {
     let before_actual = raw_before.map(crate::hash);
     let before_sha_matches = match (event.before_sha.as_deref(), before_actual.as_deref()) {
         (None, Some(actual)) => normalized_before.is_empty() && actual == crate::hash(&[]),
@@ -3237,7 +3266,7 @@ fn verified_structured_lines(
         ),
     ];
     if checks.iter().take(7).any(|check| !check.passed) {
-        return (Vec::new(), Vec::new(), Vec::new(), checks);
+        return (Vec::new(), Vec::new(), Vec::new(), checks, false);
     }
     let old = commit_split_lines(normalized_before);
     let new = commit_split_lines(normalized_after);
@@ -3253,6 +3282,7 @@ fn verified_structured_lines(
         }
     }
     let nonempty = !added.is_empty();
+    let verified_no_add = !nonempty && checks.iter().all(|check| check.passed);
     let mut checks = checks;
     checks.push(explain_check(
         "verified_added_lines",
@@ -3260,16 +3290,16 @@ fn verified_structured_lines(
         format!("verified_added_line_count={}", added.len()),
     ));
     if !nonempty {
-        return (Vec::new(), Vec::new(), Vec::new(), checks);
+        return (Vec::new(), Vec::new(), Vec::new(), checks, verified_no_add);
     }
     if evidence_exact {
         let line_numbers = actual_ranges
             .iter()
             .flat_map(|[start, end]| *start..=*end)
             .collect();
-        (added, line_numbers, Vec::new(), checks)
+        (added, line_numbers, Vec::new(), checks, false)
     } else {
-        (Vec::new(), Vec::new(), added_line_numbers, checks)
+        (Vec::new(), Vec::new(), added_line_numbers, checks, false)
     }
 }
 
@@ -3340,21 +3370,53 @@ fn ranges_match_at_duplicate_boundary(
     differing_range.is_some()
 }
 
-fn duplicate_competing_candidates(line: &[u8], evidence: &Evidence) -> String {
+fn duplicate_competing_candidates(
+    line: &[u8],
+    source_step: Option<usize>,
+    line_number: usize,
+    identity_mapping_steps: &[bool],
+    evidence: &Evidence,
+) -> String {
+    let identity_source_step = source_step.filter(|source_step| {
+        derive::is_identity_mapped_direct_line(
+            evidence,
+            identity_mapping_steps,
+            Some(*source_step),
+            line_number,
+        )
+    });
+    let source_attribution = identity_source_step
+        .and_then(|index| evidence.steps.get(index))
+        .and_then(|step| step.attribution.as_ref());
     let candidates = evidence
         .steps
         .iter()
-        .filter(|step| matches!(step.kind, StepKind::Ai { .. }))
-        .filter_map(|step| {
+        .enumerate()
+        .filter(|(_, step)| matches!(step.kind, StepKind::Ai { .. }))
+        .filter_map(|(step_index, step)| {
             let attribution = step.attribution.as_ref()?;
+            if identity_source_step.is_some_and(|source_step| {
+                derive::is_same_source_event(
+                    step_index,
+                    attribution,
+                    Some(source_step),
+                    source_attribution,
+                )
+            }) {
+                return None;
+            }
             let matching_lines = split_normalized_lines(&step.after)
                 .iter()
                 .enumerate()
                 .filter_map(|(index, candidate)| {
-                    (*candidate == line
-                        && (attribution.direct_line_numbers.is_empty()
-                            || attribution.direct_line_numbers.contains(&(index + 1))))
-                    .then_some(index + 1)
+                    let line_matches = if identity_source_step.is_some() {
+                        index + 1 == line_number
+                            && derive::claims_line_at_position(attribution, line_number)
+                    } else {
+                        attribution.direct_line_numbers.is_empty()
+                            || attribution.direct_line_numbers.contains(&(index + 1))
+                    };
+                    (*candidate == line && line_matches).then_some(index + 1)
                 })
                 .collect::<Vec<_>>();
             (!matching_lines.is_empty()).then(|| {
@@ -3473,7 +3535,7 @@ fn commit_split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
     lines
 }
 
-fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn normalize_eol(bytes: &[u8]) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -3723,6 +3785,7 @@ fn missing_snapshot_time_cut_fallback(
         kind: StepKind::Ai { degraded: true },
         after: committed_normalized.to_vec(),
         attribution: Some(derive::StepAttribution {
+            path: event.path.clone(),
             adapter_id: event.tool.clone(),
             tool_id: event.tool.clone(),
             run_id: event.tool_use_id.clone(),
@@ -3735,6 +3798,7 @@ fn missing_snapshot_time_cut_fallback(
             limiting_basis: vec!["X_TIME_CUT".into(), "INCOMPLETE_SOURCE".into()],
             direct_lines: Vec::new(),
             direct_line_numbers: Vec::new(),
+            verified_no_add: false,
             event_index: Some(event.order),
         }),
     })
@@ -4814,6 +4878,7 @@ mod tests {
     #[test]
     fn score_v1_applies_listed_penalties_and_category_caps() {
         let exact = derive::StepAttribution {
+            path: None,
             adapter_id: Some("codex".into()),
             tool_id: Some("tool-1".into()),
             run_id: None,
@@ -4826,6 +4891,7 @@ mod tests {
             limiting_basis: Vec::new(),
             direct_lines: Vec::new(),
             direct_line_numbers: Vec::new(),
+            verified_no_add: false,
             event_index: None,
         };
         assert_eq!(

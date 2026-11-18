@@ -810,6 +810,19 @@ fn structured_added_lines(
     Some(lines)
 }
 
+fn structured_patch_has_deletions(input: &serde_json::Value) -> bool {
+    input
+        .get("input")
+        .or_else(|| input.get("patch"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|patch| {
+            patch.lines().any(|line| {
+                line.strip_prefix('-')
+                    .is_some_and(|body| !body.starts_with('-'))
+            })
+        })
+}
+
 fn structured_input(
     adapter: &str,
     operation: Option<&str>,
@@ -1041,7 +1054,8 @@ fn structured_input_is_direct_eligible(
     if operation == "create_file" {
         return true;
     }
-    structured_added_lines(adapter, Some(operation), input).is_some_and(|lines| !lines.is_empty())
+    (structured_added_lines(adapter, Some(operation), input).is_some_and(|lines| !lines.is_empty())
+        || (operation == "apply_patch" && structured_patch_has_deletions(input)))
         && !payload.is_empty()
 }
 
